@@ -165,6 +165,87 @@ struct Index {
 
 /// Canonical absolute fingerprint of a build/query root; exit 2 when the
 /// root does not resolve.
+fn canon_root(root: &std::path::Path) -> PathBuf {
+    match std::fs::canonicalize(root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("nkgrep: bad root {}: {e}", root.display());
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Stable (device, inode) cookie for a canonical root; (0, 0) where the
+/// platform offers no file identity (non-unix) or metadata is unreadable.
+/// Unlike mtime this never changes when files are added inside the tree.
+fn root_cookie(canon: &std::path::Path) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(canon) {
+            Ok(m) => (m.dev(), m.ino()),
+            Err(_) => (0, 0),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = canon;
+        (0, 0)
+    }
+}
+
+/// Parse index JSON; old absolute-path indexes (missing `root`) and corrupt
+/// files are refused loudly instead of silently matching nothing.
+fn parse_index(idx_path: &str, data: &str) -> Index {
+    match serde_json::from_str::<Index>(data) {
+        Ok(idx) => {
+            if idx.files.iter().any(|p| PathBuf::from(p).is_absolute()) {
+                eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
+                std::process::exit(2);
+            }
+            idx
+        }
+        Err(e) => {
+            eprintln!("nkgrep: unreadable index {idx_path} (old format? rebuild with `nkgrep index`): {e}");
+            std::process::exit(2);
+        }
+    }
+}
+/// Binary index magic (8 B) + plain-LE linear layout, no codec (NKGREP02):
+/// magic | root_dev u64 | root_ino u64 | root_len u32 + root bytes
+/// | nfiles u32 + (len u32 + bytes)* | npostings u32 + (key u32 + vlen u32 + ids u32 LE)*.
+/// Keys are packed trigrams (gram_pack), sorted numeric on write for stable
+/// bytes. Any truncation → loud exit 2. NKGREP01 (u64 widths + String keys)
+/// is refused loudly as a stale format, same as a fingerprint mismatch.
+fn load_index_for_query(idx_path: &str, query_root: &PathBuf) -> Index {
+    let data = read_index_bytes(idx_path);
+    let mut idx = parse_index_auto(idx_path, &data);
+    let q_canon = canon_root(query_root);
+    if q_canon.to_string_lossy() != idx.root {
+        eprintln!(
+            "nkgrep: index root mismatch (built at {}, queried at {})",
+            idx.root,
+            q_canon.display()
+        );
+    }
+    let (dev, ino) = root_cookie(&q_canon);
+    if idx.root_dev != 0 && (dev, ino) != (idx.root_dev, idx.root_ino) {
+        eprintln!(
+            "nkgrep: index root mismatch (built at {}, queried at {}: root replaced)",
+            idx.root,
+            q_canon.display()
+        );
+        std::process::exit(2);
+    }
+    for f in idx.files.iter_mut() {
+        *f = query_root.join(&*f).to_string_lossy().into_owned();
+    }
+    idx
+}
+
+/// Load an index for `serve`: no query root exists, so the stored canonical
+/// root is the verify base. Refuse (exit 2) when the tree moved or was
+/// replaced behind the stored fingerprint.
 fn load_index_for_serve(idx_path: &str) -> Index {
     let data = read_index_bytes(idx_path);
     let mut idx = parse_index_auto(idx_path, &data);
