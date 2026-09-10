@@ -1,0 +1,35 @@
+# Build
+/target/
+
+# PRIVATE device-only surface — never commit
+HANDOFF.md
+CHANGELOG.md
+AGENTS.md
+docs/
+plans/
+outputs/
+output/
+.worktrees/
+
+# Bench generated data (harness scripts are tracked; corpora/indexes/outputs are not)
+bench/corpus*/
+bench/nk.idx.*
+bench/outputs/
+bench/__pycache__/
+__pycache__/
+
+# Index and corpus artifacts anywhere
+*.idx.json
+*.idx.bin
+nkgrep.idx.json
+corpus*/
+.tgrep/
+*CORPUS_TGREP*
+*TGREP_CORPUS*
+
+# Serve configs
+*.serve.json
+serve.json
+
+# macOS
+.DS_Store
