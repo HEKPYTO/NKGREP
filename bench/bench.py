@@ -1,4 +1,4 @@
-"""Neutral bakeoff: rg --json vs nkgrep. Asserts identical match sets (differential
+"""Neutral bakeoff: rg --json vs nkg. Asserts identical match sets (differential
 equality), reports median wall time over N runs, prints kill verdict."""
 import json
 import statistics
@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
-NK = HERE.parent / "target" / "release" / "nkgrep"
+NK = HERE.parent / "target" / "release" / "nkg"
 CORPUS = HERE / "corpus"
 RUNS = 5
 

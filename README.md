@@ -1,4 +1,4 @@
-# nkgrep
+# nkg
 
 Ranked code search for people who live in big repos. You type a pattern, it
 hands back the k best hits with a score attached — usually before you've
@@ -14,30 +14,30 @@ so the good stuff floats to the top.
 cargo install nkgrep
 ```
 
-Or build it yourself:
+Or build it yourself (crate stays `nkgrep`, the binary is `nkg`):
 
 ```bash
 cargo build --release
-./target/release/nkgrep --version
+./target/release/nkg --version
 ```
 
 ## 30-second quickstart
 
 ```bash
 # index the repo once
-nkgrep index . --index nkgrep.idx.json
+nkg index . --index .nkg.json
 
 # serve it in the background
-nkgrep serve --index nkgrep.idx.json --port 17632 &
+nkg serve --index .nkg.json --port 17632 &
 
 # ask for the 20 best hits
-nkgrep --port 17632 --top 20 -- 'TODO|FIXME'
+nkg --port 17632 --top 20 -- 'TODO|FIXME'
 ```
 
 No server? No problem — plain one-shot search works too:
 
 ```bash
-nkgrep -- 'pattern' src
+nkg -- 'pattern' src
 ```
 
 Each hit comes back as one JSON object per line:
@@ -51,7 +51,7 @@ Each hit comes back as one JSON object per line:
 Pretty fast. Same-machine medians of 5 + warmup, all match sets equal to
 ripgrep:
 
-| query | nkgrep | tgrep |
+| query | nkg | tgrep |
 |---|---|---|
 | selective, 578 hits | 12.4 ms | 28.9 ms |
 | alternation, 8,538 hits | 79.6 ms | 127.3 ms |
@@ -59,7 +59,13 @@ ripgrep:
 
 ![benchmark](bench/benchmark.png)
 
+The gate that matters lives in `bench/bench.py`: ripgrep vs `nkg` on the
+same corpus, same queries. It checks the match sets are identical
+(`EQUALITY: PASS`), that `nkg` is at or under ripgrep on every query
+(`SPEED: PASS`), and only then prints `KILL: SURVIVE`. Anything else is
+`KILL` — no excuses.
+
 ## Learn more
 
 - `bench/README.md` — full numbers, corpora, and how to re-run everything.
-- `man/nkgrep.1` — every flag, exit code, and example (`man -l man/nkgrep.1`).
+- `man/nkg.1` — every flag, exit code, and example (`man -l man/nkg.1`).

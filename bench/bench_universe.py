@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
-NK = HERE.parent / "target" / "release" / "nkgrep"
+NK = HERE.parent / "target" / "release" / "nkg"
 CORPUS = HERE / "corpus"
 CORPUS_GIT = HERE / "corpus-git"
 CORPUS_TGREP = HERE / "corpus-tgrep"

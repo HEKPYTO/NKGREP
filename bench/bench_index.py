@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
-NK = HERE.parent / "target" / "release" / "nkgrep"
+NK = HERE.parent / "target" / "release" / "nkg"
 CORPUS = HERE / "corpus"
 IDX = HERE / "nk.idx.json"
 RUNS = 3
@@ -76,7 +76,7 @@ def med(cmd, cwd):
 
 
 def main():
-    assert IDX.exists(), "build index first: nkgrep index corpus --index nk.idx.json"
+    assert IDX.exists(), "build index first: nkg index corpus --index nk.idx.json"
     print("== gate A: oracle (indexed full vs rg full) ==")
     a_ok = True
     for q in FULL_QUERIES:

@@ -1,8 +1,8 @@
-#compdef nkgrep
-# zsh completion for nkgrep — static flag list, mirrors `nkgrep --help`
-# Install: copy to a directory in $fpath (e.g. ~/.zsh/completions/_nkgrep)
+#compdef nkg
+# zsh completion for nkg — static flag list, mirrors `nkg --help`
+# Install: copy to a directory in $fpath (e.g. ~/.zsh/completions/_nkg)
 
-_nkgrep() {
+_nkg() {
     local context state line
     typeset -A opt_args
 
@@ -61,4 +61,4 @@ _nkgrep() {
     return 1
 }
 
-_nkgrep "$@"
+_nkg "$@"

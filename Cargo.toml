@@ -22,6 +22,10 @@ exclude = [
      "corpus*/",
 ]
 
+[[bin]]
+name = "nkg"
+path = "src/main.rs"
+
 [dependencies]
 grep-matcher = "0.1"
 grep-regex = "0.1"

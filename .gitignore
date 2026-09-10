@@ -22,6 +22,8 @@ __pycache__/
 *.idx.json
 *.idx.bin
 nkgrep.idx.json
+.nkgrep.json
+.nkg.json
 corpus*/
 .tgrep/
 *CORPUS_TGREP*
