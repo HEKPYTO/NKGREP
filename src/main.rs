@@ -647,7 +647,12 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
     }
     validate_stored_files(idx_path, &idx.files);
     for f in idx.files.iter_mut() {
-        *f = query_root.join(&*f).to_string_lossy().into_owned();
+        // rg parity (audit #10): `query_root.join(rel)` echoes the argv
+        // prefix (`.` -> `./src/a.txt`); strip one leading `./` so cold
+        // indexed prints `src/a.txt` like rg and like the serve wire.
+        // SHAPE CHANGE: indexed JSON/text paths with a `.` root lose `./`.
+        let joined = query_root.join(&*f).to_string_lossy().into_owned();
+        *f = strip_dot_slash(&joined).to_owned();
     }
     idx
 }
@@ -903,6 +908,53 @@ fn served_path_counts(raw: &[u8]) -> Vec<(String, usize)> {
     let mut rows: Vec<(String, usize)> = counts.into_iter().collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows
+}
+/// Display-path normalization (rg parity, probed 15.1.0): strip a single
+/// leading `./` so `nkg pat .` prints `src/a.txt`, not `./src/a.txt`.
+/// Absolute paths and bare relatives pass through untouched.
+fn strip_dot_slash(s: &str) -> &str {
+    s.strip_prefix("./").unwrap_or(s)
+}
+/// Serve-wire display path: index-root-relative form of an absolute
+/// daemon path (`<root>/<rel>` -> `<rel>`). Falls back to the absolute
+/// string when it escapes the root (should not happen; fail-open display).
+fn serve_display_path<'a>(abs: &'a str, root: &str) -> &'a str {
+    let prefix = root.strip_suffix('/').unwrap_or(root);
+    if let Some(rest) = abs.strip_prefix(prefix) {
+        if let Some(rel) = rest.strip_prefix('/') {
+            if !rel.is_empty() {
+                return rel;
+            }
+        }
+    }
+    // Fallback: Path-prefix comparison covers symlinked/macOS /private
+    // aliasing where string prefixes diverge but components agree.
+    if let Ok(rel) = std::path::Path::new(abs).strip_prefix(std::path::Path::new(root)) {
+        if let Some(s) = rel.to_str() {
+            if !s.is_empty() {
+                // Leak-free: the stripped `rel` borrows `abs`, but `to_str`
+                // on the stripped path borrows the intermediate; re-slice
+                // `abs` by length so the return borrows `abs` directly.
+                let off = abs.len() - s.len();
+                return &abs[off..];
+            }
+        }
+    }
+    abs
+}
+/// Distinct matched-file count from a ranked order (`ord` + `loc`): the
+/// `F` in `N matches in F files` counts files with hits, not files walked.
+fn matched_file_count(ord: &[u32], loc: &[(u32, u32)]) -> usize {
+    let mut seen: HashSet<u32> = HashSet::with_capacity(ord.len().min(1024));
+    for &i in ord {
+        seen.insert(loc[i as usize].0);
+    }
+    seen.len()
+}
+/// Serve-side distinct-file count without re-aggregating: callers holding
+/// `served_path_counts` rows reuse `rows.len()`.
+fn served_file_count(raw: &[u8]) -> usize {
+    served_path_counts(raw).len()
 }
 
 /// `-c` / `-l` line writer: `path:count` per matching file, or matching
@@ -2295,7 +2347,14 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                             let (fi, _) = loc[i as usize];
                             let pid = files[fi as usize].pid as usize;
                             if esc[pid].is_none() {
-                                let ps = &idx.files[pid];
+                                // Serve wire is index-root-relative (cold parity):
+                                // the daemon reads via the absolute `idx.files`
+                                // entry but emits the `root/`-stripped display
+                                // form, so serve JSON/text prints `src/a.txt`
+                                // like a normalized cold query, not an absolute
+                                // path. SHAPE CHANGE (audit #5): serve paths
+                                // were absolute before this fix.
+                                let ps = serve_display_path(&idx.files[pid], &idx.root);
                                 let mut v = Vec::with_capacity(ps.len() + 2);
                                 push_escaped_json(&mut v, ps);
                                 esc[pid] = Some(v);
@@ -2492,9 +2551,18 @@ fn save_serve_info(idx_path: &str, port: u16) {
     }
 }
 
-/// Port recorded by a running `serve` for this index, or None when no live
-/// server is registered (missing/corrupt/stale file reads as absent with a
-/// stale-file warning on stderr, then the caller falls back to cold load).
+/// Serve-first probe outcome: a hit, a silent cold fallback (no sidecar ever
+/// registered or an unparseable sidecar — fresh-user stderr stays clean), or
+/// a single warned fallback (stale pid/reuse, or a live registration whose
+/// listener/reply failed). At most one line is ever printed by the caller.
+enum ServeProbe {
+    Hit(Vec<u8>, usize),
+    MissSilent,
+    MissWarn(String),
+}
+/// Quiet sidecar read: `Ok(None)` = absent/corrupt (silent fallback),
+/// `Err(msg)` = stale pid/reuse (caller prints `msg` once, no second
+/// `server unreachable` line), `Ok(Some(port))` = live registration.
 ///
 /// Trust model (accepted): localhost-only bind, no wire token. The query
 /// pattern travels to 127.0.0.1:port in cleartext and any local listener on
@@ -2504,30 +2572,34 @@ fn save_serve_info(idx_path: &str, port: u16) {
 /// while any local user can already bind loopback). The pid-liveness +
 /// starttime check here closes only the stale-file / port-reuse hijack: a
 /// dead daemon's sidecar never diverts a query.
-fn load_serve_port(idx_path: &str) -> Option<u16> {
+fn load_serve_port_quiet(idx_path: &str) -> Result<Option<u16>, String> {
     let path = serve_info_path(idx_path);
-    let data = std::fs::read_to_string(&path).ok()?;
-    let info: ServerInfo = serde_json::from_str(data.trim()).ok()?;
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    let info: ServerInfo = match serde_json::from_str(data.trim()) {
+        Ok(i) => i,
+        Err(_) => return Ok(None),
+    };
     if info.port == 0 || !pid_alive(info.pid) {
-        eprintln!(
+        return Err(format!(
             "nkg: stale serve file {path} (pid {} not running); falling back to cold index load",
             info.pid
-        );
-        return None;
+        ));
     }
     if info.starttime != 0 {
         match proc_starttime(info.pid) {
             Some(cur) if cur == info.starttime => {}
             _ => {
-                eprintln!(
+                return Err(format!(
                     "nkg: stale serve file {path} (pid {} reused); falling back to cold index load",
                     info.pid
-                );
-                return None;
+                ));
             }
         }
     }
-    Some(info.port)
+    Ok(Some(info.port))
 }
 
 fn cmd_serve(idx_path: &str, port: u16) {
@@ -2665,8 +2737,10 @@ fn client_query(
     (raw, matches, bad_regex, ctx_echo)
 }
 /// Serve-first probe for `--use-index`: connect to the daemon registered in
-/// `<index>.serve.json`, if any. Any failure (no file, no listener, bad
-/// reply) returns None so the caller falls back to the cold index load.
+/// `<index>.serve.json`, if any. No sidecar (or an unparseable one) is a
+/// silent cold fallback; a stale registration warns once via `load_serve_port_quiet`;
+/// any failure after a live registration (no listener, bad reply, old daemon
+/// without context echo) warns once as unreachable. At most one line total.
 /// Context behaves like `client_query`: carried `"ctx":true` lines collect
 /// verbatim but never count, and a missing context echo from an old daemon
 /// fails over to the cold path.
@@ -2678,20 +2752,32 @@ fn try_serve_query(
     before: usize,
     after: usize,
     mspec: &MatchSpec,
-) -> Option<(Vec<u8>, usize)> {
-    let port = load_serve_port(idx_path)?;
-    let mut stream = TcpStream::connect_timeout(
-        &"127.0.0.1"
-            .parse()
-            .ok()
-            .map(|ip| std::net::SocketAddr::new(ip, port))?,
-        Duration::from_millis(200),
-    )
-    .ok()?;
-    stream
+) -> ServeProbe {
+    const UNREACHABLE: &str = "nkg: server unreachable, falling back to local index";
+    let port = match load_serve_port_quiet(idx_path) {
+        Ok(Some(p)) => p,
+        Ok(None) => return ServeProbe::MissSilent,
+        Err(msg) => return ServeProbe::MissWarn(msg),
+    };
+    let addr = match "127.0.0.1"
+        .parse()
+        .ok()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+    {
+        Some(a) => a,
+        None => return ServeProbe::MissWarn(UNREACHABLE.to_string()),
+    };
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        Ok(s) => s,
+        Err(_) => return ServeProbe::MissWarn(UNREACHABLE.to_string()),
+    };
+    if stream
         .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok()?;
-    let req = serde_json::to_string(&Query {
+        .is_err()
+    {
+        return ServeProbe::MissWarn(UNREACHABLE.to_string());
+    }
+    let req = match serde_json::to_string(&Query {
         pattern: pattern.to_string(),
         top,
         ignore_case,
@@ -2702,10 +2788,13 @@ fn try_serve_query(
         max_count: mspec.max_count,
         patterns: mspec.patterns.to_vec(),
         fixed: mspec.fixed,
-    })
-    .ok()?;
-    stream.write_all(req.as_bytes()).ok()?;
-    stream.write_all(b"\n").ok()?;
+    }) {
+        Ok(r) => r,
+        Err(_) => return ServeProbe::MissWarn(UNREACHABLE.to_string()),
+    };
+    if stream.write_all(req.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+        return ServeProbe::MissWarn(UNREACHABLE.to_string());
+    }
     let mut reader = BufReader::new(stream);
     // Raw passthrough: server bytes are already final-ordered hit JSON, one
     // per line. Collect them verbatim instead of parsing each Hit and
@@ -2719,7 +2808,7 @@ fn try_serve_query(
     loop {
         line.clear();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            return None;
+            return ServeProbe::MissWarn(UNREACHABLE.to_string());
         }
         let t = line.trim();
         if t.contains("\"done\"") {
@@ -2731,7 +2820,7 @@ fn try_serve_query(
             break;
         }
         if t.contains("\"error\"") {
-            return None;
+            return ServeProbe::MissWarn(UNREACHABLE.to_string());
         }
         if t.is_empty() {
             continue;
@@ -2752,9 +2841,9 @@ fn try_serve_query(
     if ctx_on && !ctx_echo {
         // Old daemon ignored the context fields and served plain hits: fail
         // over to the cold path, which attaches context locally.
-        return None;
+        return ServeProbe::MissWarn(UNREACHABLE.to_string());
     }
-    Some((raw, matches))
+    ServeProbe::Hit(raw, matches)
 }
 /// Cold-emission JSON string escaper (Escaper region): byte-identical to
 /// serde_json for `&str` input. Only `"`, `\` and bytes < 0x20 escape;
@@ -3317,6 +3406,7 @@ fn main() {
     if raw.first().map(|s| s.as_str()) == Some("serve") {
         let mut idx = String::from(".nkg.json");
         let mut port: u16 = 0;
+        let mut have_port = false;
         let mut j = 1;
         while j < raw.len() {
             if raw[j] == "--index" {
@@ -3332,10 +3422,18 @@ fn main() {
                 }
                 port = raw[j].parse().unwrap_or(0);
                 if port == 0 {
+                    eprintln!("nkg: bad --port {:?}: expected a port number", raw[j]);
                     usage();
                 }
+                have_port = true;
             }
             j += 1;
+        }
+        // Audit #11: `--port` is required (usage exit 2). The old random-bind
+        // (port 0) is gone: no caller relies on it (README/frozen record/serve-first
+        // all use explicit ports; only this site called `cmd_serve`).
+        if !have_port {
+            usage();
         }
         cmd_serve(&idx, port);
         return;
@@ -3884,7 +3982,7 @@ fn main() {
     let t0 = Instant::now();
     if port.is_none() {
         if let Some(idx_path) = &use_index {
-            if let Some((raw, matches)) = try_serve_query(
+            match try_serve_query(
                 idx_path,
                 &pattern,
                 top,
@@ -3893,25 +3991,62 @@ fn main() {
                 ctx_after,
                 &mspec,
             ) {
-                // `-q` over serve suppresses stdout client-side; the daemon
-                // has no quiet protocol (short-circuit lives on the cold
-                // path). Exit codes keep the 0/1 contract.
-                if count_mode || files_only {
-                    // `-c` / `-l` over serve-first: aggregate the served JSON
-                    // lines client-side (--top already applied server-side;
-                    // `-l` wins over `-c`, `-q` still suppresses stdout).
-                    if !quiet {
+                ServeProbe::Hit(raw, matches) => {
+                    // `-q` over serve suppresses stdout client-side; the daemon
+                    // has no quiet protocol (short-circuit lives on the cold
+                    // path). Exit codes keep the 0/1 contract.
+                    if count_mode || files_only {
+                        // `-c` / `-l` over serve-first: aggregate the served JSON
+                        // lines client-side (--top already applied server-side;
+                        // `-l` wins over `-c`, `-q` still suppresses stdout).
+                        // `matched` counts distinct hit files (cold parity);
+                        // diagnostics keep the cold `matches in files` + `index
+                        // load` shape so stderr needs one grammar (`via serve`
+                        // rides inside the parens, load is 0 with no cold read).
                         let rows = served_path_counts(&raw);
-                        let refs: Vec<(&str, usize)> =
-                            rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+                        if !quiet {
+                            let refs: Vec<(&str, usize)> =
+                                rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+                            let stdout = std::io::stdout();
+                            let mut writer =
+                                std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                            write_aggregates(&mut writer, &refs, files_only);
+                            stdout_flush(&mut writer);
+                        }
+                        let matched = rows.len();
+                        eprintln!(
+                            "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
+                            t0.elapsed().as_millis()
+                        );
+                        if matches == 0 {
+                            std::process::exit(1);
+                        }
+                        return;
+                    }
+                    if !quiet {
                         let stdout = std::io::stdout();
                         let mut writer =
                             std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-                        write_aggregates(&mut writer, &refs, files_only);
+                        if ctx_on {
+                            // Context owns the output: regrouped rg-shaped rows
+                            // from the carried hit+ctx wire (rank groups kept).
+                            let text =
+                                render_served_context(&raw, ctx_before, ctx_after, &group_sep);
+                            stdout_write_all(&mut writer, &text);
+                        } else if format_text {
+                            // Text renders client-side from the JSON wire (rank
+                            // order kept); the daemon wire is untouched. Color
+                            // highlights client-side via serve_text_out.
+                            let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
+                            stdout_write_all(&mut writer, &text);
+                        } else {
+                            stdout_write_all(&mut writer, &raw);
+                        }
                         stdout_flush(&mut writer);
                     }
+                    let matched = served_file_count(&raw);
                     eprintln!(
-                        "nkg: {matches} matches via serve, {} ms",
+                        "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
                         t0.elapsed().as_millis()
                     );
                     if matches == 0 {
@@ -3919,35 +4054,11 @@ fn main() {
                     }
                     return;
                 }
-                if !quiet {
-                    let stdout = std::io::stdout();
-                    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-                    if ctx_on {
-                        // Context owns the output: regrouped rg-shaped rows
-                        // from the carried hit+ctx wire (rank groups kept).
-                        let text = render_served_context(&raw, ctx_before, ctx_after, &group_sep);
-                        stdout_write_all(&mut writer, &text);
-                    } else if format_text {
-                        // Text renders client-side from the JSON wire (rank
-                        // order kept); the daemon wire is untouched. Color
-                        // highlights client-side via serve_text_out.
-                        let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
-                        stdout_write_all(&mut writer, &text);
-                    } else {
-                        stdout_write_all(&mut writer, &raw);
-                    }
-                    stdout_flush(&mut writer);
+                ServeProbe::MissWarn(msg) => {
+                    eprintln!("{msg}");
                 }
-                eprintln!(
-                    "nkg: {matches} matches via serve, {} ms",
-                    t0.elapsed().as_millis()
-                );
-                if matches == 0 {
-                    std::process::exit(1);
-                }
-                return;
+                ServeProbe::MissSilent => {}
             }
-            eprintln!("nkg: server unreachable, falling back to local index");
         }
     }
     if let Some(p) = port {
@@ -3966,34 +4077,42 @@ fn main() {
         if count_mode || files_only {
             // `-c` / `-l` over --port: same client-side aggregation as the
             // serve-first branch above.
+            let rows = served_path_counts(&raw);
             if !quiet {
-                let rows = served_path_counts(&raw);
                 let refs: Vec<(&str, usize)> = rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
                 let stdout = std::io::stdout();
                 let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
                 write_aggregates(&mut writer, &refs, files_only);
                 stdout_flush(&mut writer);
             }
-        } else if !quiet {
-            let stdout = std::io::stdout();
-            let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-            if ctx_on && ctx_echo {
-                // Same regrouped render as the serve-first branch.
-                let text = render_served_context(&raw, ctx_before, ctx_after, &group_sep);
-                stdout_write_all(&mut writer, &text);
-            } else if format_text {
-                // Same client-side text render as the serve-first branch.
-                let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
-                stdout_write_all(&mut writer, &text);
-            } else {
-                stdout_write_all(&mut writer, &raw);
+            let matched = rows.len();
+            eprintln!(
+                "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
+                t0.elapsed().as_millis()
+            );
+        } else {
+            if !quiet {
+                let stdout = std::io::stdout();
+                let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                if ctx_on && ctx_echo {
+                    // Same regrouped render as the serve-first branch.
+                    let text = render_served_context(&raw, ctx_before, ctx_after, &group_sep);
+                    stdout_write_all(&mut writer, &text);
+                } else if format_text {
+                    // Same client-side text render as the serve-first branch.
+                    let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
+                    stdout_write_all(&mut writer, &text);
+                } else {
+                    stdout_write_all(&mut writer, &raw);
+                }
+                stdout_flush(&mut writer);
             }
-            stdout_flush(&mut writer);
+            let matched = served_file_count(&raw);
+            eprintln!(
+                "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
+                t0.elapsed().as_millis()
+            );
         }
-        eprintln!(
-            "nkg: {matches} matches via serve, {} ms",
-            t0.elapsed().as_millis()
-        );
         if matches == 0 {
             std::process::exit(1);
         }
@@ -4106,7 +4225,7 @@ fn main() {
             files = paths.len();
             ptab = paths
                 .iter()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| strip_dot_slash(&p.to_string_lossy()).to_owned())
                 .collect();
             if quiet {
                 // Existence only: `find_any` stops the parallel wave at the
@@ -4171,7 +4290,7 @@ fn main() {
                 walk_error |= had_walk_error;
                 let allowed: HashSet<String> = walked
                     .into_iter()
-                    .map(|p| p.to_string_lossy().into_owned())
+                    .map(|p| strip_dot_slash(&p.to_string_lossy()).to_owned())
                     .collect();
                 order.retain(|id| allowed.contains(&idx.files[*id as usize]));
             }
@@ -4214,7 +4333,7 @@ fn main() {
         files = paths.len();
         ptab = paths
             .iter()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| strip_dot_slash(&p.to_string_lossy()).to_owned())
             .collect();
         if quiet {
             // Existence only: `find_any` stops the parallel wave at the
@@ -4275,6 +4394,10 @@ fn main() {
         ord.truncate(n);
     }
     let matches = ord.len();
+    // Audit #8: `F` counts distinct hit files, not files walked/candidates.
+    // SHAPE CHANGE: `-c` single-file hits and `-m1` now report `in 1 files`
+    // instead of `in N files` (walked count).
+    let matched = matched_file_count(&ord, &loc);
     if count_mode || files_only {
         // `-c` / `-l` cold emit: per-file surviving-hit (post---top) counts,
         // path-sorted for a stable contract (rg emits walk-parallel order).
@@ -4295,7 +4418,7 @@ fn main() {
         write_aggregates(&mut writer, &rows, files_only);
         stdout_flush(&mut writer);
         eprintln!(
-            "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
         if walk_error {
@@ -4357,7 +4480,7 @@ fn main() {
         stdout_write_all(&mut writer, &buf);
         stdout_flush(&mut writer);
         eprintln!(
-            "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
         if walk_error {
@@ -4392,7 +4515,7 @@ fn main() {
         stdout_write_all(&mut writer, &buf);
         stdout_flush(&mut writer);
         eprintln!(
-            "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
         if walk_error {
@@ -4479,7 +4602,7 @@ fn main() {
     }
     stdout_flush(&mut writer);
     eprintln!(
-        "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+        "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
         t0.elapsed().as_millis()
     );
     if walk_error {
