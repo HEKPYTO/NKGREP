@@ -1190,6 +1190,132 @@ fn try_serve_query(idx_path: &str, pattern: &str, top: Option<usize>) -> Option<
 /// memchr2 skips the common quote/backslash-free run; the gap holds only
 /// rare controls, scanned inline. Floats are NOT touched here: `emit_hit_json`
 /// formats `score` via serde_json so ryu output stays oracle-exact.
+fn push_escaped_json(out: &mut Vec<u8>, s: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let b = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    // First index in `b[pos..end)` holding a byte < 0x20, or `end` when the
+    // gap is control-free. SWAR fast path (ST-8 text-half): each 8-byte word
+    // is tested exactly via the zero-byte trick on `w & 0xE0..` (a byte is
+    // < 0x20 iff its top three bits are clear), so the common control-free
+    // gap skips the per-byte branch loop below; a flagged word falls through
+    // to the exact per-byte scan, which must find the control (the word test
+    // is exact, never a false positive). Tail bytes scan inline.
+    #[inline]
+    fn first_control(b: &[u8], pos: usize, end: usize) -> usize {
+        const E0: u64 = 0xE0E0_E0E0_E0E0_E0E0;
+        const LO: u64 = 0x0101_0101_0101_0101;
+        const HI: u64 = 0x8080_8080_8080_8080;
+        let mut k = pos;
+        let stop = pos + (end - pos) / 8 * 8;
+        while k < stop {
+            let v = u64::from_le_bytes(b[k..k + 8].try_into().unwrap());
+            let m = v & E0;
+            if (m.wrapping_sub(LO) & !m & HI) != 0 {
+                break;
+            }
+            k += 8;
+        }
+        while k < end {
+            if b[k] < 0x20 {
+                return k;
+            }
+            k += 1;
+        }
+        end
+    }
+    loop {
+        let rel = memchr::memchr2(b'"', b'\\', &b[i..]);
+        let end = match rel {
+            Some(r) => i + r,
+            None => b.len(),
+        };
+        // Control-free gaps (the corpus-common case: 0 of 51410 heavy texts
+        // hold a byte < 0x20) skip the per-byte loop; the escape loop below
+        // then resumes from the first real control with `start` untouched,
+        // which emits byte-identical output.
+        let mut j = first_control(b, i, end);
+        while j < end {
+            let c = b[j];
+            if c < 0x20 {
+                out.extend_from_slice(&b[start..j]);
+                match c {
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    0x08 => out.extend_from_slice(b"\\b"),
+                    0x0C => out.extend_from_slice(b"\\f"),
+                    _ => {
+                        out.extend_from_slice(b"\\u00");
+                        out.push(HEX[(c >> 4) as usize]);
+                        out.push(HEX[(c & 0xF) as usize]);
+                    }
+                }
+                start = j + 1;
+            }
+            j += 1;
+        }
+        match rel {
+            Some(_) => {
+                out.extend_from_slice(&b[start..end]);
+                out.extend_from_slice(if b[end] == b'"' { b"\\\"" } else { b"\\\\" });
+                start = end + 1;
+                i = end + 1;
+            }
+            None => break,
+        }
+    }
+    out.extend_from_slice(&b[start..]);
+}
+
+/// Manual cold-emission line from columnar fields (ST-5): byte-identical to
+/// `emit_hit_with_path` (same field order/separators, same path escaper,
+/// same serde/ryu score path); only the source of the fields differs.
+fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, score: f64) {
+    buf.extend_from_slice(b"{\"path\":\"");
+    buf.extend_from_slice(path_esc);
+    buf.extend_from_slice(b"\",\"line\":");
+    // itoa (ST-8 text-half): manual digits, byte-identical to Display, no
+    // core::fmt machinery per hit (~16 ns/hit on heavy-full replay).
+    let mut tmp = [0u8; 20];
+    let mut v = line;
+    let mut len = 0usize;
+    if v == 0 {
+        tmp[19] = b'0';
+        len = 1;
+    } else {
+        while v > 0 {
+            len += 1;
+            tmp[20 - len] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    buf.extend_from_slice(&tmp[20 - len..]);
+    buf.extend_from_slice(b",\"text\":\"");
+    push_escaped_json(buf, text);
+    buf.extend_from_slice(b"\",\"score\":");
+    serde_json::to_writer(&mut *buf, &score).unwrap();
+    buf.extend_from_slice(b"}\n");
+}
+
+/// Manual cold-emission Hit line with a pre-escaped path: field order and
+/// separators match the derived Serialize impl; only text/path escaping is
+/// hand-rolled, floats stay on the serde (ryu) path. Test-only since the
+/// cold path went columnar; the differential oracle pins it byte-identical.
+#[cfg(test)]
+fn emit_hit_with_path(buf: &mut Vec<u8>, h: &Hit, path_esc: &[u8]) {
+    emit_raw_with_path(buf, path_esc, h.line, &h.text, h.score)
+}
+
+/// Manual cold-emission Hit line: escapes the path inline (tests, fallback).
+#[cfg(test)]
+fn emit_hit_json(buf: &mut Vec<u8>, h: &Hit) {
+    let mut p = Vec::with_capacity(h.path.len() + 2);
+    push_escaped_json(&mut p, &h.path);
+    emit_hit_with_path(buf, h, &p);
+}
+
 fn usage() -> ! {
     eprintln!("usage: nkgrep index <path> [--index FILE]");
     eprintln!("       nkgrep serve --index FILE --port PORT");
@@ -1687,3 +1813,155 @@ mod literal_tests {
 }
 
 #[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    fn quoted_manual(s: &str) -> Vec<u8> {
+        let mut m = Vec::with_capacity(s.len() + 2);
+        m.push(b'"');
+        push_escaped_json(&mut m, s);
+        m.push(b'"');
+        m
+    }
+
+    fn check_str(s: &str) {
+        let o = serde_json::to_vec(&s).unwrap();
+        assert_eq!(quoted_manual(s), o, "escape divergence on {s:?}");
+    }
+
+    fn check_hit(path: &str, line: u64, text: &str, score: f64) {
+        let h = Hit {
+            path: Arc::new(path.to_string()),
+            line,
+            text: text.to_string(),
+            score,
+        };
+        let mut m = Vec::new();
+        emit_hit_json(&mut m, &h);
+        let mut o = serde_json::to_vec(&h).unwrap();
+        o.push(b'\n');
+        assert_eq!(m, o, "hit divergence on {path:?}:{line}:{text:?}:{score:?}");
+    }
+
+    #[test]
+    fn fuzz_vs_serde_full_matrix() {
+        // Every single byte 0x00-0x7F standalone.
+        for b in 0u8..=0x7Fu8 {
+            check_str(&char::from_u32(b as u32).unwrap().to_string());
+        }
+        // Every control/quote/backslash embedded in text.
+        let mut specials: Vec<char> = (0u8..0x20).map(|b| b as char).collect();
+        specials.push('"');
+        specials.push('\\');
+        for c in &specials {
+            check_str(&format!("a{c}b"));
+            check_str(&format!("{c}lead"));
+            check_str(&format!("trail{c}"));
+        }
+        // Full pair matrix over specials (byte-identical gate).
+        for a in &specials {
+            for b in &specials {
+                check_str(&format!("{a}{b}"));
+                check_str(&format!("x{a}y{b}z"));
+            }
+        }
+        // Must-NOT-escape: DEL, high bytes via multibyte, slashes.
+        for s in [
+            "\x7f",
+            "caf\u{e9}",
+            "\u{1f600}",
+            "\u{fffd}",
+            "\u{4e2d}\u{6587}",
+            "e\u{301}",
+            "a/b\\c",
+            "/abs/path/x.txt",
+            "tab\there",
+            "nl\nhere",
+            "cr\rhere",
+            "bs\x08here",
+            "ff\x0chere",
+            "q\"q",
+            "b\\b",
+            "\"quoted\"",
+            "\\\\unc\\\\path",
+            "",
+            "plain ascii line with spaces 123",
+        ] {
+            check_str(s);
+        }
+        // Hit-level sweep: lines x scores x tricky strings. Floats stay on
+        // the serde path (ryu); this locks byte-identity including score.
+        let texts = [
+            "plain",
+            "q\"q\\",
+            "a\nb\tc",
+            "\x01\x02\x1f mid \x7f",
+            "uni \u{1f600} \u{fffd}",
+            "",
+            "trail\\",
+        ];
+        let lines = [0u64, 1, 42, u64::MAX];
+        let scores = [
+            0.0,
+            -0.0,
+            1.5,
+            -42.25,
+            123456.789,
+            1e-7,
+            1e300,
+            99.999999,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        for t in texts {
+            for l in lines {
+                for s in scores {
+                    check_hit("corpus/pkg_0/m_0.txt", l, t, s);
+                    check_hit("we\"ird\\path\x01.txt", l, t, s);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_vs_serde_corpus_bytes() {
+        // Every line of the real bench corpus as `text`, every file path as
+        // `path`: the differential oracle over actual emission bytes.
+        let root = std::path::Path::new("bench/corpus");
+        if !root.exists() {
+            return;
+        }
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        let mut n = 0usize;
+        for p in &files {
+            check_str(&p.to_string_lossy());
+            let data = std::fs::read(p).unwrap();
+            for line in data.split(|&b| b == b'\n') {
+                let s = String::from_utf8_lossy(line);
+                check_str(&s);
+                // Spot Hit-level check per file: first line only keeps it fast.
+                if n < 2000 && line.as_ptr() == data.as_ptr() {
+                    check_hit(&p.to_string_lossy(), 1, &s, 12.5);
+                }
+                n += 1;
+                if n >= 60000 {
+                    return;
+                }
+            }
+        }
+        assert!(n > 1000, "corpus fuzz saw too few lines: {n}");
+    }
+}
