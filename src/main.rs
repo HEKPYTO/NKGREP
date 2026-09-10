@@ -217,6 +217,150 @@ fn parse_index(idx_path: &str, data: &str) -> Index {
 /// Keys are packed trigrams (gram_pack), sorted numeric on write for stable
 /// bytes. Any truncation → loud exit 2. NKGREP01 (u64 widths + String keys)
 /// is refused loudly as a stale format, same as a fingerprint mismatch.
+const BIN_MAGIC: &[u8; 8] = b"NKGREP02";
+const OLD_BIN_MAGIC: &[u8; 8] = b"NKGREP01";
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn encode_index_bin(idx: &Index) -> Vec<u8> {
+    let mut out = Vec::with_capacity(idx.files.len() * 40);
+    out.extend_from_slice(BIN_MAGIC);
+    put_u64(&mut out, idx.root_dev);
+    put_u64(&mut out, idx.root_ino);
+    put_u32(&mut out, idx.root.len() as u32);
+    out.extend_from_slice(idx.root.as_bytes());
+    put_u32(&mut out, idx.files.len() as u32);
+    for f in &idx.files {
+        put_u32(&mut out, f.len() as u32);
+        out.extend_from_slice(f.as_bytes());
+    }
+    let mut keys: Vec<u32> = idx.postings.keys().copied().collect();
+    keys.sort();
+    put_u32(&mut out, keys.len() as u32);
+    for k in keys {
+        let ids = &idx.postings[&k];
+        put_u32(&mut out, k);
+        put_u32(&mut out, ids.len() as u32);
+        for id in ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+    out
+}
+
+fn parse_index_bin(idx_path: &str, data: &[u8]) -> Index {
+    let refuse = |why: &str| -> ! {
+        eprintln!("nkgrep: unreadable index {idx_path} (truncated binary? rebuild with `nkgrep index`): {why}");
+        std::process::exit(2);
+    };
+    let mut cur = BIN_MAGIC.len();
+    let take = |cur: &mut usize, n: usize| -> &[u8] {
+        let end = cur.checked_add(n).unwrap_or(usize::MAX);
+        if end > data.len() {
+            refuse("unexpected end of file");
+        }
+        let s = &data[*cur..end];
+        *cur = end;
+        s
+    };
+    let u64_at = |cur: &mut usize| -> u64 {
+        let b = take(cur, 8);
+        u64::from_le_bytes(b.try_into().unwrap())
+    };
+    let u32_at = |cur: &mut usize| -> u32 {
+        let b = take(cur, 4);
+        u32::from_le_bytes(b.try_into().unwrap())
+    };
+    let str_at = |cur: &mut usize| -> String {
+        let n = u32_at(cur) as usize;
+        if n > data.len() {
+            refuse("bad length prefix");
+        }
+        match std::str::from_utf8(take(cur, n)) {
+            Ok(s) => s.to_owned(),
+            Err(_) => refuse("non-utf8 path"),
+        }
+    };
+    let root_dev = u64_at(&mut cur);
+    let root_ino = u64_at(&mut cur);
+    let root = str_at(&mut cur);
+    let nfiles = u32_at(&mut cur) as usize;
+    if nfiles > data.len() {
+        refuse("bad file count");
+    }
+    let mut files = Vec::with_capacity(nfiles.min(1 << 20));
+    for _ in 0..nfiles {
+        files.push(str_at(&mut cur));
+    }
+    let npost = u32_at(&mut cur) as usize;
+    if npost > data.len() {
+        refuse("bad posting count");
+    }
+    let mut postings = HashMap::with_capacity(npost.min(1 << 20));
+    for _ in 0..npost {
+        let k = u32_at(&mut cur);
+        // No vlen-vs-nfiles cap: distinct byte triples share no key now,
+        // but one file still pushes its id once per key while vlen counts
+        // ids, not files. Per-id range checks below still reject corruption.
+        let vlen = u32_at(&mut cur) as usize;
+        let raw = take(&mut cur, vlen.saturating_mul(4));
+        if raw.len() != vlen * 4 {
+            refuse("bad posting length");
+        }
+        let mut ids = Vec::with_capacity(vlen);
+        for c in raw.chunks_exact(4) {
+            let id = u32::from_le_bytes(c.try_into().unwrap());
+            if id as usize >= nfiles {
+                refuse("posting id out of range");
+            }
+            ids.push(id);
+        }
+        postings.insert(k, ids);
+    }
+    let idx = Index { root, root_dev, root_ino, files, postings };
+    if idx.files.iter().any(|p| PathBuf::from(p).is_absolute()) {
+        eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
+        std::process::exit(2);
+    }
+    idx
+}
+
+/// Read raw index bytes once; binary (magic) vs JSON dispatch lives here so
+/// both load helpers share it with unchanged signatures.
+fn read_index_bytes(idx_path: &str) -> Vec<u8> {
+    match std::fs::read(idx_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("nkgrep: cannot read index {idx_path}: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+fn parse_index_auto(idx_path: &str, data: &[u8]) -> Index {
+    if data.starts_with(BIN_MAGIC) {
+        return parse_index_bin(idx_path, data);
+    }
+    if data.starts_with(OLD_BIN_MAGIC) || data.starts_with(b"NKGREP") {
+        eprintln!("nkgrep: stale index format {idx_path} (expected NKGREP02): rebuild with `nkgrep index`");
+        std::process::exit(2);
+    }
+    match std::str::from_utf8(data) {
+        Ok(s) => parse_index(idx_path, s),
+        Err(e) => {
+            eprintln!("nkgrep: unreadable index {idx_path} (old format? rebuild with `nkgrep index`): {e}");
+            std::process::exit(2);
+        }
+    }
+}
+/// Load an index for a query rooted at `query_root`: refuse (exit 2) on
+/// fingerprint mismatch, then materialize root-relative entries to
+/// query-root-joined paths so rank/verify see scan-identical strings.
 fn load_index_for_query(idx_path: &str, query_root: &PathBuf) -> Index {
     let data = read_index_bytes(idx_path);
     let mut idx = parse_index_auto(idx_path, &data);
