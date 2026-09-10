@@ -1,4 +1,4 @@
-"""Indexed bakeoff: scan-nk vs indexed-nk (full, equality) vs indexed top-k vs rg.
+"""Indexed bakeoff: scan-nk vs indexed-nk (full, sets must match) vs indexed top-k vs rg.
 Index stores paths under root "corpus" from HERE, so indexed runs use cwd=HERE.
 Kill gates: (A) indexed full sets equal rg sets. (B) selective indexed total
 <= scan total. (C) top-k latency on concentrated query beats rg full."""
@@ -77,7 +77,7 @@ def med(cmd, cwd):
 
 def main():
     assert IDX.exists(), "build index first: nkg index corpus --index nk.idx.json"
-    print("== gate A: oracle (indexed full vs rg full) ==")
+    print("== gate A: match sets (indexed full vs rg full) ==")
     a_ok = True
     for q in FULL_QUERIES:
         r, g = rg_set(q), nk_indexed_set(q)

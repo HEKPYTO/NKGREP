@@ -124,7 +124,7 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
         path_bonus: file_score,
     };
     // `with` (not try_with): destroyed-TLS fallback returning empty would
-    // silently drop matches and break the equality; loud panic is correct.
+    // silently drop matches and break set equality; loud panic is correct.
     // Any IO/search error still discards partial hits, as before.
     let ok = SEARCHER.with(|s| {
         BUF.with(|b| {
@@ -244,7 +244,7 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
         path_bonus: file_score,
     };
     // `with` (not try_with): destroyed-TLS fallback returning empty would
-    // silently drop matches and break the equality; loud panic is correct.
+    // silently drop matches and break set equality; loud panic is correct.
     // Any IO/search error still discards partial hits, as before.
     let ok = SEARCHER.with(|s| {
         BUF.with(|b| {
@@ -568,7 +568,7 @@ fn parse_index_bin(idx_path: &str, data: &[u8]) -> Index {
 /// Hostile-index memory bound: an index file larger than
 /// `MAX_INDEX_BYTES` refuses the whole operation loudly (exit 2, never a
 /// silent truncation or per-file drop — either would break the
-/// indexed==scan equality by searching a subset while claiming the full
+/// indexed==scan check by searching a subset while claiming the full
 /// corpus). The read itself is length-capped so a file that grows past
 /// the pre-check between metadata and read still cannot OOM the loader;
 /// under-cap files take the identical bytes as before.
@@ -2851,7 +2851,7 @@ fn try_serve_query(
 /// (lowercase hex, matching serde_json); UTF-8 multibyte passes through.
 /// memchr2 skips the common quote/backslash-free run; the gap holds only
 /// rare controls, scanned inline. Floats are NOT touched here: callers format
-/// `score` via serde_json so ryu output stays equality-exact.
+/// `score` via serde_json so ryu output stays byte-exact.
 fn push_escaped_json(out: &mut Vec<u8>, s: &str) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let b = s.as_bytes();
@@ -3229,7 +3229,7 @@ fn serve_text_out(raw: &[u8], pattern: &str, ignore_case: bool, color_on: bool) 
 }
 
 // Real emission fns (`emit_raw_with_path` + `push_escaped_json`) are exercised
-// directly by the escape equality below; no test-only wrappers.
+// directly by the escape check below; no test-only wrappers.
 
 const USAGE: &str = "usage: nkg index <path> [--index FILE]\n       nkg serve --index FILE --port PORT\n       nkg [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-./--hidden] [--no-ignore] [-L/--follow] [-g/--glob GLOB] [-d/--max-depth N] [--max-filesize N] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
 
@@ -3429,9 +3429,9 @@ fn main() {
             }
             j += 1;
         }
-        // Audit #11: `--port` is required (usage exit 2). The old random-bind
-        // (port 0) is gone: no caller relies on it (README/frozen record/serve-first
-        // all use explicit ports; only this site called `cmd_serve`).
+        // `--port` is required (usage exit 2). The old random-bind
+        // (port 0) is gone: no caller relies on it; only this site
+        // called `cmd_serve`.
         if !have_port {
             usage();
         }
@@ -4128,7 +4128,7 @@ fn main() {
     };
     // ST-5 columnar cold path: borrow-banked FileHits (pid = file id when
     // indexed, ptab index on scan) + flattened side scores vec + pid-indexed
-    // escaped paths. Serve emits the same banked path; the equality pins both
+    // escaped paths. Serve emits the same banked path; the check pins both
     // byte-identical.
     let mut hits: Vec<FileHits> = vec![];
     let mut walk_error = false;
@@ -4529,7 +4529,7 @@ fn main() {
     // Ordered parallel emission (cold emission only): manual memchr escaper
     // into chunk buffers per-thread, join in order, single sequential write.
     // Serial fallback under threshold keeps selective/small queries off the
-    // rayon ramp. serde_json remains the differential equality in tests.
+    // rayon ramp. serde_json remains the differential check in tests.
     // Each unique path is escaped once per query (heavy-full emits 51k hits
     // from ~3k files) into a pid-indexed table: no per-hit HashMap, no Arc.
     // Indexed pids address the index file table, scan pids the ptab.
@@ -5054,7 +5054,7 @@ mod escape_tests {
     #[test]
     fn fuzz_vs_serde_corpus_bytes() {
         // Every line of the real bench corpus as `text`, every file path as
-        // `path`: the differential equality over actual emission bytes.
+        // `path`: the differential check over actual emission bytes.
         let root = std::path::Path::new("bench/corpus");
         if !root.exists() {
             return;

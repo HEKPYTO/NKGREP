@@ -1,5 +1,5 @@
 """Deterministic synthetic corpus. No hidden files, no gitignore, all UTF-8 text,
-so walker differences between tools vanish and the equality compares pure search."""
+so walker differences between tools vanish and the comparison is pure search."""
 import random
 import shutil
 from pathlib import Path

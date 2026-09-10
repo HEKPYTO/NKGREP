@@ -30,7 +30,7 @@ walk -> index -> rank -> verify -> emit
   TCP on 127.0.0.1. `--use-index` prefers a live daemon and falls
   back to cold automatically.
 
-## Where to add things
+## Extension
 
 - New flag: arg-parse loop in `main`, one `usage()` line, one
   `print_help()` entry, then thread through cold + serve paths.
@@ -40,7 +40,7 @@ walk -> index -> rank -> verify -> emit
   (regex-syntax queries must fall back to full scan when trigrams
   can't prove candidacy — see `branch_needs_fallback`).
 
-## Invariants (do not break)
+## Invariants (Do Not Break)
 
 - Indexed full search equals scan full search on every query
   (`tests/oracle.rs` enforces it).

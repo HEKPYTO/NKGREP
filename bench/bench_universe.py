@@ -1,4 +1,4 @@
-"""Universe bakeoff: every installed grep vs rg reference. Differential equality
+"""Universe bakeoff: every installed grep vs rg reference. Differential match-set check
 (match sets must equal rg's) + median wall time. N/A entries carry reasons."""
 import json
 import os
@@ -156,7 +156,7 @@ def tool_set(name, q):
 def main():
     setup_git_corpus()
     ref = {}
-    print(f"{'tool':10s} " + " ".join(f"{q[:14]:>14s}" for q in QUERIES) + "   oracle")
+    print(f"{'tool':10s} " + " ".join(f"{q[:14]:>14s}" for q in QUERIES) + "   sets")
     results = {}
     with TgrepServe():
         for name in TOOLS:
