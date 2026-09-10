@@ -104,6 +104,47 @@ fn verify_one_raw(pid: u32, path: &str, matcher: &RegexMatcher, file_score: f64)
 /// Serve-side columnar verify: same TLS Searcher + 64 KB buffer +
 /// search_slice core and verbatim-banked sink as `verify_one_raw`, but the
 /// file bytes come through the daemon fd cache (`read_verify_bytes`).
+fn verify_one_raw_cached(
+    pid: u32,
+    path: &str,
+    matcher: &RegexMatcher,
+    file_score: f64,
+    fdc: Option<(&FdCache, u32)>,
+) -> Option<FileHits> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SEARCHER: RefCell<Searcher> = RefCell::new(SearcherBuilder::new().build());
+        static BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
+    }
+    let mut sink = ColCollector {
+        arena: vec![],
+        metas: vec![],
+        path_bonus: file_score,
+        depth_penalty: 0.0,
+    };
+    // `with` (not try_with): destroyed-TLS fallback returning empty would
+    // silently drop matches and break the oracle; loud panic is correct.
+    // Any IO/search error still discards partial hits, as before.
+    let ok = SEARCHER.with(|s| {
+        BUF.with(|b| {
+            let mut buf = b.borrow_mut();
+            buf.clear();
+            let mut searcher = s.borrow_mut();
+            (|| -> std::io::Result<bool> {
+                read_verify_bytes(fdc, path, &mut buf, false)?;
+                // Twin of the `verify_one_raw` early exit: empty files hold
+                // no matches; skip searcher setup identically.
+                if buf.is_empty() {
+                    return Ok(true);
+                }
+                Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
+            })()
+            .unwrap_or(false)
+        })
+    });
+    if ok && !sink.metas.is_empty() { Some(FileHits { pid, arena: sink.arena, metas: sink.metas }) } else { None }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Index {
     /// Canonical absolute path of the tree the index was built from.
@@ -124,6 +165,28 @@ struct Index {
 
 /// Canonical absolute fingerprint of a build/query root; exit 2 when the
 /// root does not resolve.
+fn load_index_for_serve(idx_path: &str) -> Index {
+    let data = read_index_bytes(idx_path);
+    let mut idx = parse_index_auto(idx_path, &data);
+    let base = PathBuf::from(&idx.root);
+    let live = canon_root(&base);
+    let (dev, ino) = root_cookie(&live);
+    if live.to_string_lossy() != idx.root
+        || (idx.root_dev != 0 && (dev, ino) != (idx.root_dev, idx.root_ino))
+    {
+        eprintln!(
+            "nkgrep: index root mismatch (built at {}, now at {})",
+            idx.root,
+            live.display()
+        );
+        std::process::exit(2);
+    }
+    for f in idx.files.iter_mut() {
+        *f = base.join(&*f).to_string_lossy().into_owned();
+    }
+    idx
+}
+
 fn walk_files(root: &PathBuf) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = vec![];
     for entry in WalkBuilder::new(root)
@@ -232,6 +295,211 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
 /// to a concurrent replace retries once, then fails like any IO error.
 /// Any metadata/open failure falls back to plain open+read, so the cache
 /// never fails where the uncached path succeeds.
+struct CachedFd {
+    fd: std::os::unix::io::RawFd,
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+impl Drop for CachedFd {
+    fn drop(&mut self) {
+        // SAFETY: fd owned from `into_raw_fd` on fill, closed exactly once
+        // (replace drops the old entry; daemon exit drops the slots).
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+/// Dense per-file slots (ids are 0..nfiles): one small mutex per file, so a
+/// warm pread hit never waits on another file's open and never hashes.
+struct FdCache {
+    slots: Vec<std::sync::Mutex<Option<CachedFd>>>,
+}
+
+impl FdCache {
+    fn new(nfiles: usize) -> Self {
+        let mut slots = Vec::with_capacity(nfiles);
+        for _ in 0..nfiles {
+            slots.push(std::sync::Mutex::new(None));
+        }
+        FdCache { slots }
+    }
+}
+
+/// Best-effort NOFILE bump so the daemon can hold one fd per indexed file.
+/// Never fails the daemon: when the ceiling stays low the cache just fills
+/// what fits and fill-open errors fall back to plain open+read.
+fn bump_nofile_for_cache(want_files: usize) {
+    // SAFETY: getrlimit/setrlimit with a valid stack struct; daemon tuning.
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim as *mut _) != 0 {
+            return;
+        }
+        let want = (want_files as libc::rlim_t).saturating_add(128);
+        if lim.rlim_cur >= want {
+            return;
+        }
+        let mut next = lim;
+        // Raising the ceiling needs privilege; EPERM is tolerated below.
+        next.rlim_max = next.rlim_max.max(want);
+        next.rlim_cur = want;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &next as *const _) != 0 {
+            next = lim;
+            next.rlim_cur = next.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &next as *const _);
+        }
+        let mut after: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut after as *mut _) == 0 {
+            eprintln!("nkgrep: NOFILE cur={} max={}", after.rlim_cur, after.rlim_max);
+        }
+    }
+}
+
+/// pread loop into `buf` from offset 0 to EOF (offset-free: safe on a fd
+/// shared across rayon workers). Appends like `read_to_end`.
+fn pread_all(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut off: libc::off_t = 0;
+    loop {
+        if buf.len() == buf.capacity() {
+            buf.reserve(8 * 1024);
+        }
+        // SAFETY: pread into the spare capacity; `set_len` covers exactly
+        // the bytes the kernel initialized; EINTR retries, EOF ends.
+        let n = unsafe {
+            let dst = buf.spare_capacity_mut();
+            libc::pread(
+                fd,
+                dst.as_mut_ptr() as *mut libc::c_void,
+                dst.len(),
+                off,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let n = n as usize;
+        off += n as libc::off_t;
+        // SAFETY: `n` bytes initialized by pread above.
+        unsafe {
+            buf.set_len(buf.len() + n);
+        }
+    }
+}
+
+fn plain_open_read(path: &str, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open(path)?.read_to_end(buf)?;
+    Ok(())
+}
+
+/// Serve-side file read: warm-fd hit serves stat + pread (no open/close and
+/// no path walk); miss or edit opens fresh, validates the fd's own metadata,
+/// and caches it. `retried` bounds the EBADF re-read after a concurrent
+/// replace closed the fd under us.
+fn read_verify_bytes(
+    fdc: Option<(&FdCache, u32)>,
+    path: &str,
+    buf: &mut Vec<u8>,
+    retried: bool,
+) -> std::io::Result<()> {
+    let (cache, id) = match fdc {
+        None => return plain_open_read(path, buf),
+        Some(x) => x,
+    };
+    let live = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return plain_open_read(path, buf),
+    };
+    let (len, modified) = match live.modified() {
+        Ok(t) => (live.len(), t),
+        Err(_) => return plain_open_read(path, buf),
+    };
+    let slot = match cache.slots.get(id as usize) {
+        Some(s) => s,
+        None => return plain_open_read(path, buf),
+    };
+    // Fast path: per-slot lock only, no open/hash while holding it.
+    // Poison-tolerant: a panicked holder must not wedge the daemon.
+    if let Some(fd) = slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|e| e.len == len && e.modified == modified)
+        .map(|e| e.fd)
+    {
+        match pread_all(fd, buf) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EBADF) && !retried => {
+                // Lost the fd to a concurrent replace: drop the dead entry
+                // and re-read once through the fresh path.
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                return read_verify_bytes(fdc, path, buf, true);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // Miss or edit: open + stat OUTSIDE the lock so one cold file never
+    // stalls other workers' warm pread hits.
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return plain_open_read(path, buf),
+    };
+    let (flen, fmod) = match f.metadata().and_then(|m| m.modified().map(|t| (m.len(), t))) {
+        Ok(x) => x,
+        Err(_) => return plain_open_read(path, buf),
+    };
+    // `f` drops here but the fd must survive: forget the File.
+    // SAFETY: `into_raw_fd` transfers ownership to the entry.
+    let fresh = {
+        use std::os::unix::io::IntoRawFd;
+        f.into_raw_fd()
+    };
+    let fd = {
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            // Recheck: another worker filled the same generation first.
+            Some(e) if e.len == flen && e.modified == fmod => {
+                let fd = e.fd;
+                // SAFETY: `fresh` came from `into_raw_fd` above and is now
+                // surplus; closing exactly once here keeps one owner.
+                unsafe {
+                    libc::close(fresh);
+                }
+                fd
+            }
+            _ => {
+                // Replace drops the old entry (closes its fd) if present.
+                *guard = Some(CachedFd { fd: fresh, len: flen, modified: fmod });
+                fresh
+            }
+        }
+    };
+    match pread_all(fd, buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EBADF) && !retried => {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            read_verify_bytes(fdc, path, buf, true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Query {
+    pattern: String,
+    top: Option<usize>,
+}
+
+/// Ranked candidate file ids with scores. None = no usable literal.
 fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
     let ors = query_grams(pattern)?;
     let n = idx.files.len() as f64;
@@ -294,6 +562,172 @@ fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
 /// only, comparator verbatim the Hit-order one (NaN fallback included), so
 /// the order — ties included — matches the stable fat-Hit sort given the
 /// same collect sequence. Sort traffic touches 8 B scores, never payloads.
+fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stream);
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        let t0 = Instant::now();
+        // Columnar serve emission: borrow-banked FileHits through the fd
+        // cache, rank once over the side scores vec, escape each unique
+        // path once, emit via emit_raw_with_path, single socket write.
+        // Byte-identical wire (one object per line plus the done line);
+        // no per-hit serde struct setup, no Arc path clones, no per-hit
+        // path escaping.
+        let mut broken = false;
+        match serde_json::from_str::<Query>(line.trim()) {
+            Err(_) => {}
+            Ok(q) => match build_matcher(&q.pattern) {
+                Err(e) => {
+                    if writeln!(writer, "{{\"error\":\"{e}\"}}").is_err() {
+                        broken = true;
+                    }
+                }
+                Ok(matcher) => {
+                    let order = ranked_candidates(&idx, &q.pattern).unwrap_or_else(|| {
+                        (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect()
+                    });
+                    let files: Vec<FileHits> = order
+                        .par_iter()
+                        .filter_map(|(id, s)| {
+                            verify_one_raw_cached(
+                                *id,
+                                &idx.files[*id as usize],
+                                &matcher,
+                                *s,
+                                Some((&*fdc, *id)),
+                            )
+                        })
+                        .collect();
+                    let (hit_scores, loc) = flat_scores(&files);
+                    let mut ord = raw_order(&hit_scores);
+                    if let Some(n) = q.top {
+                        ord.truncate(n);
+                    }
+                    let mut esc: Vec<Option<Vec<u8>>> = vec![None; idx.files.len()];
+                    for &i in &ord {
+                        let (fi, _) = loc[i as usize];
+                        let pid = files[fi as usize].pid as usize;
+                        if esc[pid].is_none() {
+                            let ps = &idx.files[pid];
+                            let mut v = Vec::with_capacity(ps.len() + 2);
+                            push_escaped_json(&mut v, ps);
+                            esc[pid] = Some(v);
+                        }
+                    }
+                    let mut buf = Vec::with_capacity(ord.len() * 160);
+                    for &i in &ord {
+                        let (fi, mi) = loc[i as usize];
+                        let fh = &files[fi as usize];
+                        let m = &fh.metas[mi as usize];
+                        let text = banked_text(fh, m);
+                        emit_raw_with_path(
+                            &mut buf,
+                            esc[fh.pid as usize].as_ref().unwrap(),
+                            m.line,
+                            &text,
+                            m.score,
+                        );
+                    }
+                    if writer.write_all(&buf).is_err() {
+                        broken = true;
+                    }
+                }
+            },
+        }
+        if writeln!(writer, "{{\"done\":true,\"ms\":{}}}", t0.elapsed().as_millis()).is_err() {
+            broken = true;
+        }
+        if writer.flush().is_err() {
+            broken = true;
+        }
+        if broken {
+            break;
+        }
+        line.clear();
+    }
+}
+
+fn serve_info_path(idx_path: &str) -> String {
+    format!("{idx_path}.serve.json")
+}
+
+#[derive(Serialize, Deserialize)]
+struct ServerInfo {
+    pid: u32,
+    port: u16,
+}
+
+fn save_serve_info(idx_path: &str, port: u16) {
+    let info = ServerInfo { pid: std::process::id(), port };
+    if let Ok(s) = serde_json::to_string(&info) {
+        let _ = std::fs::write(serve_info_path(idx_path), s + "\n");
+    }
+}
+
+/// Port recorded by a running `serve` for this index, or None when no
+/// server registered (missing or corrupt file reads as absent).
+fn cmd_serve(idx_path: &str, port: u16) {
+    let idx = Arc::new(load_index_for_serve(idx_path));
+    // O3: daemon-global warm-fd cache + fd headroom for one fd per file.
+    bump_nofile_for_cache(idx.files.len());
+    let fdc = Arc::new(FdCache::new(idx.files.len()));
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    save_serve_info(idx_path, bound);
+    eprintln!("nkgrep: serving {} files on 127.0.0.1:{bound}", idx.files.len());
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                let idx = idx.clone();
+                let fdc = fdc.clone();
+                std::thread::spawn(move || handle_client(s, idx, fdc));
+            }
+            Err(e) => eprintln!("nkgrep: accept error: {e}"),
+        }
+    }
+}
+
+/// Hot client fetch: returns the server's hit lines verbatim plus the hit
+/// count, without parsing Hits or re-serializing them. The server already
+/// emits final ranked order, so the bytes are stdout-ready; the old
+/// parse-then-to_string round trip only burned ~8-14 ms on heavy full.
+/// Skips blank lines and error lines exactly as the old `from_str::<Hit>`
+/// fallible parse dropped them (a bad-regex error reply yields empty
+/// stdout, exit 1 below).
+fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let req = serde_json::to_string(&Query {
+        pattern: pattern.to_string(),
+        top,
+    })
+    .unwrap();
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(b"\n").unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut raw = vec![];
+    let mut matches = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let t = line.trim();
+        if t.contains("\"done\"") {
+            break;
+        }
+        if t.is_empty() || t.contains("\"error\"") {
+            continue;
+        }
+        matches += 1;
+        raw.extend_from_slice(line.as_bytes());
+    }
+    (raw, matches)
+}
+/// Serve-first probe for `--use-index`: connect to the daemon registered in
+/// `<index>.serve.json`, if any. Any failure (no file, no listener, bad
+/// reply) returns None so the caller falls back to the cold index load.
 fn usage() -> ! {
     eprintln!("usage: nkgrep index <path> [--index FILE]");
     eprintln!("       nkgrep serve --index FILE --port PORT");
