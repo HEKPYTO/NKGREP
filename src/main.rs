@@ -2916,6 +2916,17 @@ fn print_help() {
         "  --group-separator SEP\n",
         "                     separator between disjoint context groups in one\n",
         "                     file (default `--`; empty prints none)\n",
+        "  --top N            print only the top N ranked matches\n",
+        "  --use-index FILE   load this index file for the query, consulting the\n",
+        "                     daemon registered for it first and falling back to a\n",
+        "                     local index load when the server is unreachable\n",
+        "  --port PORT        query the daemon on PORT instead of searching locally\n",
+        "  --                 end the flag scan, so a pattern beginning with -\n",
+        "                     is searched literally\n",
+        "  --index FILE       for index and serve, use FILE as the index file\n",
+        "                     (default: .nkgrep.json)\n",
+        "  -h, --help         print help to stdout and exit 0\n",
+        "  -V, --version      print the version to stdout and exit 0\n",
     );
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
