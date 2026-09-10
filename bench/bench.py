@@ -1,5 +1,5 @@
 """Neutral bakeoff: rg --json vs nkg. Asserts identical match sets (differential
-equality), reports median wall time over N runs, prints kill verdict."""
+match sets), reports median wall time over N runs, prints kill verdict."""
 import json
 import statistics
 import subprocess
@@ -65,7 +65,7 @@ def median_time(cmd, cwd):
 def main():
     if not NK.exists():
         sys.exit("build first: cargo build --release")
-    print(f"{'query':28s} {'rg_ms':>9s} {'nk_ms':>9s} {'matches':>8s} oracle")
+    print(f"{'query':28s} {'rg_ms':>9s} {'nk_ms':>9s} {'matches':>8s} sets")
     all_ok, all_fast = True, True
     for q in QUERIES:
         rset, gset = rg_set(q), nk_set(q)

@@ -19,7 +19,7 @@ competitive.
 | `corpus-git/` | Same text under git, for `git grep` comparisons |
 | `corpus-tgrep/` | Same text served by a `tgrep` server |
 | `nk.idx.json` / `nk.idx.bin` | Prebuilt index files over `corpus/` |
-| `archived runs/` | Dated example result snapshots |
+| run artifacts | Per-run numbers stay local and untracked |
 
 ## Corpora
 
@@ -52,7 +52,7 @@ shapes those tools need (a git checkout and a served tree). You do not
 build them by hand: `bench_universe.py` prepares the git copy and
 starts/stops the `tgrep` server on its own each run.
 
-## Query set
+## Query Set
 
 All four scripts use the same four queries, from highly selective to
 match-everything:
@@ -153,14 +153,11 @@ are required.
 
 ```sh
 python3 bench/collect_progress.py --public-simple
-# writes local runs/progress.csv + local runs/progress.png (private, gitignored)
-#   and bench/benchmark.png (the public chart, tracked in git)
+# redraws bench/benchmark.png from stored past medians
 ```
 
 By default this plots a stored table of past medians (no measuring —
-fast and deterministic) and upserts those rows into
-`local runs/progress.csv`, keyed by date, source, query, and tool, so
-re-runs never duplicate rows. To measure fresh numbers on your machine
+fast and deterministic). To measure fresh numbers on your machine
 and overlay them instead (slow; needs the full tool set and
 `matplotlib`):
 
@@ -181,18 +178,8 @@ python3 bench/collect_progress.py --live --runs 3 --date 2026-09-10
 - **Every plotted bar passed match-set equality vs ripgrep.** A bar
   that diverged would not be plotted as a time at all.
 
-The same run also writes `local runs/progress.png`, a detailed local-only
-variant with footnotes recording the exact command, query, and session
-behind each bar. It lives under `local runs/`, which is gitignored, so it
-stays on your disk — `bench/benchmark.png` is the chart to share.
-
-`local runs/progress.csv` holds the same data in tabular form
-(`date, source, tool, query, median_ms`, plus the EQUAL/DIVERGE
-equality column), one row per plotted bar.
-
-`bench/archived runs/` keeps dated example snapshots of full result
-printouts; each file records at the top the corpus, method, and per-run
-numbers behind its verdict lines.
+Run artifacts (numbers behind each bar) stay local and untracked —
+`bench/benchmark.png` is the chart to share.
 
 ## Reproducibility method
 

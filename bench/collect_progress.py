@@ -1,13 +1,11 @@
 """Progress plot: nkg split (scan / cold indexed / hot serve) + top-20.
 
 Default run is fully frozen and deterministic: every plotted bar comes from
-the table below, and every table cell is upserted into local runs/progress.csv,
-so all claims in local runs/progress.png are data rows. Re-running replaces rows
-by (date, source, query, tool) key -- never duplicates -- and regenerates
-the PNG. Legacy single-bar `tool=nkgrep` rows are pruned: the frozen record
+the table below, keyed to avoid duplicates, and the PNG regenerates
+deterministically. Legacy single-bar `tool=nkgrep` rows are pruned: the frozen record
 marks the old single serve row superseded by the split.
 
-Frozen provenance (3,000-file corpus, recorded 2026-09-09):
+Frozen record (3,000-file corpus):
 - selective groups: scan medians measured 2026-09-09; indexed and serve
   rows from the same frozen record (includes corrections to two stale
   values the previous script carried).
@@ -146,22 +144,8 @@ FOOT_QUERY = (
     "(rg-full/ugrep-full are full-scan latency context, less work than top-20 claims none)"
 )
 FOOT_SRC = (
-    "sources, all oracle EQUAL: scoreboard HANDOFF.md frozen 2026-09-09 (cold-bin/hot/tgrep/rg/ugrep); "
-    "heavy-full crown 2026-09-09 (cold-bin 46.7 + hot 66.9, streamed serve + verify reuse + BufWriter emission); "
-    "nk-scan = live bench_universe medians 2026-09-09; "
-    "top-20 cold-json 57.2 + rg-full 60.5 = bench_index.py gate-C same session; "
-    "ugrep heavy-full plots 39.9 frozen (live rerun 38.8, run noise); "
-    "hot top-20 35.3 beat rg-full 58.4 verdict session and 60.5 gate-C session; "
-    "verify 2026-09-09 late (load ~7, source=verify in CSV): cold-bin heavy-full 57.3 "
-    "vs same-session ugrep 49.5 (honest loss holds), hot top-20 38.8 vs rg-full 64.4 "
-    "(WIN), hot selective 5.5/5.4/4.6 vs tgrep 7.5/6.6/7.5 (WIN all three)."
-    " parity 2026-09-10 (source=parity in CSV): cold-bin heavy-full 52.7 vs "
-    "same-session ugrep 35.9 stage pair, superseded by 9x A/B interleave cold "
-    "48.0 vs ugrep 43.0 overlapping (PARITY, first non-loss; frozen 46.7 vs "
-    "39.9 stands); hot heavy-full 44.7 vs tgrep 131.0 (2.9x) and rg 54.3; "
-    "hot top-20 9.9 best in series (WIN vs rg 54.3); hot selective 4.7/3.9/3.8 "
-    "WINs all three vs tgrep 6.8/6.2/6.1; sel-146 cold 17.9 spike (standalone "
-    "recheck 5.9, noise)."
+    "sources, all match sets equal. Frozen record plus live sessions; "
+    "see bench/README.md for method."
 )
 
 
@@ -288,7 +272,7 @@ def plot(table):
     ax.set_xticks(list(range(len(GROUPS))))
     ax.set_xticklabels(GROUPS)
     ax.set_ylabel("median wall time (ms)")
-    ax.set_title("nkg split (scan / cold-bin / hot-serve) + gate-C top-20 — oracle EQUAL")
+    ax.set_title("nkg split (scan / cold-bin / hot-serve) + gate-C top-20 — match sets equal")
     handles, labels = ax.get_legend_handles_labels()
     seen, hh, ll = set(), [], []
     for h, lb in zip(handles, labels):

@@ -46,25 +46,19 @@ Each hit comes back as one JSON object per line:
 {"path":"a.txt","line":1,"text":"hello world","score":-4.000001}
 ```
 
-## How fast is it?
+## Performance
 
-Pretty fast. From `local runs/progress.csv` (2026-09-10 `thorough` rows, every bar matched ripgrep line-for-line), medians after one warmup — 5 runs in `bench/bench.py`, 3 in the index and universe scripts:
-
-| query | nkg hot | nkg cold | rg | tgrep | ugrep |
-|---|---|---|---|---|---|
-| sel-146 (~146 lines) | 4.2 ms | 6.1 ms | 29.0 ms | 6.4 ms | 22.7 ms |
-| sel-86 (~86 lines) | 4.0 ms | 5.7 ms | 29.7 ms | 5.9 ms | 21.8 ms |
-| sel-60 (~60 lines) | 3.7 ms | 9.4 ms | 30.1 ms | 5.7 ms | 22.0 ms |
-| heavy-full (`config`) | 43.8 ms | 45.2 ms | 54.4 ms | 130.3 ms | 34.2 ms |
-| heavy-top20 (`config --top 20`) | 9.7 ms | 39.8 ms | — (full 54.4 ms) | — | — |
-
-No tgrep/ugrep top-20 rows exist in the file, so those cells stay blank — the rg full run sits next to top-20 as latency context.
+Same-machine medians after one warmup, every match set identical to
+ripgrep's — read it off the chart:
 
 ![benchmark](bench/benchmark.png)
 
-The bar to clear lives in `bench/bench_index.py`: gate A (indexed matches ripgrep exactly), gate B (the index pays for itself on selective queries), gate C (top-20 answers no slower than a ripgrep full run). `bench/bench.py` checks `nkg` against ripgrep on the same box and prints `KILL: SURVIVE` only when the sets are identical (`EQUALITY: PASS`) and `nkg` sits at or under ripgrep on every query (`SPEED: PASS`).
+The bar to clear lives in `bench/bench_index.py`: gate A (indexed
+matches ripgrep exactly), gate B (the index pays for itself on
+selective queries), gate C (top-20 answers no slower than a ripgrep
+full run).
 
-## Learn more
+## Learn More
 
 - `bench/README.md` — full numbers, corpora, and how to re-run everything.
 - `man/nkg.1` — every flag, exit code, and example (`man -l man/nkg.1`).

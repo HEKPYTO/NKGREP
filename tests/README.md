@@ -2,11 +2,11 @@
 
 ## Contract
 
-`oracle.rs` enforces the one rule everything else rests on:
+`oracle.rs` (match-set equality suite) enforces the one rule everything else rests on:
 **indexed full search must equal scan full search on every query.**
 Any divergence fails the suite.
 
-## Fixture (100-file equality fixture — not the 3,000-file bench corpus)
+## Fixture (100-File Fixture in oracle.rs — Not the 3,000-File Bench Corpus)
 
 A planted tree (4 packages × 25 files × 20 lines = 100 text files) plus
 a binary file, built fresh per run under the system temp dir. This is
