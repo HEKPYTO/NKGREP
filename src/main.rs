@@ -23,12 +23,8 @@ struct Hit {
     score: f64,
 }
 
-/// ST-5 columnar hits, borrow-banked text (cold + serve): narrow per-hit
-/// record keyed by file id; match bytes are banked verbatim into a per-file
-/// arena (one amortized alloc per matched file, zero per hit) and decoded
-/// with the exact eager expression (`from_utf8_lossy` + char-trim) at emit,
-/// where valid UTF-8 borrows and only invalid-UTF8 hits allocate — the same
-/// hits that allocated before. Wire bytes stay identical.
+/// Columnar hit: per-file arena banks match bytes verbatim; decode at emit.
+/// Wire bytes identical to the eager path.
 struct HitMeta {
     line: u64,
     start: u32,
@@ -40,11 +36,8 @@ struct FileHits {
     pid: u32,
     arena: Vec<u8>,
     metas: Vec<HitMeta>,
-    /// Context line table (ContextLines): byte offset of each 1-based line
-    /// start over `arena`. Empty unless verified with context>0, in which
-    /// case the arena holds the full file bytes verbatim (one copy — match
-    /// bytes are slices of it, never duplicated) and every meta points into
-    /// it. The no-context path never fills it, so default output is untouched.
+    /// Line-start offsets over `arena`; empty unless context>0 (then arena
+    /// holds the full file bytes verbatim).
     line_starts: Vec<u32>,
 }
 
@@ -52,7 +45,6 @@ struct ColCollector {
     arena: Vec<u8>,
     metas: Vec<HitMeta>,
     path_bonus: f64,
-    depth_penalty: f64,
 }
 
 impl Sink for ColCollector {
@@ -61,7 +53,7 @@ impl Sink for ColCollector {
     fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         let line_no = m.line_number().unwrap_or(0);
         let bytes = m.bytes();
-        let score = self.path_bonus - self.depth_penalty - (line_no as f64) / 1e6;
+        let score = self.path_bonus - (line_no as f64) / 1e6;
         let start = self.arena.len() as u32;
         self.arena.extend_from_slice(bytes);
         let end = self.arena.len() as u32;
@@ -130,7 +122,6 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
         arena: vec![],
         metas: vec![],
         path_bonus: file_score,
-        depth_penalty: 0.0,
     };
     // `with` (not try_with): destroyed-TLS fallback returning empty would
     // silently drop matches and break the equality; loud panic is correct.
@@ -251,7 +242,6 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
         arena: vec![],
         metas: vec![],
         path_bonus: file_score,
-        depth_penalty: 0.0,
     };
     // `with` (not try_with): destroyed-TLS fallback returning empty would
     // silently drop matches and break the equality; loud panic is correct.
@@ -845,7 +835,6 @@ fn search_stdin_raw_inv(buf: &[u8], matcher: &RegexMatcher, invert: bool) -> Opt
         arena: vec![],
         metas: vec![],
         path_bonus: 0.0,
-        depth_penalty: 0.0,
     };
     let ok = SEARCHER.with(|s| {
         let mut local: Option<Searcher> = None;
@@ -2755,8 +2744,8 @@ fn try_serve_query(
 /// `\n`/`\r`/`\t`/0x08/0x0C use short forms, other controls `\u00XX`
 /// (lowercase hex, matching serde_json); UTF-8 multibyte passes through.
 /// memchr2 skips the common quote/backslash-free run; the gap holds only
-/// rare controls, scanned inline. Floats are NOT touched here: `emit_hit_json`
-/// formats `score` via serde_json so ryu output stays equality-exact.
+/// rare controls, scanned inline. Floats are NOT touched here: callers format
+/// `score` via serde_json so ryu output stays equality-exact.
 fn push_escaped_json(out: &mut Vec<u8>, s: &str) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let b = s.as_bytes();
@@ -2835,16 +2824,8 @@ fn push_escaped_json(out: &mut Vec<u8>, s: &str) {
     }
     out.extend_from_slice(&b[start..]);
 }
-
-/// Manual cold-emission line from columnar fields (ST-5): byte-identical to
-/// `emit_hit_with_path` (same field order/separators, same path escaper,
-/// same serde/ryu score path); only the source of the fields differs.
-fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, score: f64) {
-    buf.extend_from_slice(b"{\"path\":\"");
-    buf.extend_from_slice(path_esc);
-    buf.extend_from_slice(b"\",\"line\":");
-    // itoa (ST-8 text-half): manual digits, byte-identical to Display, no
-    // core::fmt machinery per hit (~16 ns/hit on heavy-full replay).
+/// Manual u64 digits, byte-identical to Display, no fmt machinery per hit.
+fn push_line_no(buf: &mut Vec<u8>, line: u64) {
     let mut tmp = [0u8; 20];
     let mut v = line;
     let mut len = 0usize;
@@ -2859,6 +2840,28 @@ fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str,
         }
     }
     buf.extend_from_slice(&tmp[20 - len..]);
+}
+/// Resolve the display path for a file id: index table when indexed, else scan table.
+fn path_of<'a>(
+    idx_opt: &'a Option<Index>,
+    ptab: &'a [String],
+    hits_indexed: bool,
+    pid: usize,
+) -> &'a str {
+    match idx_opt {
+        Some(idx) if hits_indexed => &idx.files[pid],
+        _ => &ptab[pid],
+    }
+}
+
+/// Manual cold-emission line from columnar fields: byte-identical to the
+/// derived Serialize impl (same field order/separators, same path escaper,
+/// same serde/ryu score path); only the source of the fields differs.
+fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, score: f64) {
+    buf.extend_from_slice(b"{\"path\":\"");
+    buf.extend_from_slice(path_esc);
+    buf.extend_from_slice(b"\",\"line\":");
+    push_line_no(buf, line);
     buf.extend_from_slice(b",\"text\":\"");
     push_escaped_json(buf, text);
     buf.extend_from_slice(b"\",\"score\":");
@@ -2872,21 +2875,7 @@ fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str,
 fn emit_text_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
     buf.extend_from_slice(path.as_bytes());
     buf.push(b':');
-    // itoa verbatim from emit_raw_with_path (byte-identical digits, no fmt).
-    let mut tmp = [0u8; 20];
-    let mut v = line;
-    let mut len = 0usize;
-    if v == 0 {
-        tmp[19] = b'0';
-        len = 1;
-    } else {
-        while v > 0 {
-            len += 1;
-            tmp[20 - len] = b'0' + (v % 10) as u8;
-            v /= 10;
-        }
-    }
-    buf.extend_from_slice(&tmp[20 - len..]);
+    push_line_no(buf, line);
     buf.push(b':');
     buf.extend_from_slice(text.as_bytes());
     buf.push(b'\n');
@@ -2899,21 +2888,7 @@ fn emit_text_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
 fn emit_ctx_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
     buf.extend_from_slice(path.as_bytes());
     buf.push(b':');
-    // itoa verbatim from emit_text_row (byte-identical digits, no fmt).
-    let mut tmp = [0u8; 20];
-    let mut v = line;
-    let mut len = 0usize;
-    if v == 0 {
-        tmp[19] = b'0';
-        len = 1;
-    } else {
-        while v > 0 {
-            len += 1;
-            tmp[20 - len] = b'0' + (v % 10) as u8;
-            v /= 10;
-        }
-    }
-    buf.extend_from_slice(&tmp[20 - len..]);
+    push_line_no(buf, line);
     buf.push(b'-');
     buf.extend_from_slice(text.as_bytes());
     buf.push(b'\n');
@@ -2929,21 +2904,7 @@ fn emit_ctx_json(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, file
     buf.extend_from_slice(b"{\"path\":\"");
     buf.extend_from_slice(path_esc);
     buf.extend_from_slice(b"\",\"line\":");
-    // itoa verbatim from emit_raw_with_path (byte-identical digits, no fmt).
-    let mut tmp = [0u8; 20];
-    let mut v = line;
-    let mut len = 0usize;
-    if v == 0 {
-        tmp[19] = b'0';
-        len = 1;
-    } else {
-        while v > 0 {
-            len += 1;
-            tmp[20 - len] = b'0' + (v % 10) as u8;
-            v /= 10;
-        }
-    }
-    buf.extend_from_slice(&tmp[20 - len..]);
+    push_line_no(buf, line);
     buf.extend_from_slice(b",\"text\":\"");
     push_escaped_json(buf, text);
     buf.extend_from_slice(b"\",\"score\":");
@@ -3059,26 +3020,24 @@ enum ColorWhen {
     Auto,
     Always,
     Never,
-    Ansi,
 }
 
 /// Parse a `--color` value; None means usage error (exit 2 at the call site).
+/// `ansi` is an rg-compatible alias for `always`.
 fn parse_color_when(s: &str) -> Option<ColorWhen> {
     match s {
         "auto" => Some(ColorWhen::Auto),
-        "always" => Some(ColorWhen::Always),
+        "always" | "ansi" => Some(ColorWhen::Always),
         "never" => Some(ColorWhen::Never),
-        "ansi" => Some(ColorWhen::Ansi),
         _ => None,
     }
 }
 
-/// Resolve color for this process. Explicit always/ansi win everywhere (even
-/// piped, matching the rg `--color=always` probe); never wins nowhere; auto
-/// follows the stdout TTY only.
+/// Resolve color for this process. Explicit always wins everywhere (even
+/// piped); never wins nowhere; auto follows the stdout TTY only.
 fn color_enabled(when: ColorWhen) -> bool {
     match when {
-        ColorWhen::Always | ColorWhen::Ansi => true,
+        ColorWhen::Always => true,
         ColorWhen::Never => false,
         ColorWhen::Auto => std::io::stdout().is_terminal(),
     }
@@ -3111,12 +3070,9 @@ fn colorize_spans<'a>(text: &'a str, matcher: &RegexMatcher) -> std::borrow::Cow
         pos = e;
     }
     out.extend_from_slice(&b[pos..]);
-    // Unreachable fallback: spans are char-boundary aligned and the SGR
-    // inserts are ASCII, so the splice stays valid UTF-8 by construction.
-    match String::from_utf8(out) {
-        Ok(s) => std::borrow::Cow::Owned(s),
-        Err(_) => std::borrow::Cow::Borrowed(text),
-    }
+    // Spans are char-boundary aligned and SGR inserts are ASCII, so the
+    // splice stays valid UTF-8 by construction; loud panic if broken.
+    std::borrow::Cow::Owned(String::from_utf8(out).expect("colorize splice must stay UTF-8"))
 }
 
 /// Colored text row: same `path:line:text` framing as `emit_text_row` with
@@ -3166,51 +3122,35 @@ fn serve_text_out(raw: &[u8], pattern: &str, ignore_case: bool, color_on: bool) 
     json_hits_to_text(raw)
 }
 
-/// Manual cold-emission Hit line with a pre-escaped path: field order and
-/// separators match the derived Serialize impl; only text/path escaping is
-/// hand-rolled, floats stay on the serde (ryu) path. Test-only since the
-/// cold path went columnar; the differential equality pins it byte-identical.
-#[cfg(test)]
-fn emit_hit_with_path(buf: &mut Vec<u8>, h: &Hit, path_esc: &[u8]) {
-    emit_raw_with_path(buf, path_esc, h.line, &h.text, h.score)
-}
+// Real emission fns (`emit_raw_with_path` + `push_escaped_json`) are exercised
+// directly by the escape equality below; no test-only wrappers.
 
-/// Manual cold-emission Hit line: escapes the path inline (tests, fallback).
-#[cfg(test)]
-fn emit_hit_json(buf: &mut Vec<u8>, h: &Hit) {
-    let mut p = Vec::with_capacity(h.path.len() + 2);
-    push_escaped_json(&mut p, &h.path);
-    emit_hit_with_path(buf, h, &p);
-}
+const USAGE: &str = "usage: nkgrep index <path> [--index FILE]\n       nkgrep serve --index FILE --port PORT\n       nkgrep [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
 
 fn usage() -> ! {
-    eprintln!("usage: nkgrep index <path> [--index FILE]");
-    eprintln!("       nkgrep serve --index FILE --port PORT");
-    eprintln!("       nkgrep [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]");
+    eprint!("{USAGE}");
     std::process::exit(2);
 }
-/// Stdout write that never panics: BrokenPipe (e.g. `| head`) exits quietly
-/// with 0; any other IO error exits 2. Success-path bytes are unchanged.
+/// Stdout BrokenPipe contract: `| head` exits 0; any other IO error exits 2.
+fn stdout_err(e: std::io::Error) -> ! {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("nkgrep: stdout: {e}");
+    std::process::exit(2);
+}
+
+/// Stdout write that never panics; success-path bytes are unchanged.
 fn stdout_write_all(w: &mut impl Write, data: &[u8]) {
-    match w.write_all(data) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
-        Err(e) => {
-            eprintln!("nkgrep: stdout: {e}");
-            std::process::exit(2);
-        }
+    if let Err(e) = w.write_all(data) {
+        stdout_err(e);
     }
 }
 
 /// Stdout flush with the same BrokenPipe contract as `stdout_write_all`.
 fn stdout_flush(w: &mut impl Write) {
-    match w.flush() {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
-        Err(e) => {
-            eprintln!("nkgrep: stdout: {e}");
-            std::process::exit(2);
-        }
+    if let Err(e) = w.flush() {
+        stdout_err(e);
     }
 }
 /// `-q` exit: stdout stays empty (the flag's whole contract), stderr keeps
@@ -3230,13 +3170,12 @@ fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant) -> ! {
 /// (stderr, exit 2). Write errors are ignored: help under a closed pipe
 /// simply ends the process.
 fn print_help() {
-    let s = concat!(
+    let head = concat!(
         "nkgrep ",
         env!("CARGO_PKG_VERSION"),
         " — ranked trigram code search\n",
-        "usage: nkgrep index <path> [--index FILE]\n",
-        "       nkgrep serve --index FILE --port PORT\n",
-        "       nkgrep [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n",
+    );
+    let opts = concat!(
         "options:\n",
         "  -i, --ignore-case  case-insensitive match\n",
         "  -q, --quiet        suppress stdout, stop at first match\n",
@@ -3295,7 +3234,9 @@ fn print_help() {
     );
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
-    let _ = w.write_all(s.as_bytes());
+    let _ = w.write_all(head.as_bytes());
+    let _ = w.write_all(USAGE.as_bytes());
+    let _ = w.write_all(opts.as_bytes());
     let _ = w.flush();
 }
 
@@ -4222,10 +4163,8 @@ fn main() {
         hits = (0u32..ptab.len() as u32)
             .into_par_iter()
             .filter_map(|pid| {
-                // Same verify core as the indexed path: the depth penalty
-                // folds into the score (the raw sink's depth_penalty stays 0),
-                // so scores are identical to the old inline Collector
-                // with its per-file Searcher + per-file matcher clone.
+                // Same verify core as the indexed path: depth folds into
+                // file_score, so scores match the old inline Collector.
                 let ps = &ptab[pid as usize];
                 let depth = PathBuf::from(ps).components().count() as f64;
                 let bonus = if patterns.iter().any(|pat| ps.contains(pat.as_str())) {
@@ -4264,19 +4203,15 @@ fn main() {
         // path-sorted for a stable contract (rg emits walk-parallel order).
         // `-l` wins over `-c`; `-q` never reaches here (quiet_exit above).
         // Zero-count files are omitted (see write_aggregates).
-        let path_of = |pid: usize| -> &str {
-            match &idx_opt {
-                Some(idx) if hits_indexed => &idx.files[pid],
-                _ => &ptab[pid],
-            }
-        };
         let mut counts: HashMap<usize, usize> = HashMap::new();
         for &i in &ord {
             let (fi, _) = loc[i as usize];
             *counts.entry(hits[fi as usize].pid as usize).or_default() += 1;
         }
-        let mut rows: Vec<(&str, usize)> =
-            counts.iter().map(|(&pid, &n)| (path_of(pid), n)).collect();
+        let mut rows: Vec<(&str, usize)> = counts
+            .iter()
+            .map(|(&pid, &n)| (path_of(&idx_opt, &ptab, hits_indexed, pid), n))
+            .collect();
         rows.sort_by(|a, b| a.0.cmp(b.0));
         let stdout = std::io::stdout();
         let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
@@ -4300,16 +4235,10 @@ fn main() {
         // across files — the rg 15.1.0 shape probe. A line with several hits
         // renders once; `matches` (hits, multiplicity intact) drives the
         // diagnostics and the 0/1 exit, like `-c`.
-        let path_of = |pid: usize| -> &str {
-            match &idx_opt {
-                Some(idx) if hits_indexed => &idx.files[pid],
-                _ => &ptab[pid],
-            }
-        };
         let mut buf = Vec::with_capacity(ord.len() * 128);
         for (fi, mis) in ctx_file_groups(&hits, &loc, &ord) {
             let fh = &hits[fi];
-            let ps = path_of(fh.pid as usize);
+            let ps = path_of(&idx_opt, &ptab, hits_indexed, fh.pid as usize);
             let nlines = fh.line_starts.len() as u64;
             let mlines = ctx_group_lines(&hits, fi, &mis);
             let mut k = 0usize;
@@ -4367,10 +4296,7 @@ fn main() {
             let (fi, mi) = loc[i as usize];
             let fh = &hits[fi as usize];
             let m = &fh.metas[mi as usize];
-            let ps: &str = match &idx_opt {
-                Some(idx) if hits_indexed => &idx.files[fh.pid as usize],
-                _ => &ptab[fh.pid as usize],
-            };
+            let ps: &str = path_of(&idx_opt, &ptab, hits_indexed, fh.pid as usize);
             let text = banked_text(fh, m);
             if color_on {
                 emit_text_row_colored(&mut buf, ps, m.line, &text, &matcher);
@@ -4411,10 +4337,7 @@ fn main() {
         let (fi, _) = loc[i as usize];
         let pid = hits[fi as usize].pid as usize;
         if esc[pid].is_none() {
-            let ps: &str = match &idx_opt {
-                Some(idx) if hits_indexed => &idx.files[pid],
-                _ => &ptab[pid],
-            };
+            let ps: &str = path_of(&idx_opt, &ptab, hits_indexed, pid);
             let mut v = Vec::with_capacity(ps.len() + 2);
             push_escaped_json(&mut v, ps);
             esc[pid] = Some(v);
@@ -4717,7 +4640,6 @@ mod literal_tests {
                 arena: vec![],
                 metas: vec![],
                 path_bonus: 0.0,
-                depth_penalty: 0.0,
             };
             s.search_slice(&w, line.as_bytes(), &mut sink).unwrap();
             assert_eq!(sink.metas.len(), want, "word line {line:?}");
@@ -4729,7 +4651,6 @@ mod literal_tests {
             arena: vec![],
             metas: vec![],
             path_bonus: 0.0,
-            depth_penalty: 0.0,
         };
         s.search_slice(&f, b"a.c axc", &mut sink).unwrap();
         assert_eq!(sink.metas.len(), 1);
@@ -4829,7 +4750,9 @@ mod escape_tests {
             score,
         };
         let mut m = Vec::new();
-        emit_hit_json(&mut m, &h);
+        let mut p = Vec::with_capacity(h.path.len() + 2);
+        push_escaped_json(&mut p, &h.path);
+        emit_raw_with_path(&mut m, &p, h.line, &h.text, h.score);
         let mut o = serde_json::to_vec(&h).unwrap();
         o.push(b'\n');
         assert_eq!(m, o, "hit divergence on {path:?}:{line}:{text:?}:{score:?}");
@@ -4971,7 +4894,7 @@ mod color_tests {
         assert_eq!(parse_color_when("auto"), Some(ColorWhen::Auto));
         assert_eq!(parse_color_when("always"), Some(ColorWhen::Always));
         assert_eq!(parse_color_when("never"), Some(ColorWhen::Never));
-        assert_eq!(parse_color_when("ansi"), Some(ColorWhen::Ansi));
+        assert_eq!(parse_color_when("ansi"), Some(ColorWhen::Always));
         assert_eq!(parse_color_when("bogus"), None);
         assert_eq!(parse_color_when(""), None);
         assert_eq!(parse_color_when("Always"), None);
@@ -4980,7 +4903,6 @@ mod color_tests {
     #[test]
     fn enabled_explicit_wins() {
         assert!(color_enabled(ColorWhen::Always));
-        assert!(color_enabled(ColorWhen::Ansi));
         assert!(!color_enabled(ColorWhen::Never));
         // Auto follows the TTY only — no assert (environment-dependent).
     }
