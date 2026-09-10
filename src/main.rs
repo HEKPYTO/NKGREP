@@ -609,7 +609,7 @@ fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
         .git_global(!opts.no_ignore)
         .git_exclude(!opts.no_ignore)
         .parents(true)
-        .require_git(true)
+        .require_git(false)
         .follow_links(opts.follow);
     if let Some(d) = opts.max_depth {
         builder.max_depth(Some(d));
@@ -640,7 +640,12 @@ fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
             }
         }
     }
-    if glob_matcher.is_some() || opts.max_filesize.is_some() {
+    // rg parity (probed 15.1.0): `.git/` never descends unless --no-ignore:
+    // --hidden alone still skips it; --hidden+--no-ignore searches it. No
+    // git ops involved: pure path-component prune in filter_entry. Pruning
+    // the `.git` dir entry itself kills descent, so pack files cost nothing.
+    let skip_git = !opts.no_ignore;
+    if glob_matcher.is_some() || opts.max_filesize.is_some() || skip_git {
         let root_path = root.clone();
         let max_opt = opts.max_filesize;
         builder.filter_entry(move |e| {
@@ -650,6 +655,21 @@ fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
                 return true;
             }
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if skip_git {
+                // Relative to the walk root so an explicit `.git` operand
+                // still searches (probed: `rg --hidden pat .git` does). A
+                // plain file named `.git` (worktree pointer) is a hidden
+                // file, not a tree: searched under --hidden, never pruned.
+                if let Ok(rel) = e.path().strip_prefix(&root_path) {
+                    let mut comps = rel.components().peekable();
+                    while let Some(c) = comps.next() {
+                        let last = comps.peek().is_none();
+                        if c.as_os_str() == ".git" && (!last || is_dir) {
+                            return false;
+                        }
+                    }
+                }
+            }
             if let Some(max) = max_opt {
                 // Files only: dir metadata lengths are filesystem noise —
                 // filtering them would prune whole subtrees (probed: rg
@@ -4708,5 +4728,93 @@ mod context_tests {
             &out,
             b"b.txt:1-ctx B\nb.txt:2:hit B\na.txt:1:hit A1\na.txt:9:hit A2\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod git_skip_tests {
+    use super::*;
+
+    fn plant(root: &std::path::Path) {
+        // Fake `.git` tree with pack files, a hidden file, and a normal
+        // file: mirrors the live `rg --hidden` / `--no-ignore` probes.
+        std::fs::create_dir_all(root.join(".git/objects/pack")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join(".git/objects/pack/t.pack"), "packbytes\n").unwrap();
+        std::fs::write(root.join(".hidden.txt"), "hidden\n").unwrap();
+        std::fs::write(root.join("normal.txt"), "normal\n").unwrap();
+    }
+
+    fn names(root: &PathBuf, opts: &WalkOptions) -> std::collections::HashSet<String> {
+        walk_files(root, opts)
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn opts(hidden: bool, no_ignore: bool) -> WalkOptions {
+        WalkOptions {
+            hidden,
+            no_ignore,
+            follow: false,
+            max_depth: None,
+            max_filesize: None,
+            globs: vec![],
+        }
+    }
+
+    #[test]
+    fn git_four_contexts_match_rg() {
+        // Probed rg 15.1.0 on this repo: default/hidden/no-ignore all skip
+        // `.git`; only --hidden+--no-ignore descends it.
+        let dir = std::env::temp_dir().join(format!("nkgrep_gitskip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        plant(&dir);
+        let root = dir.clone();
+        let has_git =
+            |s: &std::collections::HashSet<String>| s.iter().any(|p| p.starts_with(".git"));
+        // Default: gate A + byte-identical gate — exactly the visible file.
+        let d = names(&root, &opts(false, false));
+        assert_eq!(
+            d,
+            std::collections::HashSet::from(["normal.txt".to_string()])
+        );
+        // --hidden alone: hidden files appear, `.git` still skipped.
+        let h = names(&root, &opts(true, false));
+        assert!(h.contains("normal.txt"), "{h:?}");
+        assert!(h.contains(".hidden.txt"), "{h:?}");
+        assert!(!has_git(&h), "--hidden must not descend .git: {h:?}");
+        // --no-ignore alone: hidden filter still skips `.git`.
+        let n = names(&root, &opts(false, true));
+        assert!(!has_git(&n), "--no-ignore alone keeps hidden skip: {n:?}");
+        // --hidden+--no-ignore: `.git` contents (incl. pack) searched.
+        let b = names(&root, &opts(true, true));
+        assert!(b.contains(".git/HEAD"), "{b:?}");
+        assert!(
+            b.iter().any(|p| p.starts_with(".git/objects/pack/")),
+            "{b:?}"
+        );
+        assert!(b.contains(".hidden.txt"), "{b:?}");
+        assert!(b.contains("normal.txt"), "{b:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_explicit_operand_still_searches() {
+        // Probed rg: `rg --hidden pat .git` searches the explicit dir.
+        let dir = std::env::temp_dir().join(format!("nkgrep_gitroot_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let git_root = dir.join(".git");
+        let s = names(&git_root, &opts(true, false));
+        assert!(s.contains("HEAD"), "{s:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
