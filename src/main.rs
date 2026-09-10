@@ -165,6 +165,231 @@ struct Index {
 
 /// Canonical absolute fingerprint of a build/query root; exit 2 when the
 /// root does not resolve.
+fn canon_root(root: &std::path::Path) -> PathBuf {
+    match std::fs::canonicalize(root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("nkgrep: bad root {}: {e}", root.display());
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Stable (device, inode) cookie for a canonical root; (0, 0) where the
+/// platform offers no file identity (non-unix) or metadata is unreadable.
+/// Unlike mtime this never changes when files are added inside the tree.
+fn root_cookie(canon: &std::path::Path) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(canon) {
+            Ok(m) => (m.dev(), m.ino()),
+            Err(_) => (0, 0),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = canon;
+        (0, 0)
+    }
+}
+
+/// Parse index JSON; old absolute-path indexes (missing `root`) and corrupt
+/// files are refused loudly instead of silently matching nothing.
+fn parse_index(idx_path: &str, data: &str) -> Index {
+    match serde_json::from_str::<Index>(data) {
+        Ok(idx) => {
+            if idx.files.iter().any(|p| PathBuf::from(p).is_absolute()) {
+                eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
+                std::process::exit(2);
+            }
+            idx
+        }
+        Err(e) => {
+            eprintln!("nkgrep: unreadable index {idx_path} (old format? rebuild with `nkgrep index`): {e}");
+            std::process::exit(2);
+        }
+    }
+}
+/// Binary index magic (8 B) + plain-LE linear layout, no codec (NKGREP02):
+/// magic | root_dev u64 | root_ino u64 | root_len u32 + root bytes
+/// | nfiles u32 + (len u32 + bytes)* | npostings u32 + (key u32 + vlen u32 + ids u32 LE)*.
+/// Keys are packed trigrams (gram_pack), sorted numeric on write for stable
+/// bytes. Any truncation → loud exit 2. NKGREP01 (u64 widths + String keys)
+/// is refused loudly as a stale format, same as a fingerprint mismatch.
+const BIN_MAGIC: &[u8; 8] = b"NKGREP02";
+const OLD_BIN_MAGIC: &[u8; 8] = b"NKGREP01";
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn encode_index_bin(idx: &Index) -> Vec<u8> {
+    let mut out = Vec::with_capacity(idx.files.len() * 40);
+    out.extend_from_slice(BIN_MAGIC);
+    put_u64(&mut out, idx.root_dev);
+    put_u64(&mut out, idx.root_ino);
+    put_u32(&mut out, idx.root.len() as u32);
+    out.extend_from_slice(idx.root.as_bytes());
+    put_u32(&mut out, idx.files.len() as u32);
+    for f in &idx.files {
+        put_u32(&mut out, f.len() as u32);
+        out.extend_from_slice(f.as_bytes());
+    }
+    let mut keys: Vec<u32> = idx.postings.keys().copied().collect();
+    keys.sort();
+    put_u32(&mut out, keys.len() as u32);
+    for k in keys {
+        let ids = &idx.postings[&k];
+        put_u32(&mut out, k);
+        put_u32(&mut out, ids.len() as u32);
+        for id in ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+    out
+}
+
+fn parse_index_bin(idx_path: &str, data: &[u8]) -> Index {
+    let refuse = |why: &str| -> ! {
+        eprintln!("nkgrep: unreadable index {idx_path} (truncated binary? rebuild with `nkgrep index`): {why}");
+        std::process::exit(2);
+    };
+    let mut cur = BIN_MAGIC.len();
+    let take = |cur: &mut usize, n: usize| -> &[u8] {
+        let end = cur.checked_add(n).unwrap_or(usize::MAX);
+        if end > data.len() {
+            refuse("unexpected end of file");
+        }
+        let s = &data[*cur..end];
+        *cur = end;
+        s
+    };
+    let u64_at = |cur: &mut usize| -> u64 {
+        let b = take(cur, 8);
+        u64::from_le_bytes(b.try_into().unwrap())
+    };
+    let u32_at = |cur: &mut usize| -> u32 {
+        let b = take(cur, 4);
+        u32::from_le_bytes(b.try_into().unwrap())
+    };
+    let str_at = |cur: &mut usize| -> String {
+        let n = u32_at(cur) as usize;
+        if n > data.len() {
+            refuse("bad length prefix");
+        }
+        match std::str::from_utf8(take(cur, n)) {
+            Ok(s) => s.to_owned(),
+            Err(_) => refuse("non-utf8 path"),
+        }
+    };
+    let root_dev = u64_at(&mut cur);
+    let root_ino = u64_at(&mut cur);
+    let root = str_at(&mut cur);
+    let nfiles = u32_at(&mut cur) as usize;
+    if nfiles > data.len() {
+        refuse("bad file count");
+    }
+    let mut files = Vec::with_capacity(nfiles.min(1 << 20));
+    for _ in 0..nfiles {
+        files.push(str_at(&mut cur));
+    }
+    let npost = u32_at(&mut cur) as usize;
+    if npost > data.len() {
+        refuse("bad posting count");
+    }
+    let mut postings = HashMap::with_capacity(npost.min(1 << 20));
+    for _ in 0..npost {
+        let k = u32_at(&mut cur);
+        // No vlen-vs-nfiles cap: distinct byte triples share no key now,
+        // but one file still pushes its id once per key while vlen counts
+        // ids, not files. Per-id range checks below still reject corruption.
+        let vlen = u32_at(&mut cur) as usize;
+        let raw = take(&mut cur, vlen.saturating_mul(4));
+        if raw.len() != vlen * 4 {
+            refuse("bad posting length");
+        }
+        let mut ids = Vec::with_capacity(vlen);
+        for c in raw.chunks_exact(4) {
+            let id = u32::from_le_bytes(c.try_into().unwrap());
+            if id as usize >= nfiles {
+                refuse("posting id out of range");
+            }
+            ids.push(id);
+        }
+        postings.insert(k, ids);
+    }
+    let idx = Index { root, root_dev, root_ino, files, postings };
+    if idx.files.iter().any(|p| PathBuf::from(p).is_absolute()) {
+        eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
+        std::process::exit(2);
+    }
+    idx
+}
+
+/// Read raw index bytes once; binary (magic) vs JSON dispatch lives here so
+/// both load helpers share it with unchanged signatures.
+fn read_index_bytes(idx_path: &str) -> Vec<u8> {
+    match std::fs::read(idx_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("nkgrep: cannot read index {idx_path}: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+fn parse_index_auto(idx_path: &str, data: &[u8]) -> Index {
+    if data.starts_with(BIN_MAGIC) {
+        return parse_index_bin(idx_path, data);
+    }
+    if data.starts_with(OLD_BIN_MAGIC) || data.starts_with(b"NKGREP") {
+        eprintln!("nkgrep: stale index format {idx_path} (expected NKGREP02): rebuild with `nkgrep index`");
+        std::process::exit(2);
+    }
+    match std::str::from_utf8(data) {
+        Ok(s) => parse_index(idx_path, s),
+        Err(e) => {
+            eprintln!("nkgrep: unreadable index {idx_path} (old format? rebuild with `nkgrep index`): {e}");
+            std::process::exit(2);
+        }
+    }
+}
+/// Load an index for a query rooted at `query_root`: refuse (exit 2) on
+/// fingerprint mismatch, then materialize root-relative entries to
+/// query-root-joined paths so rank/verify see scan-identical strings.
+fn load_index_for_query(idx_path: &str, query_root: &PathBuf) -> Index {
+    let data = read_index_bytes(idx_path);
+    let mut idx = parse_index_auto(idx_path, &data);
+    let q_canon = canon_root(query_root);
+    if q_canon.to_string_lossy() != idx.root {
+        eprintln!(
+            "nkgrep: index root mismatch (built at {}, queried at {})",
+            idx.root,
+            q_canon.display()
+        );
+    }
+    let (dev, ino) = root_cookie(&q_canon);
+    if idx.root_dev != 0 && (dev, ino) != (idx.root_dev, idx.root_ino) {
+        eprintln!(
+            "nkgrep: index root mismatch (built at {}, queried at {}: root replaced)",
+            idx.root,
+            q_canon.display()
+        );
+        std::process::exit(2);
+    }
+    for f in idx.files.iter_mut() {
+        *f = query_root.join(&*f).to_string_lossy().into_owned();
+    }
+    idx
+}
+
+/// Load an index for `serve`: no query root exists, so the stored canonical
+/// root is the verify base. Refuse (exit 2) when the tree moved or was
+/// replaced behind the stored fingerprint.
 fn load_index_for_serve(idx_path: &str) -> Index {
     let data = read_index_bytes(idx_path);
     let mut idx = parse_index_auto(idx_path, &data);
@@ -233,6 +458,177 @@ fn gram_pack(g: &[u8; 3]) -> u32 {
 /// a superset of all matches. Escapes (`\x`) never contribute a literal
 /// (covers `\|`, `\d`, `\n`, `\\`); class contents contribute nothing.
 /// None = no usable literal in some branch, caller must full-scan.
+fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
+    let mut ors = vec![];
+    for branch in split_branches(pattern) {
+        let mut ands = HashSet::new();
+        for run in literal_runs(&branch) {
+            if run.len() >= 3 {
+                for w in run.windows(3) {
+                    ands.insert(gram_pack(&[w[0], w[1], w[2]]));
+                }
+            }
+        }
+        if ands.is_empty() {
+            return None;
+        }
+        let mut grams = ands.into_iter().collect::<Vec<_>>();
+        grams.sort();
+        ors.push(grams);
+    }
+    Some(ors)
+}
+
+/// Split on unescaped `|` outside `[...]` classes. Verbatim copy otherwise
+/// (escapes and classes preserved for `literal_runs` to interpret).
+fn split_branches(pattern: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![String::new()];
+    let mut it = pattern.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                out.last_mut().unwrap().push('\\');
+                if let Some(e) = it.next() {
+                    out.last_mut().unwrap().push(e);
+                }
+            }
+            '[' => {
+                let mut cls = String::from("[");
+                if it.peek() == Some(&'^') {
+                    cls.push(it.next().unwrap());
+                }
+                if it.peek() == Some(&']') {
+                    cls.push(it.next().unwrap()); // `[]...]` — first ] literal
+                }
+                {
+                    let iter = it.by_ref();
+                    while let Some(c2) = iter.next() {
+                        cls.push(c2);
+                        if c2 == '\\' {
+                            if let Some(e) = iter.next() {
+                                cls.push(e); // escaped char inside class
+                            }
+                            continue;
+                        }
+                        if c2 == ']' {
+                            break;
+                        }
+                    }
+                }
+                out.last_mut().unwrap().push_str(&cls);
+            }
+            '|' => out.push(String::new()),
+            c => out.last_mut().unwrap().push(c),
+        }
+    }
+    out
+}
+
+/// Definitely-literal alphanumeric-underscore runs: skips `\x` escapes and
+/// `[...]` class contents (an unclosed `[` swallows the rest, conservatively
+/// yielding fewer grams, never wrong ones).
+fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
+    let mut runs = vec![];
+    let mut cur: Vec<u8> = vec![];
+    let mut it = branch.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if !cur.is_empty() {
+                    runs.push(std::mem::take(&mut cur));
+                }
+                let _ = it.next(); // escaped char is never a literal
+            }
+            '[' => {
+                if !cur.is_empty() {
+                    runs.push(std::mem::take(&mut cur));
+                }
+                if it.peek() == Some(&'^') {
+                    it.next();
+                }
+                if it.peek() == Some(&']') {
+                    it.next();
+                }
+                let mut esc = false;
+                for c2 in it.by_ref() {
+                    if esc {
+                        esc = false;
+                        continue;
+                    }
+                    if c2 == '\\' {
+                        esc = true;
+                        continue;
+                    }
+                    if c2 == ']' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => cur.push(c as u8),
+            _ => {
+                if !cur.is_empty() {
+                    runs.push(std::mem::take(&mut cur));
+                }
+            }
+        }
+    }
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    runs
+}
+
+/// ASCII-gated matcher construction (V1): when the pattern is ASCII, skip the
+/// Unicode tables (`unicode(false)` + `\n` line terminator, which unlocks the
+/// fast line-oriented search path); when it is additionally a pure literal,
+/// compile with `fixed_strings`. Each flag is independent and keeps
+/// independently. A builder error (e.g. the line terminator rejecting a
+/// pattern that can match `\n`) retries less-gated, ending at plain
+/// `RegexMatcher::new`, so construction never fails where it used to work.
+fn build_matcher(pattern: &str) -> Result<RegexMatcher, grep_regex::Error> {
+    let ascii_only = pattern.is_ascii();
+    let literal_only = is_pure_literal(pattern);
+    if ascii_only || literal_only {
+        let mut b = RegexMatcherBuilder::new();
+        if ascii_only {
+            b.unicode(false);
+            b.line_terminator(Some(b'\n'));
+        }
+        if literal_only {
+            b.fixed_strings(true);
+        }
+        if let Ok(m) = b.build(pattern) {
+            return Ok(m);
+        }
+        if ascii_only {
+            let mut bz = RegexMatcherBuilder::new();
+            bz.unicode(false);
+            if literal_only {
+                bz.fixed_strings(true);
+            }
+            if let Ok(m) = bz.build(pattern) {
+                return Ok(m);
+            }
+        }
+    }
+    RegexMatcher::new(pattern)
+}
+/// Pure-literal probe for the `fixed_strings` gate: one `|`-free branch whose
+/// every byte survives `literal_runs` as a single run. Conservative on
+/// purpose: any metachar, escape, class, or alternation disqualifies (that
+/// query keeps the regex engine, gaining only `unicode(false)` when ASCII).
+fn is_pure_literal(pattern: &str) -> bool {
+    if pattern.is_empty() || !pattern.is_ascii() {
+        return false;
+    }
+    let branches = split_branches(pattern);
+    if branches.len() != 1 {
+        return false;
+    }
+    let runs = literal_runs(&branches[0]);
+    runs.len() == 1 && runs[0].len() == pattern.len()
+}
+
 fn cmd_index(root: &PathBuf, idx_path: &str) {
     let t0 = Instant::now();
     let root_canon = canon_root(root);
@@ -562,6 +958,115 @@ fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
 /// only, comparator verbatim the Hit-order one (NaN fallback included), so
 /// the order — ties included — matches the stable fat-Hit sort given the
 /// same collect sequence. Sort traffic touches 8 B scores, never payloads.
+fn raw_order(scores: &[f64]) -> Vec<u32> {
+    let mut ord: Vec<u32> = (0..scores.len() as u32).collect();
+    ord.sort_by(|a, b| {
+        scores[*b as usize]
+            .partial_cmp(&scores[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ord
+}
+
+/// Batched parallel verify in descending file-score order with provable
+/// top-k early exit (spec §6): every match scores at most its file score
+/// (match score = file score − line/1e6), so once k hits are banked, no
+/// unverified file whose file score does not exceed the kth-best match
+/// score can displace the top-k. Each batch uses the serve pattern
+/// (rayon par_iter + flat_map verify); the kth check runs between
+/// batches against the batch max (order[0] of the chunk, order is desc).
+/// Exiting before a batch whose max does not exceed kth exits before
+/// every file a per-file loop would skip — same proof, batch granularity.
+/// Final global sort + truncate stays with the caller.
+/// ST-5 columnar: banks verbatim match bytes per file (one amortized arena
+/// alloc per matched file, zero per hit) with zero Arc traffic; callers
+/// flatten metas to a side scores vec for the index-only sort.
+fn flat_scores(files: &[FileHits]) -> (Vec<f64>, Vec<(u32, u32)>) {
+    let n: usize = files.iter().map(|f| f.metas.len()).sum();
+    let mut scores = Vec::with_capacity(n);
+    let mut loc = Vec::with_capacity(n);
+    for (fi, f) in files.iter().enumerate() {
+        for (mi, m) in f.metas.iter().enumerate() {
+            scores.push(m.score);
+            loc.push((fi as u32, mi as u32));
+        }
+    }
+    (scores, loc)
+}
+
+/// Decode banked match bytes with the exact eager expression
+/// (`from_utf8_lossy` then char-trim of `\n`/`\r`): valid UTF-8 borrows the
+/// arena, only invalid-UTF8 hits allocate — the same hits as before.
+fn banked_text<'a>(fh: &'a FileHits, m: &HitMeta) -> std::borrow::Cow<'a, str> {
+    let raw = &fh.arena[m.start as usize..m.end as usize];
+    let cow = String::from_utf8_lossy(raw);
+    match cow {
+        std::borrow::Cow::Borrowed(b) => std::borrow::Cow::Borrowed(b.trim_end_matches(|c| c == '\n' || c == '\r')),
+        std::borrow::Cow::Owned(o) => {
+            std::borrow::Cow::Owned(o.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
+        }
+    }
+}
+
+fn parallel_verify_batched_raw(
+    idx: &Index,
+    matcher: &RegexMatcher,
+    order: &[u32],
+    scores: &[f64],
+    top: Option<usize>,
+) -> Vec<FileHits> {
+    if top == Some(0) {
+        return vec![];
+    }
+    const BATCH: usize = 64;
+    // Full queries never early-exit (k = MAX), so the sequential batch
+    // waves are pure barrier overhead: verify all candidates in one wave.
+    // Top-k keeps the batched proof path below untouched (§6).
+    if top.is_none() {
+        return order
+            .par_iter()
+            .filter_map(|id| {
+                verify_one_raw(*id, &idx.files[*id as usize], matcher, scores[*id as usize])
+            })
+            .collect();
+    }
+    let k = top.unwrap_or(usize::MAX);
+    let mut all: Vec<FileHits> = vec![];
+    let mut total = 0usize;
+    let mut kth = f64::NEG_INFINITY;
+    let mut done = 0usize;
+    for chunk in order.chunks(BATCH) {
+        if total >= k && scores[chunk[0] as usize] <= kth {
+            eprintln!("nkgrep: early exit after {done} of {} files", order.len());
+            break;
+        }
+        // Per-file exit at file granularity (spec §6, same proof as the
+        // batch check: every match scores at most its file score, so a file
+        // whose file score does not exceed kth contributes no top-k hit).
+        // Same `<= kth` threshold as the batch exit, applied per file, so
+        // the surviving set — ties included — matches the batch-only path.
+        let armed = total >= k;
+        let kth_now = kth;
+        let mut batch: Vec<FileHits> = chunk
+            .par_iter()
+            .filter(|id| !armed || scores[**id as usize] > kth_now)
+            .filter_map(|id| {
+                verify_one_raw(*id, &idx.files[*id as usize], matcher, scores[*id as usize])
+            })
+            .collect();
+        total += batch.iter().map(|f| f.metas.len()).sum::<usize>();
+        all.append(&mut batch);
+        done += chunk.len();
+        if total >= k {
+            let (mut s, _) = flat_scores(&all);
+            s.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            kth = s[k - 1];
+        }
+    }
+    all
+}
+
+
 fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stream);
@@ -667,6 +1172,11 @@ fn save_serve_info(idx_path: &str, port: u16) {
 
 /// Port recorded by a running `serve` for this index, or None when no
 /// server registered (missing or corrupt file reads as absent).
+fn load_serve_port(idx_path: &str) -> Option<u16> {
+    let data = std::fs::read_to_string(serve_info_path(idx_path)).ok()?;
+    serde_json::from_str::<ServerInfo>(data.trim()).ok().map(|i| i.port)
+}
+
 fn cmd_serve(idx_path: &str, port: u16) {
     let idx = Arc::new(load_index_for_serve(idx_path));
     // O3: daemon-global warm-fd cache + fd headroom for one fd per file.
@@ -728,6 +1238,178 @@ fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize
 /// Serve-first probe for `--use-index`: connect to the daemon registered in
 /// `<index>.serve.json`, if any. Any failure (no file, no listener, bad
 /// reply) returns None so the caller falls back to the cold index load.
+fn try_serve_query(idx_path: &str, pattern: &str, top: Option<usize>) -> Option<(Vec<u8>, usize)> {
+    let port = load_serve_port(idx_path)?;
+    let mut stream = TcpStream::connect_timeout(
+        &"127.0.0.1".parse().ok().map(|ip| std::net::SocketAddr::new(ip, port))?,
+        Duration::from_millis(200),
+    )
+    .ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    let req = serde_json::to_string(&Query { pattern: pattern.to_string(), top }).ok()?;
+    stream.write_all(req.as_bytes()).ok()?;
+    stream.write_all(b"\n").ok()?;
+    let mut reader = BufReader::new(stream);
+    // Raw passthrough: server bytes are already final-ordered hit JSON, one
+    // per line. Collect them verbatim instead of parsing each Hit and
+    // re-serializing it. Blank lines are skipped and error lines fail over
+    // to the cold path, matching the old fallible-parse behavior.
+    let mut raw = vec![];
+    let mut matches = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return None;
+        }
+        let t = line.trim();
+        if t.contains("\"done\"") {
+            break;
+        }
+        if t.contains("\"error\"") {
+            return None;
+        }
+        if t.is_empty() {
+            continue;
+        }
+        matches += 1;
+        raw.extend_from_slice(line.as_bytes());
+    }
+    Some((raw, matches))
+}
+/// Cold-emission JSON string escaper (Escaper region): byte-identical to
+/// serde_json for `&str` input. Only `"`, `\` and bytes < 0x20 escape;
+/// `\n`/`\r`/`\t`/0x08/0x0C use short forms, other controls `\u00XX`
+/// (lowercase hex, matching serde_json); UTF-8 multibyte passes through.
+/// memchr2 skips the common quote/backslash-free run; the gap holds only
+/// rare controls, scanned inline. Floats are NOT touched here: `emit_hit_json`
+/// formats `score` via serde_json so ryu output stays equality-exact.
+fn push_escaped_json(out: &mut Vec<u8>, s: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let b = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    // First index in `b[pos..end)` holding a byte < 0x20, or `end` when the
+    // gap is control-free. SWAR fast path (ST-8 text-half): each 8-byte word
+    // is tested exactly via the zero-byte trick on `w & 0xE0..` (a byte is
+    // < 0x20 iff its top three bits are clear), so the common control-free
+    // gap skips the per-byte branch loop below; a flagged word falls through
+    // to the exact per-byte scan, which must find the control (the word test
+    // is exact, never a false positive). Tail bytes scan inline.
+    #[inline]
+    fn first_control(b: &[u8], pos: usize, end: usize) -> usize {
+        const E0: u64 = 0xE0E0_E0E0_E0E0_E0E0;
+        const LO: u64 = 0x0101_0101_0101_0101;
+        const HI: u64 = 0x8080_8080_8080_8080;
+        let mut k = pos;
+        let stop = pos + (end - pos) / 8 * 8;
+        while k < stop {
+            let v = u64::from_le_bytes(b[k..k + 8].try_into().unwrap());
+            let m = v & E0;
+            if (m.wrapping_sub(LO) & !m & HI) != 0 {
+                break;
+            }
+            k += 8;
+        }
+        while k < end {
+            if b[k] < 0x20 {
+                return k;
+            }
+            k += 1;
+        }
+        end
+    }
+    loop {
+        let rel = memchr::memchr2(b'"', b'\\', &b[i..]);
+        let end = match rel {
+            Some(r) => i + r,
+            None => b.len(),
+        };
+        // Control-free gaps (the corpus-common case: 0 of 51410 heavy texts
+        // hold a byte < 0x20) skip the per-byte loop; the escape loop below
+        // then resumes from the first real control with `start` untouched,
+        // which emits byte-identical output.
+        let mut j = first_control(b, i, end);
+        while j < end {
+            let c = b[j];
+            if c < 0x20 {
+                out.extend_from_slice(&b[start..j]);
+                match c {
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    0x08 => out.extend_from_slice(b"\\b"),
+                    0x0C => out.extend_from_slice(b"\\f"),
+                    _ => {
+                        out.extend_from_slice(b"\\u00");
+                        out.push(HEX[(c >> 4) as usize]);
+                        out.push(HEX[(c & 0xF) as usize]);
+                    }
+                }
+                start = j + 1;
+            }
+            j += 1;
+        }
+        match rel {
+            Some(_) => {
+                out.extend_from_slice(&b[start..end]);
+                out.extend_from_slice(if b[end] == b'"' { b"\\\"" } else { b"\\\\" });
+                start = end + 1;
+                i = end + 1;
+            }
+            None => break,
+        }
+    }
+    out.extend_from_slice(&b[start..]);
+}
+
+/// Manual cold-emission line from columnar fields (ST-5): byte-identical to
+/// `emit_hit_with_path` (same field order/separators, same path escaper,
+/// same serde/ryu score path); only the source of the fields differs.
+fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, score: f64) {
+    buf.extend_from_slice(b"{\"path\":\"");
+    buf.extend_from_slice(path_esc);
+    buf.extend_from_slice(b"\",\"line\":");
+    // itoa (ST-8 text-half): manual digits, byte-identical to Display, no
+    // core::fmt machinery per hit (~16 ns/hit on heavy-full replay).
+    let mut tmp = [0u8; 20];
+    let mut v = line;
+    let mut len = 0usize;
+    if v == 0 {
+        tmp[19] = b'0';
+        len = 1;
+    } else {
+        while v > 0 {
+            len += 1;
+            tmp[20 - len] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    buf.extend_from_slice(&tmp[20 - len..]);
+    buf.extend_from_slice(b",\"text\":\"");
+    push_escaped_json(buf, text);
+    buf.extend_from_slice(b"\",\"score\":");
+    serde_json::to_writer(&mut *buf, &score).unwrap();
+    buf.extend_from_slice(b"}\n");
+}
+
+/// Manual cold-emission Hit line with a pre-escaped path: field order and
+/// separators match the derived Serialize impl; only text/path escaping is
+/// hand-rolled, floats stay on the serde (ryu) path. Test-only since the
+/// cold path went columnar; the differential equality pins it byte-identical.
+#[cfg(test)]
+fn emit_hit_with_path(buf: &mut Vec<u8>, h: &Hit, path_esc: &[u8]) {
+    emit_raw_with_path(buf, path_esc, h.line, &h.text, h.score)
+}
+
+/// Manual cold-emission Hit line: escapes the path inline (tests, fallback).
+#[cfg(test)]
+fn emit_hit_json(buf: &mut Vec<u8>, h: &Hit) {
+    let mut p = Vec::with_capacity(h.path.len() + 2);
+    push_escaped_json(&mut p, &h.path);
+    emit_hit_with_path(buf, h, &p);
+}
+
 fn usage() -> ! {
     eprintln!("usage: nkgrep index <path> [--index FILE]");
     eprintln!("       nkgrep serve --index FILE --port PORT");
@@ -1078,3 +1760,302 @@ fn main() {
 }
 
 #[cfg(test)]
+mod literal_tests {
+    use super::*;
+
+    fn sorted_branches(pat: &str) -> Option<Vec<Vec<u32>>> {
+        query_grams(pat).map(|mut ors| {
+            for b in &mut ors {
+                b.sort();
+            }
+            ors.sort();
+            ors
+        })
+    }
+
+    #[test]
+    fn escaped_pipe_stays_one_branch() {
+        // `abc\|def` is a single literal `abc|def`, not an alternation.
+        let got = sorted_branches("abc\\|def").unwrap();
+        assert_eq!(got.len(), 1, "escaped pipe must not split: {got:?}");
+        assert!(got[0].contains(&gram_pack(b"abc")), "{got:?}");
+        assert!(got[0].contains(&gram_pack(b"def")), "{got:?}");
+    }
+
+    #[test]
+    fn escaped_pipe_branch_still_indexes() {
+        // Naive `split('|')` yields a bare `x` branch -> None (full scan).
+        // Proper parse keeps 2 branches, both with usable literals.
+        let got = sorted_branches("needle_1\\|x|NEEDLE_ALPHA").unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+
+    #[test]
+    fn class_pipe_does_not_split() {
+        let got = sorted_branches("[a|b]+needle_1").unwrap();
+        assert_eq!(got.len(), 1, "class pipe must not split: {got:?}");
+        assert!(got[0].contains(&gram_pack(b"nee")), "{got:?}");
+    }
+
+    #[test]
+    fn group_alternation_splits() {
+        let got = sorted_branches("(needle_1|needle_2)_suffix").unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+    #[test]
+    fn cached_verify_matches_plain() {
+        // The fd-cache read path (`Some`) must bank the same hits as the
+        // plain path (`None`): byte-identical decoded text, line, and score.
+        let dir = std::env::temp_dir().join(format!("nkgrep_cached_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "needle here\nsecond needle\n").unwrap();
+        let ap = a.to_string_lossy().into_owned();
+        let matcher = RegexMatcher::new("needle").unwrap();
+        let fdc = FdCache::new(1);
+        let plain = verify_one_raw(0, &ap, &matcher, 10.0).expect("plain must hit");
+        let cached = verify_one_raw_cached(0, &ap, &matcher, 10.0, Some((&fdc, 0)))
+            .expect("cached must hit");
+        assert_eq!(cached.metas.len(), plain.metas.len());
+        for (c, p) in cached.metas.iter().zip(plain.metas.iter()) {
+            assert_eq!((c.line, c.score), (p.line, p.score));
+            assert_eq!(banked_text(&cached, c), banked_text(&plain, p));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_literal_falls_back() {
+        assert!(query_grams("a|b").is_none());
+        assert!(query_grams(".*").is_none());
+        assert!(query_grams("a\\|b").is_none()); // single branch, runs < 3
+    }
+
+    #[test]
+    fn plain_queries_unchanged() {
+        assert!(query_grams("TODO_FIXME_ALPHA").is_some());
+        assert_eq!(
+            sorted_branches("needle_1|needle_2|needle_3").unwrap().len(),
+            3
+        );
+        assert_eq!(sorted_branches("fn parse_config").unwrap().len(), 1);
+    }
+    #[test]
+    fn pack_bijective_and_ordered() {
+        // Bijective: distinct triples pack distinctly, top byte stays zero.
+        let mut seen = std::collections::HashSet::new();
+        for a in [0u8, 1, 65, 95, 122, 200, 255] {
+            for b in [0u8, 1, 65, 95, 122, 200, 255] {
+                for c in [0u8, 1, 65, 95, 122, 200, 255] {
+                    let k = gram_pack(&[a, b, c]);
+                    assert_eq!(k >> 24, 0, "top byte must stay zero");
+                    assert_eq!(((k >> 16) & 0xFF) as u8, a);
+                    assert_eq!(((k >> 8) & 0xFF) as u8, b);
+                    assert_eq!((k & 0xFF) as u8, c);
+                    assert!(seen.insert(k), "collision on [{a}, {b}, {c}]");
+                }
+            }
+        }
+        // Numeric order equals lexicographic byte order.
+        let mut trips: Vec<[u8; 3]> = vec![
+            *b"abc", *b"abd", *b"bac", *b"aaa", *b"zzz", *b"a_c", *b"_aa",
+        ];
+        trips.sort();
+        let mut packed: Vec<u32> = trips.iter().map(|t| gram_pack(t)).collect();
+        packed.sort();
+        assert_eq!(
+            packed,
+            trips.iter().map(|t| gram_pack(t)).collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn top_zero_indexed_matches_scan_empty() {
+        let dir = std::env::temp_dir().join(format!("nkgrep_top0_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "needle_haystack_content\n").unwrap();
+        std::fs::write(&b, "needle_haystack_content\n").unwrap();
+        let idx = Index {
+            root: String::new(),
+            root_dev: 0,
+            root_ino: 0,
+            files: vec![
+                a.to_string_lossy().into_owned(),
+                b.to_string_lossy().into_owned(),
+            ],
+            postings: HashMap::new(),
+        };
+        let matcher = RegexMatcher::new("needle_haystack_content").unwrap();
+        let order = vec![0u32, 1u32];
+        let scores = vec![10.0f64, 5.0f64];
+        let batched = parallel_verify_batched_raw(&idx, &matcher, &order, &scores, Some(0));
+        // Columnar flat scan (serve semantics): full verify, rank over side
+        // scores, top-0 truncate.
+        let scanned_all: Vec<FileHits> = [(0u32, 10.0f64), (1u32, 5.0f64)]
+            .into_iter()
+            .filter_map(|(id, s)| verify_one_raw_cached(id, &idx.files[id as usize], &matcher, s, None))
+            .collect();
+        let (scanned_scores, _) = flat_scores(&scanned_all);
+        let mut scanned_ord = raw_order(&scanned_scores);
+        scanned_ord.truncate(0);
+        assert!(batched.is_empty(), "top=0 batched must return 0 hits");
+        assert!(scanned_ord.is_empty(), "top=0 scan must return 0 hits");
+        assert!(!scanned_all.is_empty(), "fixture must match without top");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    fn quoted_manual(s: &str) -> Vec<u8> {
+        let mut m = Vec::with_capacity(s.len() + 2);
+        m.push(b'"');
+        push_escaped_json(&mut m, s);
+        m.push(b'"');
+        m
+    }
+
+    fn check_str(s: &str) {
+        let o = serde_json::to_vec(&s).unwrap();
+        assert_eq!(quoted_manual(s), o, "escape divergence on {s:?}");
+    }
+
+    fn check_hit(path: &str, line: u64, text: &str, score: f64) {
+        let h = Hit {
+            path: Arc::new(path.to_string()),
+            line,
+            text: text.to_string(),
+            score,
+        };
+        let mut m = Vec::new();
+        emit_hit_json(&mut m, &h);
+        let mut o = serde_json::to_vec(&h).unwrap();
+        o.push(b'\n');
+        assert_eq!(m, o, "hit divergence on {path:?}:{line}:{text:?}:{score:?}");
+    }
+
+    #[test]
+    fn fuzz_vs_serde_full_matrix() {
+        // Every single byte 0x00-0x7F standalone.
+        for b in 0u8..=0x7Fu8 {
+            check_str(&char::from_u32(b as u32).unwrap().to_string());
+        }
+        // Every control/quote/backslash embedded in text.
+        let mut specials: Vec<char> = (0u8..0x20).map(|b| b as char).collect();
+        specials.push('"');
+        specials.push('\\');
+        for c in &specials {
+            check_str(&format!("a{c}b"));
+            check_str(&format!("{c}lead"));
+            check_str(&format!("trail{c}"));
+        }
+        // Full pair matrix over specials (byte-identical gate).
+        for a in &specials {
+            for b in &specials {
+                check_str(&format!("{a}{b}"));
+                check_str(&format!("x{a}y{b}z"));
+            }
+        }
+        // Must-NOT-escape: DEL, high bytes via multibyte, slashes.
+        for s in [
+            "\x7f",
+            "caf\u{e9}",
+            "\u{1f600}",
+            "\u{fffd}",
+            "\u{4e2d}\u{6587}",
+            "e\u{301}",
+            "a/b\\c",
+            "/abs/path/x.txt",
+            "tab\there",
+            "nl\nhere",
+            "cr\rhere",
+            "bs\x08here",
+            "ff\x0chere",
+            "q\"q",
+            "b\\b",
+            "\"quoted\"",
+            "\\\\unc\\\\path",
+            "",
+            "plain ascii line with spaces 123",
+        ] {
+            check_str(s);
+        }
+        // Hit-level sweep: lines x scores x tricky strings. Floats stay on
+        // the serde path (ryu); this locks byte-identity including score.
+        let texts = [
+            "plain",
+            "q\"q\\",
+            "a\nb\tc",
+            "\x01\x02\x1f mid \x7f",
+            "uni \u{1f600} \u{fffd}",
+            "",
+            "trail\\",
+        ];
+        let lines = [0u64, 1, 42, u64::MAX];
+        let scores = [
+            0.0,
+            -0.0,
+            1.5,
+            -42.25,
+            123456.789,
+            1e-7,
+            1e300,
+            99.999999,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        for t in texts {
+            for l in lines {
+                for s in scores {
+                    check_hit("corpus/pkg_0/m_0.txt", l, t, s);
+                    check_hit("we\"ird\\path\x01.txt", l, t, s);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_vs_serde_corpus_bytes() {
+        // Every line of the real bench corpus as `text`, every file path as
+        // `path`: the differential equality over actual emission bytes.
+        let root = std::path::Path::new("bench/corpus");
+        if !root.exists() {
+            return;
+        }
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        let mut n = 0usize;
+        for p in &files {
+            check_str(&p.to_string_lossy());
+            let data = std::fs::read(p).unwrap();
+            for line in data.split(|&b| b == b'\n') {
+                let s = String::from_utf8_lossy(line);
+                check_str(&s);
+                // Spot Hit-level check per file: first line only keeps it fast.
+                if n < 2000 && line.as_ptr() == data.as_ptr() {
+                    check_hit(&p.to_string_lossy(), 1, &s, 12.5);
+                }
+                n += 1;
+                if n >= 60000 {
+                    return;
+                }
+            }
+        }
+        assert!(n > 1000, "corpus fuzz saw too few lines: {n}");
+    }
+}
