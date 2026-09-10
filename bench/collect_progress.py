@@ -40,7 +40,7 @@ ROOT = HERE.parent
 OUT_DIR = ROOT / "output"
 CSV = OUT_DIR / "results.csv"
 PNG = OUT_DIR / "results.png"
-PUBLIC_PNG = HERE / "results.png"
+PUBLIC_PNG = HERE / "benchmark.png"
 
 GROUPS = ["sel-146", "sel-86", "sel-60", "heavy-full", "heavy-top20"]
 ORDER = [
