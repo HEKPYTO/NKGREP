@@ -602,9 +602,10 @@ fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
     let mut ors = vec![];
     for branch in split_branches(pattern) {
         // Soundness fallback: `(?` changes literal semantics (flags `(?i)`,
-        // groups `(?P<>)`, comments `(?#)`, lookaround) and `{n}` repetition
+        // groups `(?P<>)`, comments `(?#)`, lookaround) and `{n}`/`*`/`?`
         // can drop a required trigram (`ABCDEF{0}` matches `ABCDE`, which
-        // lacks `DEF`). Either forces a full scan.
+        // lacks `DEF`; `NEEDLE_ALPHA?` matches `NEEDLE_ALPH`, lacking `PHA`).
+        // Any of them forces a full scan; `+` keeps every literal run.
         if branch_needs_fallback(&branch) {
             return None;
         }
@@ -627,10 +628,14 @@ fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
 }
 
 /// True when a split branch contains an unescaped `(?` (flags, named groups,
-/// comments, lookaround) or an unescaped `{`+digit repetition outside a
-/// `[...]` class. Escapes and class contents are skipped exactly as
-/// `literal_runs` skips them, so an escaped/literal `(?` or `{2}` never
-/// forces a fallback it does not need.
+/// comments, lookaround), an unescaped `{`+digit repetition, or an unescaped
+/// `*`/`?` quantifier outside a `[...]` class. Each can drop a required
+/// trigram (`ABCDEF{0}` matches `ABCDE` which lacks `DEF`; `NEEDLE_ALPHA?`
+/// matches `NEEDLE_ALPH` which lacks `PHA`), so any of them forces a full
+/// scan. `+` stays indexed: it keeps at least one copy of its atom, so every
+/// match still contains the literal run. Escapes and class contents are
+/// skipped exactly as `literal_runs` skips them, so an escaped/literal
+/// `(?`, `{2}`, `*`, or `?` never forces a fallback it does not need.
 fn branch_needs_fallback(branch: &str) -> bool {
     let mut it = branch.chars().peekable();
     while let Some(c) = it.next() {
@@ -665,6 +670,7 @@ fn branch_needs_fallback(branch: &str) -> bool {
                     return true;
                 }
             }
+            '*' | '?' => return true,
             '{' if it.peek().is_some_and(|p| p.is_ascii_digit()) => return true,
             '{' => {}
             _ => {}
@@ -1479,18 +1485,12 @@ fn cmd_serve(idx_path: &str, port: u16) {
         "nkgrep: serving {} files on 127.0.0.1:{bound}",
         idx.files.len()
     );
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let idx = idx.clone();
-                let fdc = fdc.clone();
-                std::thread::spawn(move || handle_client(s, idx, fdc));
-            }
-            Err(e) => eprintln!("nkgrep: accept error: {e}"),
-        }
+    for s in listener.incoming().flatten() {
+        let idx = idx.clone();
+        let fdc = fdc.clone();
+        std::thread::spawn(move || handle_client(s, idx, fdc));
     }
 }
-
 /// Hot client fetch: returns the server's hit lines verbatim plus the hit
 /// count, without parsing Hits or re-serializing them. The server already
 /// emits final ranked order, so the bytes are stdout-ready; the old
