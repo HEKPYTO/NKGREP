@@ -1,0 +1,19 @@
+[package]
+name = "nkgrep"
+version = "0.1.0"
+edition = "2021"
+description = "Top-n,k ranked code search: trigram index, best-first verify, proven match sets"
+license = "Apache-2.0"
+
+[dependencies]
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+rayon = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+memchr = "2"
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
