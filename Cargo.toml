@@ -13,7 +13,6 @@ exclude = [
      "plans/",
      "outputs/",
      "output/",
-     "HANDOFF.md",
      "CHANGELOG.md",
      "AGENTS.md",
      ".worktrees/",

@@ -3231,7 +3231,7 @@ fn serve_text_out(raw: &[u8], pattern: &str, ignore_case: bool, color_on: bool) 
 // Real emission fns (`emit_raw_with_path` + `push_escaped_json`) are exercised
 // directly by the escape equality below; no test-only wrappers.
 
-const USAGE: &str = "usage: nkg index <path> [--index FILE]\n       nkg serve --index FILE --port PORT\n       nkg [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
+const USAGE: &str = "usage: nkg index <path> [--index FILE]\n       nkg serve --index FILE --port PORT\n       nkg [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-./--hidden] [--no-ignore] [-L/--follow] [-g/--glob GLOB] [-d/--max-depth N] [--max-filesize N] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
 
 fn usage() -> ! {
     eprint!("{USAGE}");
