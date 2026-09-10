@@ -13,6 +13,97 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 mod prefilter;
+#[derive(Serialize, Deserialize, Clone)]
+#[cfg(test)]
+struct Hit {
+    path: std::sync::Arc<String>,
+    line: u64,
+    text: String,
+    score: f64,
+}
+
+/// ST-5 columnar hits, borrow-banked text (cold + serve): narrow per-hit
+/// record keyed by file id; match bytes are banked verbatim into a per-file
+/// arena (one amortized alloc per matched file, zero per hit) and decoded
+/// with the exact eager expression (`from_utf8_lossy` + char-trim) at emit,
+/// where valid UTF-8 borrows and only invalid-UTF8 hits allocate — the same
+/// hits that allocated before. Wire bytes stay identical.
+struct HitMeta {
+    line: u64,
+    start: u32,
+    end: u32,
+    score: f64,
+}
+
+struct FileHits {
+    pid: u32,
+    arena: Vec<u8>,
+    metas: Vec<HitMeta>,
+}
+
+struct ColCollector {
+    arena: Vec<u8>,
+    metas: Vec<HitMeta>,
+    path_bonus: f64,
+    depth_penalty: f64,
+}
+
+impl Sink for ColCollector {
+    type Error = Box<dyn std::error::Error>;
+
+    fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let line_no = m.line_number().unwrap_or(0);
+        let bytes = m.bytes();
+        let score = self.path_bonus - self.depth_penalty - (line_no as f64) / 1e6;
+        let start = self.arena.len() as u32;
+        self.arena.extend_from_slice(bytes);
+        let end = self.arena.len() as u32;
+        self.metas.push(HitMeta { line: line_no, start, end, score });
+        Ok(true)
+    }
+}
+
+/// Columnar verify: same TLS Searcher + 64 KB buffer + search_slice core as
+/// the serve-side cached verify, but the sink banks verbatim match bytes.
+fn verify_one_raw(pid: u32, path: &str, matcher: &RegexMatcher, file_score: f64) -> Option<FileHits> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SEARCHER: RefCell<Searcher> = RefCell::new(SearcherBuilder::new().build());
+        static BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
+    }
+    let mut sink = ColCollector {
+        arena: vec![],
+        metas: vec![],
+        path_bonus: file_score,
+        depth_penalty: 0.0,
+    };
+    // `with` (not try_with): destroyed-TLS fallback returning empty would
+    // silently drop matches and break the oracle; loud panic is correct.
+    // Any IO/search error still discards partial hits, as before.
+    let ok = SEARCHER.with(|s| {
+        BUF.with(|b| {
+            let mut buf = b.borrow_mut();
+            buf.clear();
+            let mut searcher = s.borrow_mut();
+            (|| -> std::io::Result<bool> {
+                use std::io::Read;
+                std::fs::File::open(path)?.read_to_end(&mut buf)?;
+                // Per-file early exit: an empty file holds no lines and no
+                // matches; skip searcher setup. Result identical to searching
+                // (Ok with zero banked hits).
+                if buf.is_empty() {
+                    return Ok(true);
+                }
+                Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
+            })()
+            .unwrap_or(false)
+        })
+    });
+    if ok && !sink.metas.is_empty() { Some(FileHits { pid, arena: sink.arena, metas: sink.metas }) } else { None }
+}
+/// Serve-side columnar verify: same TLS Searcher + 64 KB buffer +
+/// search_slice core and verbatim-banked sink as `verify_one_raw`, but the
+/// file bytes come through the daemon fd cache (`read_verify_bytes`).
 #[derive(Serialize, Deserialize)]
 struct Index {
     /// Canonical absolute path of the tree the index was built from.
@@ -141,6 +232,68 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
 /// to a concurrent replace retries once, then fails like any IO error.
 /// Any metadata/open failure falls back to plain open+read, so the cache
 /// never fails where the uncached path succeeds.
+fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
+    let ors = query_grams(pattern)?;
+    let n = idx.files.len() as f64;
+    // (postings, idf weight) per gram occurrence, in query order, for
+    // deferred exact scoring of survivors only.
+    let mut occ: Vec<(&[u32], f64)> = vec![];
+    let mut cand: Vec<u32> = vec![];
+    let mut tmp: Vec<u32> = vec![];
+    for ands in &ors {
+        let mut lists: Vec<&[u32]> = Vec::with_capacity(ands.len());
+        let mut empty = false;
+        for g in ands {
+            match idx.postings.get(g) {
+                None => {
+                    empty = true;
+                    break;
+                }
+                Some(list) => {
+                    occ.push((list.as_slice(), (n / list.len() as f64).ln()));
+                    lists.push(list.as_slice());
+                }
+            }
+        }
+        if empty || lists.is_empty() {
+            continue;
+        }
+        let branch = prefilter::intersect_all(&mut lists);
+        prefilter::union_sorted_into(&cand, &branch, &mut tmp);
+        std::mem::swap(&mut cand, &mut tmp);
+    }
+    let mut is_cand = vec![false; idx.files.len()];
+    for &id in &cand {
+        is_cand[id as usize] = true;
+    }
+    let mut scores = vec![0.0f64; idx.files.len()];
+    for &(list, w) in &occ {
+        for &id in list {
+            if is_cand[id as usize] {
+                scores[id as usize] += w;
+            }
+        }
+    }
+    let mut order: Vec<(u32, f64)> = cand
+        .into_iter()
+        .map(|id| {
+            let p = &idx.files[id as usize];
+            let depth = PathBuf::from(p).components().count() as f64;
+            let bonus = if p.contains(pattern) { 100.0 } else { 0.0 };
+            (id, scores[id as usize] + bonus - depth)
+        })
+        .collect();
+    order.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(order)
+}
+
+/// Rank order over a standalone scores vec (ST-5 columnar sort): indices
+/// only, comparator verbatim the Hit-order one (NaN fallback included), so
+/// the order — ties included — matches the stable fat-Hit sort given the
+/// same collect sequence. Sort traffic touches 8 B scores, never payloads.
 fn usage() -> ! {
     eprintln!("usage: nkgrep index <path> [--index FILE]");
     eprintln!("       nkgrep serve --index FILE --port PORT");
