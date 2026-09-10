@@ -1,12 +1,9 @@
 # nkgrep
 
-nkgrep is ranked code search for people who live in big repos. You type
-a pattern, it hands back the k best hits with a score attached — usually
-before you've lifted your finger off enter.
-
-Under the hood it's a trigram index plus best-first checking. On plain
-literal queries it returns exactly the same matches as ripgrep, just ranked
-so the good stuff floats to the top.
+nkgrep is a ranked code search tool. Given a pattern, it returns the k
+highest-scoring matches. It combines a trigram index with best-first
+verification: on plain literal queries it returns exactly the match set
+of ripgrep, ordered by relevance score.
 
 ## Install
 
