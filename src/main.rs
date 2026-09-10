@@ -8,7 +8,7 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,35 +75,52 @@ impl Sink for ColCollector {
     }
 }
 
-/// Frozen no-context wrapper: the quiet paths and the MatchFlags invert
-/// contract call this signature; the body lives in `verify_one_raw_ctx`
-/// with `before = after = 0`, so the default path is untouched.
+/// Cold columnar verify arguments, bundled so the entry stays under
+/// clippy's argument-count limit (same contract as `CachedVerify`).
+struct VerifyInput<'a> {
+    pid: u32,
+    path: &'a str,
+    matcher: &'a RegexMatcher,
+    file_score: f64,
+    before: usize,
+    after: usize,
+    invert: bool,
+    follow: bool,
+}
+
+/// No-context wrapper over `verify_one_raw_ctx` (before=after=0, invert=false).
 fn verify_one_raw(
     pid: u32,
     path: &str,
     matcher: &RegexMatcher,
     file_score: f64,
+    follow: bool,
 ) -> Option<FileHits> {
-    verify_one_raw_ctx(pid, path, matcher, file_score, 0, 0, false)
+    verify_one_raw_ctx(VerifyInput {
+        pid,
+        path,
+        matcher,
+        file_score,
+        before: 0,
+        after: 0,
+        invert: false,
+        follow,
+    })
 }
 
-/// Columnar verify with context attach: same TLS Searcher + 64 KB buffer +
-/// search_slice core as the serve-side cached verify, but the sink banks
-/// verbatim match bytes. When `before`/`after` is nonzero the file's line
-/// table is attached over the same arena (see `attach_context`); the hit
-/// set, scores, and rank order are identical either way. `invert` builds a
-/// local inverted searcher per file (non-matching lines banked instead);
-/// the TLS default searcher is untouched, so invert=false is byte-identical
-/// to the old path.
-fn verify_one_raw_ctx(
-    pid: u32,
-    path: &str,
-    matcher: &RegexMatcher,
-    file_score: f64,
-    before: usize,
-    after: usize,
-    invert: bool,
-) -> Option<FileHits> {
+/// Columnar verify: TLS Searcher + 64KB buf + verbatim-banked sink; hit set,
+/// scores, and rank order identical with or without context/invert.
+fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
+    let VerifyInput {
+        pid,
+        path,
+        matcher,
+        file_score,
+        before,
+        after,
+        invert,
+        follow,
+    } = args;
     use std::cell::RefCell;
     thread_local! {
         static SEARCHER: RefCell<Searcher> = RefCell::new(SearcherBuilder::new().build());
@@ -138,7 +155,9 @@ fn verify_one_raw_ctx(
             };
             (|| -> std::io::Result<bool> {
                 use std::io::Read;
-                std::fs::File::open(path)?.read_to_end(&mut buf)?;
+                // No-follow open (unless -L): a symlink swapped in after
+                // the walk is refused here, never followed outside.
+                open_verify_file(std::path::Path::new(path), follow)?.read_to_end(&mut buf)?;
                 // Per-file early exit: an empty file holds no lines and no
                 // matches; skip searcher setup. Result identical to searching
                 // (Ok with zero banked hits).
@@ -173,14 +192,13 @@ fn verify_one_raw_ctx(
         None
     }
 }
-/// Frozen no-context wrapper over `verify_one_raw_cached_ctx` (same
-/// wrapper contract as `verify_one_raw`).
 fn verify_one_raw_cached(
     pid: u32,
     path: &str,
     matcher: &RegexMatcher,
     file_score: f64,
     fdc: Option<(&FdCache, u32)>,
+    follow: bool,
 ) -> Option<FileHits> {
     verify_one_raw_cached_ctx(CachedVerify {
         pid,
@@ -191,11 +209,10 @@ fn verify_one_raw_cached(
         after: 0,
         fdc,
         invert: false,
+        follow,
     })
 }
 
-/// Serve-side cached verify arguments, bundled so the entry stays under
-/// clippy's argument-count limit. One struct, zero behavior change.
 struct CachedVerify<'a> {
     pid: u32,
     path: &'a str,
@@ -205,6 +222,7 @@ struct CachedVerify<'a> {
     after: usize,
     fdc: Option<(&'a FdCache, u32)>,
     invert: bool,
+    follow: bool,
 }
 
 /// Serve-side columnar verify with context attach: same TLS Searcher +
@@ -222,6 +240,7 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
         after,
         fdc,
         invert,
+        follow,
     } = args;
     use std::cell::RefCell;
     thread_local! {
@@ -252,7 +271,7 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
                 None => &mut normal,
             };
             (|| -> std::io::Result<bool> {
-                read_verify_bytes(fdc, path, &mut buf, false)?;
+                read_verify_bytes(fdc, path, &mut buf, false, follow)?;
                 // Twin of the `verify_one_raw` early exit: empty files hold
                 // no matches; skip searcher setup identically.
                 if buf.is_empty() {
@@ -335,17 +354,73 @@ fn root_cookie(canon: &std::path::Path) -> (u64, u64) {
     }
 }
 
+/// Stored `files` entries must be root-relative: absolute paths (stale
+/// format) and `..` components (directory escape past the query root on
+/// join) are refused loudly (exit 2), never silently dropped. Checked at
+/// parse and again pre-join at load so a hostile index cannot make verify
+/// read outside the rooted tree.
+fn validate_stored_files(idx_path: &str, files: &[String]) {
+    use std::path::Component;
+    for p in files {
+        let path = PathBuf::from(p);
+        if path.is_absolute() {
+            eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
+            std::process::exit(2);
+        }
+        if path.components().any(|c| matches!(c, Component::ParentDir)) {
+            eprintln!(
+                "nkgrep: hostile index {idx_path} (path escapes root {p:?}): rebuild with `nkgrep index`"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Index write that refuses symlink targets: a pre-check plus `O_NOFOLLOW`
+/// open (unix) so a symlink swapped in between check and write still fails
+/// loudly (exit 2) instead of writing through to the target.
+fn write_index_file(idx_path: &str, bytes: &[u8]) {
+    if let Ok(m) = std::fs::symlink_metadata(idx_path) {
+        if m.file_type().is_symlink() {
+            eprintln!("nkgrep: refusing to write index through symlink {idx_path}");
+            std::process::exit(2);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        opts.custom_flags(libc::O_NOFOLLOW);
+        match opts.open(idx_path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(bytes) {
+                    eprintln!("nkgrep: cannot write index {idx_path}: {e}");
+                    std::process::exit(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("nkgrep: cannot write index {idx_path}: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = std::fs::write(idx_path, bytes) {
+            eprintln!("nkgrep: cannot write index {idx_path}: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// Parse index JSON; old absolute-path indexes (missing `root`) and corrupt
 /// files are refused loudly instead of silently matching nothing.
 fn parse_index(idx_path: &str, data: &str) -> Index {
     match serde_json::from_str::<Index>(data) {
         Ok(idx) => {
-            if idx.files.iter().any(|p| PathBuf::from(p).is_absolute()) {
-                eprintln!(
-                    "nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`"
-                );
-                std::process::exit(2);
-            }
+            validate_stored_files(idx_path, &idx.files);
             if idx
                 .postings
                 .values()
@@ -481,23 +556,56 @@ fn parse_index_bin(idx_path: &str, data: &[u8]) -> Index {
         files,
         postings,
     };
-    if idx.files.iter().any(|p| PathBuf::from(p).is_absolute()) {
-        eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
-        std::process::exit(2);
-    }
+    validate_stored_files(idx_path, &idx.files);
     idx
 }
 
 /// Read raw index bytes once; binary (magic) vs JSON dispatch lives here so
 /// both load helpers share it with unchanged signatures.
+///
+/// Hostile-index memory bound: an index file larger than
+/// `MAX_INDEX_BYTES` refuses the whole operation loudly (exit 2, never a
+/// silent truncation or per-file drop — either would break the
+/// indexed==scan equality by searching a subset while claiming the full
+/// corpus). The read itself is length-capped so a file that grows past
+/// the pre-check between metadata and read still cannot OOM the loader;
+/// under-cap files take the identical bytes as before.
+///
+/// Deliberately NOT capped (documented refusal): per-corpus-file reads
+/// (index build and verify) and hit/arena buffers. Any silent per-file
+/// or per-hit cap would search less than the scan path and break equality
+/// EQUAL; the user's own `--max-filesize` walk filter remains the
+/// explicit, rg-compatible way to bound corpus reads.
+const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 fn read_index_bytes(idx_path: &str) -> Vec<u8> {
-    match std::fs::read(idx_path) {
-        Ok(d) => d,
+    use std::io::Read;
+    let f = match std::fs::File::open(idx_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("nkgrep: cannot read index {idx_path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    if f.metadata()
+        .map(|m| m.len() > MAX_INDEX_BYTES)
+        .unwrap_or(false)
+    {
+        eprintln!("nkgrep: index {idx_path} exceeds 4 GiB: rebuild with `nkgrep index`");
+        std::process::exit(2);
+    }
+    let mut d = Vec::new();
+    match f.take(MAX_INDEX_BYTES + 1).read_to_end(&mut d) {
+        Ok(_) => {}
         Err(e) => {
             eprintln!("nkgrep: cannot read index {idx_path}: {e}");
             std::process::exit(2);
         }
     }
+    if d.len() as u64 > MAX_INDEX_BYTES {
+        eprintln!("nkgrep: index {idx_path} exceeds 4 GiB: rebuild with `nkgrep index`");
+        std::process::exit(2);
+    }
+    d
 }
 fn parse_index_auto(idx_path: &str, data: &[u8]) -> Index {
     if data.starts_with(BIN_MAGIC) {
@@ -528,9 +636,10 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
             idx.root,
             q_canon.display()
         );
+        std::process::exit(2);
     }
     let (dev, ino) = root_cookie(&q_canon);
-    if idx.root_dev != 0 && (dev, ino) != (idx.root_dev, idx.root_ino) {
+    if (dev, ino) != (idx.root_dev, idx.root_ino) {
         eprintln!(
             "nkgrep: index root mismatch (built at {}, queried at {}: root replaced)",
             idx.root,
@@ -538,6 +647,7 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
         );
         std::process::exit(2);
     }
+    validate_stored_files(idx_path, &idx.files);
     for f in idx.files.iter_mut() {
         *f = query_root.join(&*f).to_string_lossy().into_owned();
     }
@@ -553,9 +663,7 @@ fn load_index_for_serve(idx_path: &str) -> Index {
     let base = PathBuf::from(&idx.root);
     let live = canon_root(&base);
     let (dev, ino) = root_cookie(&live);
-    if live.to_string_lossy() != idx.root
-        || (idx.root_dev != 0 && (dev, ino) != (idx.root_dev, idx.root_ino))
-    {
+    if live.to_string_lossy() != idx.root || (dev, ino) != (idx.root_dev, idx.root_ino) {
         eprintln!(
             "nkgrep: index root mismatch (built at {}, now at {})",
             idx.root,
@@ -563,6 +671,7 @@ fn load_index_for_serve(idx_path: &str) -> Index {
         );
         std::process::exit(2);
     }
+    validate_stored_files(idx_path, &idx.files);
     for f in idx.files.iter_mut() {
         *f = base.join(&*f).to_string_lossy().into_owned();
     }
@@ -1291,19 +1400,34 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
     let entries: Vec<(String, HashSet<[u8; 3]>)> = paths
         .par_iter()
         .filter_map(|p| {
-            let bytes = std::fs::read(p).ok()?;
-            if is_binary(&bytes) {
-                return None;
-            }
+            // Race-close: canonicalize FIRST, then read through the
+            // canonical path with a no-follow open. The confinement check
+            // and the bytes then share one resolution: a symlink swapped
+            // in after the walk either resolves inside (read as-is) or
+            // outside (prefix check drops it) or races the open itself
+            // (O_NOFOLLOW refuses it) — never outside bytes stored under
+            // an inside name. Every failure here skips the file
+            // (fail-closed); stable files read byte-identically.
+            let canon = std::fs::canonicalize(p).ok()?;
             // Root-relative entry: canonicalize both sides so symlinked
             // roots (e.g. /tmp on macOS) fingerprint stably. Files escaping
             // the root via symlink are skipped, never stored absolute.
-            let rel = std::fs::canonicalize(p)
-                .ok()?
+            let rel = canon
                 .strip_prefix(&root_canon)
                 .ok()?
                 .to_string_lossy()
                 .into_owned();
+            let mut bytes = Vec::new();
+            {
+                use std::io::Read;
+                open_verify_file(&canon, false)
+                    .ok()?
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+            }
+            if is_binary(&bytes) {
+                return None;
+            }
             Some((rel, trigrams_of(&bytes)))
         })
         .collect();
@@ -1324,10 +1448,7 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
         postings,
     };
     if idx_path.ends_with(".bin") {
-        if let Err(e) = std::fs::write(idx_path, encode_index_bin(&idx)) {
-            eprintln!("nkgrep: cannot write index {idx_path}: {e}");
-            std::process::exit(2);
-        }
+        write_index_file(idx_path, &encode_index_bin(&idx));
     } else {
         let data = match serde_json::to_string(&idx) {
             Ok(s) => s,
@@ -1336,10 +1457,7 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
                 std::process::exit(2);
             }
         };
-        if let Err(e) = std::fs::write(idx_path, data) {
-            eprintln!("nkgrep: cannot write index {idx_path}: {e}");
-            std::process::exit(2);
-        }
+        write_index_file(idx_path, data.as_bytes());
     }
     eprintln!(
         "nkgrep: indexed {} files in {} ms -> {idx_path}",
@@ -1472,71 +1590,149 @@ fn pread_all(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) -> std::io::Result
     }
 }
 
-fn plain_open_read(path: &str, buf: &mut Vec<u8>) -> std::io::Result<()> {
+/// Open a corpus file for verify/index reads with walk-matching symlink
+/// semantics: `follow == false` (the default; the walker runs unfollowed
+/// unless `-L/--follow`) refuses symlinks atomically at open
+/// (`O_NOFOLLOW`), so a symlink swapped in between walk and open is
+/// skipped instead of followed outside the root. With `-L/--follow` the
+/// open follows links exactly like the walker does. A refused symlink
+/// surfaces as an IO error and the caller skips the file — the same
+/// outcome as a walk-filtered file, byte-identical on success paths.
+fn open_verify_file(path: &std::path::Path, follow: bool) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true);
+        if !follow {
+            o.custom_flags(libc::O_NOFOLLOW);
+        }
+        o.open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        // No O_NOFOLLOW off unix: best-effort no-follow check, still racy
+        // there but no worse than before; the unix path is exact.
+        if !follow
+            && std::fs::symlink_metadata(path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "refusing symlink without -L/--follow",
+            ));
+        }
+        std::fs::File::open(path)
+    }
+}
+fn plain_open_read(path: &str, buf: &mut Vec<u8>, follow: bool) -> std::io::Result<()> {
     use std::io::Read;
-    std::fs::File::open(path)?.read_to_end(buf)?;
+    open_verify_file(std::path::Path::new(path), follow)?.read_to_end(buf)?;
     Ok(())
 }
 
-/// Serve-side file read: warm-fd hit serves stat + pread (no open/close and
-/// no path walk); miss or edit opens fresh, validates the fd's own metadata,
-/// and caches it. `retried` bounds the EBADF re-read after a concurrent
-/// replace closed the fd under us.
+/// Serve-side file read: warm-fd hit fstats the cached fd itself (no path
+/// walk, no open/close) and preads it; miss or edit opens fresh, validates
+/// the fd's own metadata, and caches it. `retried` bounds the EBADF re-read
+/// after a concurrent replace closed the fd under us.
+///
+/// Freshness binds the fd, not the path: the served bytes come from the
+/// cached fd, so its own fstat (len, mtime) — not a path stat taken
+/// earlier — anchors the hit decision. A swap between the decision and
+/// the pread then reads old-or-new atomically per fd, never
+/// fresh-claimed stale bytes. The fd is additionally bound to the live
+/// path by (dev, ino): a rename-swap leaves the old fd valid with
+/// matching fstat, so identity must match too or the entry refreshes
+/// from the live path (a pure-fstat check would serve pre-replace bytes
+/// indefinitely). In-place edits change the fd's own fstat and miss the
+/// same way. `follow` is false on the daemon path (the served index was
+/// built unfollowed); the miss open still honors it. Any metadata/open
+/// failure falls back to plain open+read, so the cache never fails where
+/// the uncached path succeeds.
 #[cfg(unix)]
 fn read_verify_bytes(
     fdc: Option<(&FdCache, u32)>,
     path: &str,
     buf: &mut Vec<u8>,
     retried: bool,
+    follow: bool,
 ) -> std::io::Result<()> {
     let (cache, id) = match fdc {
-        None => return plain_open_read(path, buf),
+        None => return plain_open_read(path, buf, follow),
         Some(x) => x,
-    };
-    let live = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return plain_open_read(path, buf),
-    };
-    let (len, modified) = match live.modified() {
-        Ok(t) => (live.len(), t),
-        Err(_) => return plain_open_read(path, buf),
     };
     let slot = match cache.slots.get(id as usize) {
         Some(s) => s,
-        None => return plain_open_read(path, buf),
+        None => return plain_open_read(path, buf, follow),
     };
-    // Fast path: per-slot lock only, no open/hash while holding it.
-    // Poison-tolerant: a panicked holder must not wedge the daemon.
-    if let Some(fd) = slot
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|e| e.len == len && e.modified == modified)
-        .map(|e| e.fd)
-    {
+    // Hit decision under one per-slot lock, no open/hash while holding
+    // it. Poison-tolerant: a panicked holder must not wedge the daemon.
+    // None (empty slot or any mismatch) falls to the fill path below.
+    let hit_fd: Option<std::os::unix::io::RawFd> = 'hit: {
+        let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let e = match guard.as_ref() {
+            Some(e) => e,
+            None => break 'hit None,
+        };
+        // fstat the cached fd: the served bytes come from this fd, so its
+        // own metadata decides freshness — never a path stat alone.
+        let fm = {
+            use std::os::unix::io::FromRawFd;
+            // SAFETY: `e.fd` is a live cache-owned fd; the ManuallyDrop
+            // File borrows it for one metadata call and never closes it.
+            let borrowed = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(e.fd)) };
+            match borrowed.metadata() {
+                Ok(m) => m,
+                Err(_) => break 'hit None,
+            }
+        };
+        use std::os::unix::fs::MetadataExt;
+        if fm.len() != e.len || fm.modified().ok() != Some(e.modified) {
+            // The held fd itself changed under us (in-place edit): refill.
+            break 'hit None;
+        }
+        let live = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return plain_open_read(path, buf, follow),
+        };
+        if live.dev() != fm.dev() || live.ino() != fm.ino() {
+            // Rename-swap: the old fd is still valid but no longer the
+            // live path — refill from the live path, never serve the
+            // detached generation as current.
+            break 'hit None;
+        }
+        match live.modified() {
+            Ok(t) if live.len() == e.len && t == e.modified => Some(e.fd),
+            Ok(_) => break 'hit None,
+            Err(_) => return plain_open_read(path, buf, follow),
+        }
+    };
+    if let Some(fd) = hit_fd {
         match pread_all(fd, buf) {
             Ok(()) => return Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::EBADF) && !retried => {
                 // Lost the fd to a concurrent replace: drop the dead entry
                 // and re-read once through the fresh path.
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                return read_verify_bytes(fdc, path, buf, true);
+                return read_verify_bytes(fdc, path, buf, true, follow);
             }
             Err(e) => return Err(e),
         }
     }
     // Miss or edit: open + stat OUTSIDE the lock so one cold file never
-    // stalls other workers' warm pread hits.
-    let f = match std::fs::File::open(path) {
+    // stalls other workers' warm pread hits. The open honors `follow`
+    // (no-follow by default), closing the swap-a-symlink-in window.
+    let f = match open_verify_file(std::path::Path::new(path), follow) {
         Ok(f) => f,
-        Err(_) => return plain_open_read(path, buf),
+        Err(_) => return plain_open_read(path, buf, follow),
     };
     let (flen, fmod) = match f
         .metadata()
         .and_then(|m| m.modified().map(|t| (m.len(), t)))
     {
         Ok(x) => x,
-        Err(_) => return plain_open_read(path, buf),
+        Err(_) => return plain_open_read(path, buf, follow),
     };
     // `f` drops here but the fd must survive: forget the File.
     // SAFETY: `into_raw_fd` transfers ownership to the entry.
@@ -1572,7 +1768,7 @@ fn read_verify_bytes(
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(libc::EBADF) && !retried => {
             *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            read_verify_bytes(fdc, path, buf, true)
+            read_verify_bytes(fdc, path, buf, true, follow)
         }
         Err(e) => Err(e),
     }
@@ -1585,8 +1781,9 @@ fn read_verify_bytes(
     path: &str,
     buf: &mut Vec<u8>,
     _retried: bool,
+    follow: bool,
 ) -> std::io::Result<()> {
-    plain_open_read(path, buf)
+    plain_open_read(path, buf, follow)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1868,15 +2065,30 @@ fn ctx_group_lines(files: &[FileHits], fi: usize, mis: &[usize]) -> Vec<u64> {
     v
 }
 
-fn parallel_verify_batched_raw(
-    idx: &Index,
-    matcher: &RegexMatcher,
-    order: &[u32],
-    scores: &[f64],
+/// Batched parallel verify arguments, bundled so the entry stays under
+/// clippy's argument-count limit (same contract as `CachedVerify`).
+struct BatchVerify<'a> {
+    idx: &'a Index,
+    matcher: &'a RegexMatcher,
+    order: &'a [u32],
+    scores: &'a [f64],
     top: Option<usize>,
     before: usize,
     after: usize,
-) -> Vec<FileHits> {
+    follow: bool,
+}
+
+fn parallel_verify_batched_raw(args: BatchVerify<'_>) -> Vec<FileHits> {
+    let BatchVerify {
+        idx,
+        matcher,
+        order,
+        scores,
+        top,
+        before,
+        after,
+        follow,
+    } = args;
     if top == Some(0) {
         return vec![];
     }
@@ -1888,15 +2100,16 @@ fn parallel_verify_batched_raw(
         return order
             .par_iter()
             .filter_map(|id| {
-                verify_one_raw_ctx(
-                    *id,
-                    &idx.files[*id as usize],
+                verify_one_raw_ctx(VerifyInput {
+                    pid: *id,
+                    path: &idx.files[*id as usize],
                     matcher,
-                    scores[*id as usize],
+                    file_score: scores[*id as usize],
                     before,
                     after,
-                    false,
-                )
+                    invert: false,
+                    follow,
+                })
             })
             .collect();
     }
@@ -1921,15 +2134,16 @@ fn parallel_verify_batched_raw(
             .par_iter()
             .filter(|id| !armed || scores[**id as usize] > kth_now)
             .filter_map(|id| {
-                verify_one_raw_ctx(
-                    *id,
-                    &idx.files[*id as usize],
+                verify_one_raw_ctx(VerifyInput {
+                    pid: *id,
+                    path: &idx.files[*id as usize],
                     matcher,
-                    scores[*id as usize],
+                    file_score: scores[*id as usize],
                     before,
                     after,
-                    false,
-                )
+                    invert: false,
+                    follow,
+                })
             })
             .collect();
         total += batch.iter().map(|f| f.metas.len()).sum::<usize>();
@@ -1944,7 +2158,16 @@ fn parallel_verify_batched_raw(
     all
 }
 
+/// Daemon hardening bounds (localhost trust; wire token parked — see
+/// `load_serve_port`). `MAX_SERVE_LINE_BYTES` caps one wire line;
+/// `MAX_SERVE_CONNECTIONS` caps concurrent handler threads. Over-limit →
+/// drop this connection; the daemon survives.
+const MAX_SERVE_LINE_BYTES: u64 = 1 << 20;
+const MAX_SERVE_CONNECTIONS: usize = 64;
 fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
+    // Per-query liveness: hung clients must not pin a slot forever.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     let reader_src = match stream.try_clone() {
         Ok(c) => c,
         Err(_) => return,
@@ -1952,7 +2175,20 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
     let mut reader = BufReader::new(reader_src);
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stream);
     let mut line = String::new();
-    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+    loop {
+        line.clear();
+        // Bounded line: `take` caps bytes copied into `line` so a gigabyte
+        // line allocates at most MAX+1, then this connection drops.
+        let n = (&mut reader)
+            .take(MAX_SERVE_LINE_BYTES + 1)
+            .read_line(&mut line)
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        if n as u64 > MAX_SERVE_LINE_BYTES || !line.ends_with('\n') {
+            break;
+        }
         let t0 = Instant::now();
         // Columnar serve emission: borrow-banked FileHits through the fd
         // cache, rank once over the side scores vec, escape each unique
@@ -2023,6 +2259,7 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                                         &matcher,
                                         *s,
                                         Some((&*fdc, *id)),
+                                        false,
                                     )
                                 } else {
                                     verify_one_raw_cached_ctx(CachedVerify {
@@ -2034,6 +2271,7 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                                         after: q.after,
                                         fdc: Some((&*fdc, *id)),
                                         invert: q.invert,
+                                        follow: false,
                                     })
                                 }
                             })
@@ -2164,29 +2402,126 @@ fn serve_info_path(idx_path: &str) -> String {
     format!("{idx_path}.serve.json")
 }
 
+/// Linux `/proc/<pid>/stat` starttime (field 22), or None when unavailable
+/// (non-Linux, vanished pid, parse failure). Cheap pid-reuse guard.
+#[cfg(target_os = "linux")]
+fn proc_starttime(pid: u32) -> Option<u64> {
+    let data = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let text = String::from_utf8_lossy(&data);
+    let after = text.rfind(')')?;
+    let fields: Vec<&str> = text[after + 1..].split_whitespace().collect();
+    // After `(comm)`: state(3)..starttime(22) → index 19.
+    fields.get(19)?.parse::<u64>().ok()
+}
+#[cfg(not(target_os = "linux"))]
+fn proc_starttime(_pid: u32) -> Option<u64> {
+    None
+}
+/// True when `pid` plausibly exists. Unix: `kill(pid, 0)`; EPERM means the
+/// process exists but we may not signal it. Unknown platforms: assume alive
+/// (the connect probe still fails closed to the cold path).
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: kill with sig 0 sends nothing; return/errno only.
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        if r == 0 {
+            return true;
+        }
+        let e = std::io::Error::last_os_error().raw_os_error();
+        // EPERM (1) = alive, no permission; ESRCH (3) = no such process.
+        e == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
 #[derive(Serialize, Deserialize)]
 struct ServerInfo {
     pid: u32,
     port: u16,
+    /// Daemon starttime for pid-reuse detection; 0 = unknown (old files,
+    /// non-Linux). Serde-defaulted so old sidecars still parse.
+    #[serde(default)]
+    starttime: u64,
 }
 
 fn save_serve_info(idx_path: &str, port: u16) {
+    let pid = std::process::id();
     let info = ServerInfo {
-        pid: std::process::id(),
+        pid,
         port,
+        starttime: proc_starttime(pid).unwrap_or(0),
     };
-    if let Ok(s) = serde_json::to_string(&info) {
-        let _ = std::fs::write(serve_info_path(idx_path), s + "\n");
+    let Ok(s) = serde_json::to_string(&info) else {
+        return;
+    };
+    let path = serve_info_path(idx_path);
+    // No-symlink write: refuse to truncate a planted link target.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        opts.custom_flags(libc::O_NOFOLLOW);
+        match opts.open(&path) {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                let _ = f.write_all(s.as_bytes());
+                let _ = f.write_all(b"\n");
+            }
+            Err(e) => {
+                eprintln!("nkgrep: refuse serve sidecar {path}: {e}");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, s + "\n");
     }
 }
 
-/// Port recorded by a running `serve` for this index, or None when no
-/// server registered (missing or corrupt file reads as absent).
+/// Port recorded by a running `serve` for this index, or None when no live
+/// server is registered (missing/corrupt/stale file reads as absent with a
+/// stale-file warning on stderr, then the caller falls back to cold load).
+///
+/// Trust model (accepted): localhost-only bind, no wire token. The query
+/// pattern travels to 127.0.0.1:port in cleartext and any local listener on
+/// the recorded port can answer; that disclosure is documented localhost
+/// trust, not a boundary. A shared-secret wire token was considered and
+/// parked (sidecar-secret rotation/forwarding complexity outweighs the gain
+/// while any local user can already bind loopback). The pid-liveness +
+/// starttime check here closes only the stale-file / port-reuse hijack: a
+/// dead daemon's sidecar never diverts a query.
 fn load_serve_port(idx_path: &str) -> Option<u16> {
-    let data = std::fs::read_to_string(serve_info_path(idx_path)).ok()?;
-    serde_json::from_str::<ServerInfo>(data.trim())
-        .ok()
-        .map(|i| i.port)
+    let path = serve_info_path(idx_path);
+    let data = std::fs::read_to_string(&path).ok()?;
+    let info: ServerInfo = serde_json::from_str(data.trim()).ok()?;
+    if info.port == 0 || !pid_alive(info.pid) {
+        eprintln!(
+            "nkgrep: stale serve file {path} (pid {} not running); falling back to cold index load",
+            info.pid
+        );
+        return None;
+    }
+    if info.starttime != 0 {
+        match proc_starttime(info.pid) {
+            Some(cur) if cur == info.starttime => {}
+            _ => {
+                eprintln!(
+                    "nkgrep: stale serve file {path} (pid {} reused); falling back to cold index load",
+                    info.pid
+                );
+                return None;
+            }
+        }
+    }
+    Some(info.port)
 }
 
 fn cmd_serve(idx_path: &str, port: u16) {
@@ -2207,10 +2542,20 @@ fn cmd_serve(idx_path: &str, port: u16) {
         "nkgrep: serving {} files on 127.0.0.1:{bound}",
         idx.files.len()
     );
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for s in listener.incoming().flatten() {
+        if active.load(std::sync::atomic::Ordering::SeqCst) >= MAX_SERVE_CONNECTIONS {
+            drop(s);
+            continue;
+        }
         let idx = idx.clone();
         let fdc = fdc.clone();
-        std::thread::spawn(move || handle_client(s, idx, fdc));
+        let active = active.clone();
+        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::spawn(move || {
+            handle_client(s, idx, fdc);
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 }
 /// MatchFlags half of a serve query (MatchFlags owns; ContextLines owns the
@@ -3754,15 +4099,16 @@ fn main() {
                 let found = (0u32..ptab.len() as u32)
                     .into_par_iter()
                     .find_any(|pid| {
-                        verify_one_raw_ctx(
-                            *pid,
-                            &ptab[*pid as usize],
-                            &matcher,
-                            0.0,
-                            ctx_before,
-                            ctx_after,
-                            invert_match,
-                        )
+                        verify_one_raw_ctx(VerifyInput {
+                            pid: *pid,
+                            path: &ptab[*pid as usize],
+                            matcher: &matcher,
+                            file_score: 0.0,
+                            before: ctx_before,
+                            after: ctx_after,
+                            invert: invert_match,
+                            follow: walk_follow,
+                        })
                         .is_some()
                     })
                     .is_some();
@@ -3781,15 +4127,16 @@ fn main() {
                     } else {
                         0.0
                     };
-                    verify_one_raw_ctx(
+                    verify_one_raw_ctx(VerifyInput {
                         pid,
-                        ps,
-                        &matcher,
-                        bonus - depth,
-                        ctx_before,
-                        ctx_after,
-                        invert_match,
-                    )
+                        path: ps,
+                        matcher: &matcher,
+                        file_score: bonus - depth,
+                        before: ctx_before,
+                        after: ctx_after,
+                        invert: invert_match,
+                        follow: walk_follow,
+                    })
                 })
                 .collect();
         } else {
@@ -3823,6 +4170,7 @@ fn main() {
                             &idx.files[**id as usize],
                             &matcher,
                             scores[**id as usize],
+                            walk_follow,
                         )
                         .is_some()
                     })
@@ -3831,9 +4179,16 @@ fn main() {
             }
             // Rank-ordered parallel verify, kth early exit between batches
             // (spec §6: match score ≤ file score, exit moves only with proof).
-            hits = parallel_verify_batched_raw(
-                idx, &matcher, &order, &scores, top, ctx_before, ctx_after,
-            );
+            hits = parallel_verify_batched_raw(BatchVerify {
+                idx,
+                matcher: &matcher,
+                order: &order,
+                scores: &scores,
+                top,
+                before: ctx_before,
+                after: ctx_after,
+                follow: walk_follow,
+            });
             hits_indexed = true;
         }
     } else {
@@ -3849,15 +4204,16 @@ fn main() {
             let found = (0u32..ptab.len() as u32)
                 .into_par_iter()
                 .find_any(|pid| {
-                    verify_one_raw_ctx(
-                        *pid,
-                        &ptab[*pid as usize],
-                        &matcher,
-                        0.0,
-                        ctx_before,
-                        ctx_after,
-                        invert_match,
-                    )
+                    verify_one_raw_ctx(VerifyInput {
+                        pid: *pid,
+                        path: &ptab[*pid as usize],
+                        matcher: &matcher,
+                        file_score: 0.0,
+                        before: ctx_before,
+                        after: ctx_after,
+                        invert: invert_match,
+                        follow: walk_follow,
+                    })
                     .is_some()
                 })
                 .is_some();
@@ -3877,15 +4233,16 @@ fn main() {
                 } else {
                     0.0
                 };
-                verify_one_raw_ctx(
+                verify_one_raw_ctx(VerifyInput {
                     pid,
-                    ps,
-                    &matcher,
-                    bonus - depth,
-                    ctx_before,
-                    ctx_after,
-                    invert_match,
-                )
+                    path: ps,
+                    matcher: &matcher,
+                    file_score: bonus - depth,
+                    before: ctx_before,
+                    after: ctx_after,
+                    invert: invert_match,
+                    follow: walk_follow,
+                })
             })
             .collect();
     }
@@ -4175,8 +4532,8 @@ mod literal_tests {
         let ap = a.to_string_lossy().into_owned();
         let matcher = RegexMatcher::new("needle").unwrap();
         let fdc = FdCache::new(1);
-        let plain = verify_one_raw(0, &ap, &matcher, 10.0).expect("plain must hit");
-        let cached = verify_one_raw_cached(0, &ap, &matcher, 10.0, Some((&fdc, 0)))
+        let plain = verify_one_raw(0, &ap, &matcher, 10.0, false).expect("plain must hit");
+        let cached = verify_one_raw_cached(0, &ap, &matcher, 10.0, Some((&fdc, 0)), false)
             .expect("cached must hit");
         assert_eq!(cached.metas.len(), plain.metas.len());
         for (c, p) in cached.metas.iter().zip(plain.metas.iter()) {
@@ -4260,13 +4617,22 @@ mod literal_tests {
         let matcher = RegexMatcher::new("needle_haystack_content").unwrap();
         let order = vec![0u32, 1u32];
         let scores = vec![10.0f64, 5.0f64];
-        let batched = parallel_verify_batched_raw(&idx, &matcher, &order, &scores, Some(0), 0, 0);
+        let batched = parallel_verify_batched_raw(BatchVerify {
+            idx: &idx,
+            matcher: &matcher,
+            order: &order,
+            scores: &scores,
+            top: Some(0),
+            before: 0,
+            after: 0,
+            follow: false,
+        });
         // Columnar flat scan (serve semantics): full verify, rank over side
         // scores, top-0 truncate.
         let scanned_all: Vec<FileHits> = [(0u32, 10.0f64), (1u32, 5.0f64)]
             .into_iter()
             .filter_map(|(id, s)| {
-                verify_one_raw_cached(id, &idx.files[id as usize], &matcher, s, None)
+                verify_one_raw_cached(id, &idx.files[id as usize], &matcher, s, None, false)
             })
             .collect();
         let (scanned_scores, _) = flat_scores(&scanned_all);
@@ -4378,9 +4744,29 @@ mod literal_tests {
         std::fs::write(&a, "foo one\nbar two\nfoo three\nbaz four\n").unwrap();
         let ap = a.to_string_lossy().into_owned();
         let m = RegexMatcher::new("foo").unwrap();
-        let norm = verify_one_raw_ctx(0, &ap, &m, 0.0, 0, 0, false).expect("plain must hit");
+        let norm = verify_one_raw_ctx(VerifyInput {
+            pid: 0,
+            path: &ap,
+            matcher: &m,
+            file_score: 0.0,
+            before: 0,
+            after: 0,
+            invert: false,
+            follow: false,
+        })
+        .expect("plain must hit");
         assert_eq!(norm.metas.len(), 2);
-        let inv = verify_one_raw_ctx(0, &ap, &m, 0.0, 0, 0, true).expect("invert must hit");
+        let inv = verify_one_raw_ctx(VerifyInput {
+            pid: 0,
+            path: &ap,
+            matcher: &m,
+            file_score: 0.0,
+            before: 0,
+            after: 0,
+            invert: true,
+            follow: false,
+        })
+        .expect("invert must hit");
         assert_eq!(inv.metas.len(), 2);
         assert_eq!((inv.metas[0].line, inv.metas[1].line), (2, 4));
         assert_eq!(banked_text(&inv, &inv.metas[0]), "bar two");
@@ -4394,12 +4780,23 @@ mod literal_tests {
             after: 0,
             fdc: None,
             invert: true,
+            follow: false,
         })
         .expect("cached invert");
         assert_eq!(inv_c.metas.len(), 2);
         assert_eq!(inv_c.metas[0].line, 2);
         // -m keeps file order (first m).
-        let mut capped = verify_one_raw_ctx(0, &ap, &m, 0.0, 0, 0, false).unwrap();
+        let mut capped = verify_one_raw_ctx(VerifyInput {
+            pid: 0,
+            path: &ap,
+            matcher: &m,
+            file_score: 0.0,
+            before: 0,
+            after: 0,
+            invert: false,
+            follow: false,
+        })
+        .unwrap();
         apply_max_count(std::slice::from_mut(&mut capped), Some(1));
         assert_eq!(capped.metas.len(), 1);
         assert_eq!(capped.metas[0].line, 1);
@@ -4691,13 +5088,23 @@ mod context_tests {
         std::fs::write(&f, "first\r\nneedle one\nmiddle\nneedle two").unwrap();
         let fp = f.to_string_lossy().into_owned();
         let matcher = RegexMatcher::new("needle").unwrap();
-        let plain = verify_one_raw(0, &fp, &matcher, 10.0).expect("must hit");
+        let plain = verify_one_raw(0, &fp, &matcher, 10.0, false).expect("must hit");
         let before: Vec<String> = plain
             .metas
             .iter()
             .map(|m| banked_text(&plain, m).into_owned())
             .collect();
-        let attached = verify_one_raw_ctx(0, &fp, &matcher, 10.0, 1, 1, false).expect("must hit");
+        let attached = verify_one_raw_ctx(VerifyInput {
+            pid: 0,
+            path: &fp,
+            matcher: &matcher,
+            file_score: 10.0,
+            before: 1,
+            after: 1,
+            invert: false,
+            follow: false,
+        })
+        .expect("must hit");
         assert_eq!(attached.line_starts.len(), 4);
         for (m, b) in attached.metas.iter().zip(before.iter()) {
             assert_eq!(&banked_text(&attached, m).into_owned(), b);
