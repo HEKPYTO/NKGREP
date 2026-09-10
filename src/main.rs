@@ -562,6 +562,65 @@ fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
 /// only, comparator verbatim the Hit-order one (NaN fallback included), so
 /// the order — ties included — matches the stable fat-Hit sort given the
 /// same collect sequence. Sort traffic touches 8 B scores, never payloads.
+fn parallel_verify_batched_raw(
+    idx: &Index,
+    matcher: &RegexMatcher,
+    order: &[u32],
+    scores: &[f64],
+    top: Option<usize>,
+) -> Vec<FileHits> {
+    if top == Some(0) {
+        return vec![];
+    }
+    const BATCH: usize = 64;
+    // Full queries never early-exit (k = MAX), so the sequential batch
+    // waves are pure barrier overhead: verify all candidates in one wave.
+    // Top-k keeps the batched proof path below untouched (§6).
+    if top.is_none() {
+        return order
+            .par_iter()
+            .filter_map(|id| {
+                verify_one_raw(*id, &idx.files[*id as usize], matcher, scores[*id as usize])
+            })
+            .collect();
+    }
+    let k = top.unwrap_or(usize::MAX);
+    let mut all: Vec<FileHits> = vec![];
+    let mut total = 0usize;
+    let mut kth = f64::NEG_INFINITY;
+    let mut done = 0usize;
+    for chunk in order.chunks(BATCH) {
+        if total >= k && scores[chunk[0] as usize] <= kth {
+            eprintln!("nkgrep: early exit after {done} of {} files", order.len());
+            break;
+        }
+        // Per-file exit at file granularity (spec §6, same proof as the
+        // batch check: every match scores at most its file score, so a file
+        // whose file score does not exceed kth contributes no top-k hit).
+        // Same `<= kth` threshold as the batch exit, applied per file, so
+        // the surviving set — ties included — matches the batch-only path.
+        let armed = total >= k;
+        let kth_now = kth;
+        let mut batch: Vec<FileHits> = chunk
+            .par_iter()
+            .filter(|id| !armed || scores[**id as usize] > kth_now)
+            .filter_map(|id| {
+                verify_one_raw(*id, &idx.files[*id as usize], matcher, scores[*id as usize])
+            })
+            .collect();
+        total += batch.iter().map(|f| f.metas.len()).sum::<usize>();
+        all.append(&mut batch);
+        done += chunk.len();
+        if total >= k {
+            let (mut s, _) = flat_scores(&all);
+            s.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            kth = s[k - 1];
+        }
+    }
+    all
+}
+
+
 fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stream);
