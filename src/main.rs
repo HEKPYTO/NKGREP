@@ -1078,6 +1078,11 @@ fn save_serve_info(idx_path: &str, port: u16) {
 
 /// Port recorded by a running `serve` for this index, or None when no
 /// server registered (missing or corrupt file reads as absent).
+fn load_serve_port(idx_path: &str) -> Option<u16> {
+    let data = std::fs::read_to_string(serve_info_path(idx_path)).ok()?;
+    serde_json::from_str::<ServerInfo>(data.trim()).ok().map(|i| i.port)
+}
+
 fn cmd_serve(idx_path: &str, port: u16) {
     let idx = Arc::new(load_index_for_serve(idx_path));
     // O3: daemon-global warm-fd cache + fd headroom for one fd per file.
@@ -1139,6 +1144,52 @@ fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize
 /// Serve-first probe for `--use-index`: connect to the daemon registered in
 /// `<index>.serve.json`, if any. Any failure (no file, no listener, bad
 /// reply) returns None so the caller falls back to the cold index load.
+fn try_serve_query(idx_path: &str, pattern: &str, top: Option<usize>) -> Option<(Vec<u8>, usize)> {
+    let port = load_serve_port(idx_path)?;
+    let mut stream = TcpStream::connect_timeout(
+        &"127.0.0.1".parse().ok().map(|ip| std::net::SocketAddr::new(ip, port))?,
+        Duration::from_millis(200),
+    )
+    .ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    let req = serde_json::to_string(&Query { pattern: pattern.to_string(), top }).ok()?;
+    stream.write_all(req.as_bytes()).ok()?;
+    stream.write_all(b"\n").ok()?;
+    let mut reader = BufReader::new(stream);
+    // Raw passthrough: server bytes are already final-ordered hit JSON, one
+    // per line. Collect them verbatim instead of parsing each Hit and
+    // re-serializing it. Blank lines are skipped and error lines fail over
+    // to the cold path, matching the old fallible-parse behavior.
+    let mut raw = vec![];
+    let mut matches = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return None;
+        }
+        let t = line.trim();
+        if t.contains("\"done\"") {
+            break;
+        }
+        if t.contains("\"error\"") {
+            return None;
+        }
+        if t.is_empty() {
+            continue;
+        }
+        matches += 1;
+        raw.extend_from_slice(line.as_bytes());
+    }
+    Some((raw, matches))
+}
+/// Cold-emission JSON string escaper (Escaper region): byte-identical to
+/// serde_json for `&str` input. Only `"`, `\` and bytes < 0x20 escape;
+/// `\n`/`\r`/`\t`/0x08/0x0C use short forms, other controls `\u00XX`
+/// (lowercase hex, matching serde_json); UTF-8 multibyte passes through.
+/// memchr2 skips the common quote/backslash-free run; the gap holds only
+/// rare controls, scanned inline. Floats are NOT touched here: `emit_hit_json`
+/// formats `score` via serde_json so ryu output stays oracle-exact.
 fn usage() -> ! {
     eprintln!("usage: nkgrep index <path> [--index FILE]");
     eprintln!("       nkgrep serve --index FILE --port PORT");
