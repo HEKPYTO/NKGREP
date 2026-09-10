@@ -7,7 +7,7 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -487,6 +487,88 @@ fn walk_files(root: &PathBuf) -> Vec<PathBuf> {
     paths
 }
 
+/// Label for the single stdin search unit (`-` operand or piped stdin with
+/// no path). Chosen over rg's `<stdin>` for shell-visibility; the `-c`
+/// shape stays `label:count` and `-l` prints the bare label.
+const STDIN_LABEL: &str = "(standard input)";
+
+/// Stdin slice-search: the same TLS Searcher + `search_slice` core and
+/// verbatim-banked ColCollector as `verify_one_raw`, but over an
+/// already-read stdin buffer instead of a file path. Empty/binary buffers
+/// hold no matches, mirroring the file path (binaries are skipped on both
+/// index and verify sides). Own TLS Searcher: no shared fn is changed.
+/// Scores fold path_bonus 0 / depth 0; the label comes from the ptab.
+fn search_stdin_raw(buf: &[u8], matcher: &RegexMatcher) -> Option<FileHits> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SEARCHER: RefCell<Searcher> = RefCell::new(SearcherBuilder::new().build());
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    if is_binary(buf) {
+        return None;
+    }
+    let mut sink = ColCollector {
+        arena: vec![],
+        metas: vec![],
+        path_bonus: 0.0,
+        depth_penalty: 0.0,
+    };
+    let ok = SEARCHER.with(|s| {
+        let mut searcher = s.borrow_mut();
+        searcher.search_slice(matcher, buf, &mut sink).is_ok()
+    });
+    if ok && !sink.metas.is_empty() {
+        Some(FileHits {
+            pid: 0,
+            arena: sink.arena,
+            metas: sink.metas,
+        })
+    } else {
+        None
+    }
+}
+
+/// Sorted per-file surviving-hit counts from served JSON lines (the --port /
+/// serve-first paths; --top is already applied server-side). Unparseable
+/// lines are skipped; the wire contract guarantees one object per line.
+fn served_path_counts(raw: &[u8]) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+            if let Some(p) = v.get("path").and_then(|p| p.as_str()) {
+                *counts.entry(p.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let mut rows: Vec<(String, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// `-c` / `-l` line writer: `path:count` per matching file, or matching
+/// paths only when `files_only` (`-l` wins over `-c`, matching rg:
+/// `--files-with-matches` overrides `--count`). Rows must arrive path-sorted
+/// from the caller. Zero-count files are omitted — rg prints `:0` rows, a
+/// deliberate deviation keeping indexed==scan identical (binaries, candidates)
+/// with stable order; the `path:count` shape itself is rg-compatible.
+fn write_aggregates(w: &mut impl Write, rows: &[(&str, usize)], files_only: bool) {
+    let mut buf = Vec::with_capacity(rows.len() * 64);
+    for (p, n) in rows {
+        buf.extend_from_slice(p.as_bytes());
+        if !files_only {
+            buf.push(b':');
+            buf.extend_from_slice(n.to_string().as_bytes());
+        }
+        buf.push(b'\n');
+    }
+    stdout_write_all(w, &buf);
+}
+
 /// Identical binary-file skip on both index and verify sides (soundness):
 /// a file is binary when its first 8192 bytes contain a NUL. `cmd_index`
 /// and every verify path share this predicate so indexed==scan on binaries.
@@ -690,18 +772,29 @@ fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
     runs
 }
 
-/// ASCII-gated matcher construction (V1): when the pattern is ASCII, skip the
-/// Unicode tables (`unicode(false)` + `\n` line terminator, which unlocks the
-/// fast line-oriented search path); when it is additionally a pure literal,
-/// compile with `fixed_strings`. Each flag is independent and keeps
-/// independently. A builder error (e.g. the line terminator rejecting a
-/// pattern that can match `\n`) retries less-gated, ending at plain
-/// `RegexMatcher::new`, so construction never fails where it used to work.
-fn build_matcher(pattern: &str) -> Result<RegexMatcher, grep_regex::Error> {
-    let ascii_only = pattern.is_ascii();
+/// Matcher construction: ASCII-gated fast path (V1) plus the `-i` gate.
+/// Default (`case_insensitive=false`) is the exact V1 sequence: ASCII
+/// patterns skip the Unicode tables (`unicode(false)` + `\n` line
+/// terminator, unlocking the fast line-oriented path) and pure literals add
+/// `fixed_strings`; each keeps independently, builder errors retry
+/// less-gated down to plain `RegexMatcher::new`, so construction never
+/// fails where it used to work.
+/// `-i` keeps the Unicode tables on purpose: `case_insensitive(true)` with
+/// Unicode is full simple-fold insensitivity (ripgrep-compatible: `hello`
+/// finds `HELLO`, `café` finds `CAFÉ`), while adding `unicode(false)`
+/// would shrink folding to ASCII only. The cost is the Unicode tables on
+/// `-i` queries alone; the default path is untouched. `fixed_strings` still
+/// applies to pure literals (the engine folds literals itself). The final
+/// fallback keeps `case_insensitive(true)` so `-i` never silently degrades
+/// to case-sensitive; a truly bad pattern still returns Err (exit 2).
+fn build_matcher(pattern: &str, case_insensitive: bool) -> Result<RegexMatcher, grep_regex::Error> {
+    let ascii_only = pattern.is_ascii() && !case_insensitive;
     let literal_only = is_pure_literal(pattern);
-    if ascii_only || literal_only {
+    if case_insensitive || ascii_only || literal_only {
         let mut b = RegexMatcherBuilder::new();
+        if case_insensitive {
+            b.case_insensitive(true);
+        }
         if ascii_only {
             b.unicode(false);
             b.line_terminator(Some(b'\n'));
@@ -719,6 +812,13 @@ fn build_matcher(pattern: &str) -> Result<RegexMatcher, grep_regex::Error> {
                 bz.fixed_strings(true);
             }
             if let Ok(m) = bz.build(pattern) {
+                return Ok(m);
+            }
+        }
+        if case_insensitive {
+            let mut bi = RegexMatcherBuilder::new();
+            bi.case_insensitive(true);
+            if let Ok(m) = bi.build(pattern) {
                 return Ok(m);
             }
         }
@@ -1052,6 +1152,10 @@ fn read_verify_bytes(
 struct Query {
     pattern: String,
     top: Option<usize>,
+    /// `-i` over serve: false on old clients (serde default), so old/new
+    /// daemons interop — an old daemon just searches case-sensitively.
+    #[serde(default)]
+    ignore_case: bool,
 }
 
 /// Ranked candidate file ids with scores. None = no usable literal.
@@ -1243,16 +1347,24 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
         let mut broken = false;
         match serde_json::from_str::<Query>(line.trim()) {
             Err(_) => {}
-            Ok(q) => match build_matcher(&q.pattern) {
+            Ok(q) => match build_matcher(&q.pattern, q.ignore_case) {
                 Err(e) => {
                     if writeln!(writer, "{{\"error\":\"{e}\"}}").is_err() {
                         broken = true;
                     }
                 }
                 Ok(matcher) => {
-                    let order = ranked_candidates(&idx, &q.pattern).unwrap_or_else(|| {
+                    // `-i` skips trigram pruning: the postings are raw bytes,
+                    // so case-sensitive grams would false-negative
+                    // (`hello` grams miss `HELLO` files). Full-file verify
+                    // keeps serve==cold on every `-i` query.
+                    let order = if q.ignore_case {
                         (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect()
-                    });
+                    } else {
+                        ranked_candidates(&idx, &q.pattern).unwrap_or_else(|| {
+                            (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect()
+                        })
+                    };
                     let files: Vec<FileHits> = order
                         .par_iter()
                         .filter_map(|(id, s)| {
@@ -1386,7 +1498,12 @@ fn cmd_serve(idx_path: &str, port: u16) {
 /// Blank lines are skipped; a bad-regex error reply is reported as
 /// `Some(message)` (empty stdout) so the caller exits 2 like the cold path
 /// instead of masking it as zero matches.
-fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize, Option<String>) {
+fn client_query(
+    port: u16,
+    pattern: &str,
+    top: Option<usize>,
+    ignore_case: bool,
+) -> (Vec<u8>, usize, Option<String>) {
     let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
         Ok(s) => s,
         Err(e) => {
@@ -1397,6 +1514,7 @@ fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize
     let req = serde_json::to_string(&Query {
         pattern: pattern.to_string(),
         top,
+        ignore_case,
     })
     .unwrap();
     if let Err(e) = stream
@@ -1442,7 +1560,12 @@ fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize
 /// Serve-first probe for `--use-index`: connect to the daemon registered in
 /// `<index>.serve.json`, if any. Any failure (no file, no listener, bad
 /// reply) returns None so the caller falls back to the cold index load.
-fn try_serve_query(idx_path: &str, pattern: &str, top: Option<usize>) -> Option<(Vec<u8>, usize)> {
+fn try_serve_query(
+    idx_path: &str,
+    pattern: &str,
+    top: Option<usize>,
+    ignore_case: bool,
+) -> Option<(Vec<u8>, usize)> {
     let port = load_serve_port(idx_path)?;
     let mut stream = TcpStream::connect_timeout(
         &"127.0.0.1"
@@ -1458,6 +1581,7 @@ fn try_serve_query(idx_path: &str, pattern: &str, top: Option<usize>) -> Option<
     let req = serde_json::to_string(&Query {
         pattern: pattern.to_string(),
         top,
+        ignore_case,
     })
     .ok()?;
     stream.write_all(req.as_bytes()).ok()?;
@@ -1626,7 +1750,7 @@ fn emit_hit_json(buf: &mut Vec<u8>, h: &Hit) {
 fn usage() -> ! {
     eprintln!("usage: nkgrep index <path> [--index FILE]");
     eprintln!("       nkgrep serve --index FILE --port PORT");
-    eprintln!("       nkgrep [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]");
+    eprintln!("       nkgrep [-i] [-q] [-c] [-l] [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]");
     std::process::exit(2);
 }
 /// Stdout write that never panics: BrokenPipe (e.g. `| head`) exits quietly
@@ -1653,6 +1777,18 @@ fn stdout_flush(w: &mut impl Write) {
         }
     }
 }
+/// `-q` exit: stdout stays empty (the flag's whole contract), stderr keeps
+/// the diagnostics line, exit 0 on the first match / 1 on none. The
+/// short-circuit is the caller's `find_any`: rayon stops scheduling verify
+/// work once any worker banks a hit, so quiet latency is time-to-first-hit.
+fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant) -> ! {
+    eprintln!(
+        "nkgrep: {} in {files} files, {} ms (index load {load_ms} ms)",
+        if found { "1+ matches" } else { "0 matches" },
+        t0.elapsed().as_millis()
+    );
+    std::process::exit(if found { 0 } else { 1 });
+}
 
 /// `--help` text (stdout, exit 0). Usage errors still go through `usage()`
 /// (stderr, exit 2). Write errors are ignored: help under a closed pipe
@@ -1664,14 +1800,15 @@ fn print_help() {
         " — ranked trigram code search\n",
         "usage: nkgrep index <path> [--index FILE]\n",
         "       nkgrep serve --index FILE --port PORT\n",
-        "       nkgrep [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]\n",
+        "       nkgrep [-i] [-q] [-c] [-l] [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]\n",
         "options:\n",
-        "  --top N          keep top N matches\n",
-        "  --use-index FILE query the index at FILE\n",
-        "  --port PORT      query the daemon on PORT\n",
-        "  --help, -h       print this help\n",
-        "  --version, -V    print version\n",
-        "exit codes: 0 matches (or help/version), 1 no matches, 2 usage/IO/regex error\n"
+        "  -i, --ignore-case  case-insensitive match\n",
+        "  -q, --quiet        suppress stdout, stop at first match\n",
+        "  --silent           alias for --quiet\n",
+        "  -                  read (standard input) instead of [path]\n",
+        "  -c, --count        path:count per matching file, path-sorted\n",
+        "  -l, --files-with-matches\n",
+        "                     matching paths only, path-sorted (-l wins over -c)\n",
     );
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
@@ -1756,6 +1893,10 @@ fn main() {
     let mut top: Option<usize> = None;
     let mut use_index: Option<String> = None;
     let mut port: Option<u16> = None;
+    let mut ignore_case = false;
+    let mut quiet = false;
+    let mut count_mode = false;
+    let mut files_only = false;
     let mut pos: Vec<String> = vec![];
     let mut i = 0;
     while i < raw.len() {
@@ -1787,6 +1928,46 @@ fn main() {
             if port.is_none() {
                 usage();
             }
+        } else if raw[i] == "-i" || raw[i] == "--ignore-case" {
+            ignore_case = true;
+        } else if raw[i] == "-q" || raw[i] == "--quiet" || raw[i] == "--silent" {
+            quiet = true;
+        } else if raw[i] == "-c" || raw[i] == "--count" {
+            count_mode = true;
+        } else if raw[i] == "-l" || raw[i] == "--files-with-matches" {
+            files_only = true;
+        } else if raw[i].len() > 1
+            && raw[i].starts_with('-')
+            && !raw[i].starts_with("--")
+            && raw[i][1..].chars().all(|c| c == 'c' || c == 'l')
+        {
+            // Combined shorts (-cl, -lc, -cc): claimed only when EVERY char
+            // is in {c,l}, mirroring the {i,q} arm below. Mixed clusters
+            // (e.g. -ci) stay positional — the shared short-cluster protocol.
+            for c in raw[i][1..].chars() {
+                if c == 'c' {
+                    count_mode = true;
+                } else {
+                    files_only = true;
+                }
+            }
+        } else if raw[i].len() > 1
+            && raw[i].starts_with('-')
+            && !raw[i].starts_with("--")
+            && raw[i][1..].chars().all(|c| c == 'i' || c == 'q')
+        {
+            // Combined shorts (-iq, -qi): claimed only when EVERY char is in
+            // {i,q}. Anything with other letters falls through to positional
+            // (FlagsCLS owns all-{c,l} clusters; mixed clusters stay
+            // positional) — the shared short-cluster protocol. Bare `-`
+            // (stdin) never reaches here via the len>1 guard.
+            for c in raw[i][1..].chars() {
+                if c == 'i' {
+                    ignore_case = true;
+                } else {
+                    quiet = true;
+                }
+            }
         } else {
             pos.push(raw[i].clone());
         }
@@ -1795,20 +1976,59 @@ fn main() {
     if pos.is_empty() || pos.len() > 2 {
         usage();
     }
-    if port.is_none() && pos.len() != 2 {
+    // Stdin search unit (FlagsCLS): an explicit `-` operand, or piped stdin
+    // with no path operand, searches stdin as one unit labeled
+    // `(standard input)` instead of walking the tree. A terminal with no
+    // path stays a usage error (exit 2), as before.
+    let stdin_explicit = pos.get(1).map(|s| s.as_str()) == Some("-");
+    let stdin_piped = pos.len() == 1 && !std::io::stdin().is_terminal();
+    if stdin_explicit && port.is_some() {
+        eprintln!("nkgrep: stdin search cannot use --port");
         usage();
     }
+    if port.is_none() && pos.len() != 2 && !stdin_explicit && !stdin_piped {
+        usage();
+    }
+    let stdin_mode = port.is_none() && (stdin_explicit || stdin_piped);
     let pattern = pos[0].clone();
     let root = PathBuf::from(pos.get(1).map(|s| s.as_str()).unwrap_or("."));
 
     let t0 = Instant::now();
     if port.is_none() {
         if let Some(idx_path) = &use_index {
-            if let Some((raw, matches)) = try_serve_query(idx_path, &pattern, top) {
-                let stdout = std::io::stdout();
-                let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-                stdout_write_all(&mut writer, &raw);
-                stdout_flush(&mut writer);
+            if let Some((raw, matches)) = try_serve_query(idx_path, &pattern, top, ignore_case) {
+                // `-q` over serve suppresses stdout client-side; the daemon
+                // has no quiet protocol (short-circuit lives on the cold
+                // path). Exit codes keep the 0/1 contract.
+                if count_mode || files_only {
+                    // `-c` / `-l` over serve-first: aggregate the served JSON
+                    // lines client-side (--top already applied server-side;
+                    // `-l` wins over `-c`, `-q` still suppresses stdout).
+                    if !quiet {
+                        let rows = served_path_counts(&raw);
+                        let refs: Vec<(&str, usize)> =
+                            rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+                        let stdout = std::io::stdout();
+                        let mut writer =
+                            std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                        write_aggregates(&mut writer, &refs, files_only);
+                        stdout_flush(&mut writer);
+                    }
+                    eprintln!(
+                        "nkgrep: {matches} matches via serve, {} ms",
+                        t0.elapsed().as_millis()
+                    );
+                    if matches == 0 {
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+                if !quiet {
+                    let stdout = std::io::stdout();
+                    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                    stdout_write_all(&mut writer, &raw);
+                    stdout_flush(&mut writer);
+                }
                 eprintln!(
                     "nkgrep: {matches} matches via serve, {} ms",
                     t0.elapsed().as_millis()
@@ -1822,15 +2042,28 @@ fn main() {
         }
     }
     if let Some(p) = port {
-        let (raw, matches, bad_regex) = client_query(p, &pattern, top);
+        let (raw, matches, bad_regex) = client_query(p, &pattern, top, ignore_case);
         if let Some(msg) = bad_regex {
             eprintln!("nkgrep: bad regex: {msg}");
             std::process::exit(2);
         }
-        let stdout = std::io::stdout();
-        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-        stdout_write_all(&mut writer, &raw);
-        stdout_flush(&mut writer);
+        if count_mode || files_only {
+            // `-c` / `-l` over --port: same client-side aggregation as the
+            // serve-first branch above.
+            if !quiet {
+                let rows = served_path_counts(&raw);
+                let refs: Vec<(&str, usize)> = rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+                let stdout = std::io::stdout();
+                let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                write_aggregates(&mut writer, &refs, files_only);
+                stdout_flush(&mut writer);
+            }
+        } else if !quiet {
+            let stdout = std::io::stdout();
+            let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+            stdout_write_all(&mut writer, &raw);
+            stdout_flush(&mut writer);
+        }
         eprintln!(
             "nkgrep: {matches} matches via serve, {} ms",
             t0.elapsed().as_millis()
@@ -1841,7 +2074,7 @@ fn main() {
         return;
     }
 
-    let matcher = match build_matcher(&pattern) {
+    let matcher = match build_matcher(&pattern, ignore_case) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("nkgrep: bad regex: {e}");
@@ -1857,7 +2090,11 @@ fn main() {
     let mut hits_indexed = false;
     let files: usize;
     let mut load_ms = 0u128;
-    let idx_opt: Option<Index> = if let Some(idx_path) = &use_index {
+    let idx_opt: Option<Index> = if stdin_mode {
+        // Stdin bypasses the index entirely: the piped bytes are not indexed
+        // content. --use-index is ignored, not an error.
+        None
+    } else if let Some(idx_path) = &use_index {
         let t_load = Instant::now();
         let idx = load_index_for_query(idx_path, &root);
         load_ms = t_load.elapsed().as_millis();
@@ -1865,12 +2102,46 @@ fn main() {
     } else {
         None
     };
-    if let Some(idx) = &idx_opt {
+    if stdin_mode {
+        // No walk, no index: stdin bytes are the only search unit, labeled
+        // `(standard input)`. The shared sort/emit tail below applies
+        // unchanged (--top truncates, -c/-l aggregate, JSON stays default).
+        files = 1;
+        ptab = vec![STDIN_LABEL.to_string()];
+        let mut input = Vec::new();
+        {
+            use std::io::Read;
+            if std::io::stdin().read_to_end(&mut input).is_err() {
+                eprintln!("nkgrep: stdin: read error");
+                std::process::exit(2);
+            }
+        }
+        if quiet {
+            // Existence only, mirroring the file branches: no stdout, 0/1 exit.
+            quiet_exit(
+                search_stdin_raw(&input, &matcher).is_some(),
+                files,
+                load_ms,
+                t0,
+            );
+        }
+        hits = search_stdin_raw(&input, &matcher)
+            .map(|h| vec![h])
+            .unwrap_or_default();
+    } else if let Some(idx) = &idx_opt {
         let n = idx.files.len() as f64;
         let mut scores = vec![0.0f64; idx.files.len()];
         let mut order: Vec<u32> = vec![];
-        let mut fallback = false;
-        match query_grams(&pattern) {
+        // `-i` forces the scan fallback: trigram postings are raw bytes, so
+        // case-sensitive grams would false-negative on case variants
+        // (`hello` grams miss `HELLO` files). Scanning makes indexed==scan
+        // hold by construction; the matcher itself folds case.
+        let mut fallback = ignore_case;
+        match if fallback {
+            None
+        } else {
+            query_grams(&pattern)
+        } {
             None => fallback = true,
             Some(ors) => {
                 let mut occ: Vec<(&[u32], f64)> = vec![];
@@ -1920,6 +2191,17 @@ fn main() {
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect();
+            if quiet {
+                // Existence only: `find_any` stops the parallel wave at the
+                // first banked hit instead of verifying every file.
+                let found = (0u32..ptab.len() as u32)
+                    .into_par_iter()
+                    .find_any(|pid| {
+                        verify_one_raw(*pid, &ptab[*pid as usize], &matcher, 0.0).is_some()
+                    })
+                    .is_some();
+                quiet_exit(found, files, load_ms, t0);
+            }
             hits = (0u32..ptab.len() as u32)
                 .into_par_iter()
                 .filter_map(|pid| verify_one_raw(pid, &ptab[pid as usize], &matcher, 0.0))
@@ -1941,6 +2223,23 @@ fn main() {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             files = order.len();
+            if quiet {
+                // Existence only over the pruned candidate set: same
+                // `find_any` short-circuit as the scan branches.
+                let found = order
+                    .par_iter()
+                    .find_any(|id| {
+                        verify_one_raw(
+                            **id,
+                            &idx.files[**id as usize],
+                            &matcher,
+                            scores[**id as usize],
+                        )
+                        .is_some()
+                    })
+                    .is_some();
+                quiet_exit(found, files, load_ms, t0);
+            }
             // Rank-ordered parallel verify, kth early exit between batches
             // (spec §6: match score ≤ file score, exit moves only with proof).
             hits = parallel_verify_batched_raw(idx, &matcher, &order, &scores, top);
@@ -1953,6 +2252,15 @@ fn main() {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
+        if quiet {
+            // Existence only: `find_any` stops the parallel wave at the
+            // first banked hit instead of verifying every file.
+            let found = (0u32..ptab.len() as u32)
+                .into_par_iter()
+                .find_any(|pid| verify_one_raw(*pid, &ptab[*pid as usize], &matcher, 0.0).is_some())
+                .is_some();
+            quiet_exit(found, files, load_ms, t0);
+        }
         hits = (0u32..ptab.len() as u32)
             .into_par_iter()
             .filter_map(|pid| {
@@ -1980,6 +2288,38 @@ fn main() {
         ord.truncate(n);
     }
     let matches = ord.len();
+    if count_mode || files_only {
+        // `-c` / `-l` cold emit: per-file surviving-hit (post---top) counts,
+        // path-sorted for a stable contract (rg emits walk-parallel order).
+        // `-l` wins over `-c`; `-q` never reaches here (quiet_exit above).
+        // Zero-count files are omitted (see write_aggregates).
+        let path_of = |pid: usize| -> &str {
+            match &idx_opt {
+                Some(idx) if hits_indexed => &idx.files[pid],
+                _ => &ptab[pid],
+            }
+        };
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for &i in &ord {
+            let (fi, _) = loc[i as usize];
+            *counts.entry(hits[fi as usize].pid as usize).or_default() += 1;
+        }
+        let mut rows: Vec<(&str, usize)> =
+            counts.iter().map(|(&pid, &n)| (path_of(pid), n)).collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        let stdout = std::io::stdout();
+        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+        write_aggregates(&mut writer, &rows, files_only);
+        stdout_flush(&mut writer);
+        eprintln!(
+            "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            t0.elapsed().as_millis()
+        );
+        if matches == 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
     // Ordered parallel emission (cold emission only): manual memchr escaper
     // into chunk buffers per-thread, join in order, single sequential write.
     // Serial fallback under threshold keeps selective/small queries off the
