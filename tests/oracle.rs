@@ -28,11 +28,21 @@ fn fixture() -> PathBuf {
             std::fs::write(d.join(format!("m_{f}.txt")), text).unwrap();
         }
     }
+    // Binary file: NUL in the first 8 KiB forces the index skip; the verify
+    // side skips it identically, so indexed==scan holds with zero binary hits.
+    let mut bin = b"planted NEEDLE_ALPHA in binary\n".to_vec();
+    bin.extend_from_slice(&[0u8; 16]);
+    bin.extend_from_slice(b"trailing NEEDLE_ALPHA bytes\n");
+    std::fs::write(dir.join("pkg_0").join("bin.dat"), bin).unwrap();
     dir
 }
 
 fn run(args: &[&str], cwd: &PathBuf) -> Vec<(String, u64, String)> {
-    let out = Command::new(bin()).args(args).current_dir(cwd).output().unwrap();
+    let out = Command::new(bin())
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
     assert!([0, 1].contains(&out.status.code().unwrap()));
     // one JSON object per line
     let mut rows = HashSet::new();
@@ -63,7 +73,14 @@ fn indexed_equals_scan() {
         .status()
         .unwrap();
     assert!(st.success());
-    for q in ["NEEDLE_ALPHA", "needle_1|NEEDLE_ALPHA", "config"] {
+    for q in [
+        "NEEDLE_ALPHA",
+        "needle_1|NEEDLE_ALPHA",
+        "config",
+        "(?i)needle_alpha",
+        "(?P<word>NEEDLE_ALPHA)",
+        "NEEDLE_[A-Z]{2,}",
+    ] {
         let scan = run(&["--", q, "."], &dir);
         let idx_args = [
             "--use-index".to_string(),

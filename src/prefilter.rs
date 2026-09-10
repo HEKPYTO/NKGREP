@@ -119,5 +119,4 @@ mod tests {
         let mut with_empty: Vec<&[u32]> = vec![&l1, &e];
         assert!(intersect_all(&mut with_empty).is_empty());
     }
-
 }

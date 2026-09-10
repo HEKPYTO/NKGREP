@@ -7,11 +7,11 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 mod prefilter;
 #[derive(Serialize, Deserialize, Clone)]
 #[cfg(test)]
@@ -58,14 +58,24 @@ impl Sink for ColCollector {
         let start = self.arena.len() as u32;
         self.arena.extend_from_slice(bytes);
         let end = self.arena.len() as u32;
-        self.metas.push(HitMeta { line: line_no, start, end, score });
+        self.metas.push(HitMeta {
+            line: line_no,
+            start,
+            end,
+            score,
+        });
         Ok(true)
     }
 }
 
 /// Columnar verify: same TLS Searcher + 64 KB buffer + search_slice core as
 /// the serve-side cached verify, but the sink banks verbatim match bytes.
-fn verify_one_raw(pid: u32, path: &str, matcher: &RegexMatcher, file_score: f64) -> Option<FileHits> {
+fn verify_one_raw(
+    pid: u32,
+    path: &str,
+    matcher: &RegexMatcher,
+    file_score: f64,
+) -> Option<FileHits> {
     use std::cell::RefCell;
     thread_local! {
         static SEARCHER: RefCell<Searcher> = RefCell::new(SearcherBuilder::new().build());
@@ -94,12 +104,25 @@ fn verify_one_raw(pid: u32, path: &str, matcher: &RegexMatcher, file_score: f64)
                 if buf.is_empty() {
                     return Ok(true);
                 }
+                // Symmetric with `cmd_index`: binary files are never indexed,
+                // so verify skips them identically (indexed==scan).
+                if is_binary(&buf) {
+                    return Ok(true);
+                }
                 Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
             })()
             .unwrap_or(false)
         })
     });
-    if ok && !sink.metas.is_empty() { Some(FileHits { pid, arena: sink.arena, metas: sink.metas }) } else { None }
+    if ok && !sink.metas.is_empty() {
+        Some(FileHits {
+            pid,
+            arena: sink.arena,
+            metas: sink.metas,
+        })
+    } else {
+        None
+    }
 }
 /// Serve-side columnar verify: same TLS Searcher + 64 KB buffer +
 /// search_slice core and verbatim-banked sink as `verify_one_raw`, but the
@@ -137,12 +160,25 @@ fn verify_one_raw_cached(
                 if buf.is_empty() {
                     return Ok(true);
                 }
+                // Symmetric with `cmd_index`: binary files are never indexed,
+                // so verify skips them identically (indexed==scan).
+                if is_binary(&buf) {
+                    return Ok(true);
+                }
                 Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
             })()
             .unwrap_or(false)
         })
     });
-    if ok && !sink.metas.is_empty() { Some(FileHits { pid, arena: sink.arena, metas: sink.metas }) } else { None }
+    if ok && !sink.metas.is_empty() {
+        Some(FileHits {
+            pid,
+            arena: sink.arena,
+            metas: sink.metas,
+        })
+    } else {
+        None
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -200,7 +236,17 @@ fn parse_index(idx_path: &str, data: &str) -> Index {
     match serde_json::from_str::<Index>(data) {
         Ok(idx) => {
             if idx.files.iter().any(|p| PathBuf::from(p).is_absolute()) {
-                eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
+                eprintln!(
+                    "nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`"
+                );
+                std::process::exit(2);
+            }
+            if idx
+                .postings
+                .values()
+                .any(|ids| ids.iter().any(|&id| id as usize >= idx.files.len()))
+            {
+                eprintln!("nkgrep: unreadable index {idx_path} (posting id out of range? rebuild with `nkgrep index`)");
                 std::process::exit(2);
             }
             idx
@@ -314,8 +360,8 @@ fn parse_index_bin(idx_path: &str, data: &[u8]) -> Index {
             refuse("bad posting length");
         }
         let mut ids = Vec::with_capacity(vlen);
-        for c in raw.chunks_exact(4) {
-            let id = u32::from_le_bytes(c.try_into().unwrap());
+        for c in raw.as_chunks::<4>().0 {
+            let id = u32::from_le_bytes(*c);
             if id as usize >= nfiles {
                 refuse("posting id out of range");
             }
@@ -323,7 +369,13 @@ fn parse_index_bin(idx_path: &str, data: &[u8]) -> Index {
         }
         postings.insert(k, ids);
     }
-    let idx = Index { root, root_dev, root_ino, files, postings };
+    let idx = Index {
+        root,
+        root_dev,
+        root_ino,
+        files,
+        postings,
+    };
     if idx.files.iter().any(|p| PathBuf::from(p).is_absolute()) {
         eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
         std::process::exit(2);
@@ -361,7 +413,7 @@ fn parse_index_auto(idx_path: &str, data: &[u8]) -> Index {
 /// Load an index for a query rooted at `query_root`: refuse (exit 2) on
 /// fingerprint mismatch, then materialize root-relative entries to
 /// query-root-joined paths so rank/verify see scan-identical strings.
-fn load_index_for_query(idx_path: &str, query_root: &PathBuf) -> Index {
+fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
     let data = read_index_bytes(idx_path);
     let mut idx = parse_index_auto(idx_path, &data);
     let q_canon = canon_root(query_root);
@@ -435,6 +487,13 @@ fn walk_files(root: &PathBuf) -> Vec<PathBuf> {
     paths
 }
 
+/// Identical binary-file skip on both index and verify sides (soundness):
+/// a file is binary when its first 8192 bytes contain a NUL. `cmd_index`
+/// and every verify path share this predicate so indexed==scan on binaries.
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8192).any(|&b| b == 0)
+}
+
 fn trigrams_of(bytes: &[u8]) -> HashSet<[u8; 3]> {
     let mut set = HashSet::new();
     for w in bytes.windows(3) {
@@ -442,7 +501,6 @@ fn trigrams_of(bytes: &[u8]) -> HashSet<[u8; 3]> {
     }
     set
 }
-
 /// Bijective trigram pack: (a<<16)|(b<<8)|c. Numeric order equals
 /// lexicographic byte order, so sorted keys stay byte-stable across the
 /// format rev. Top byte always zero; unpack is (k>>16, k>>8, k) & 0xFF.
@@ -461,6 +519,13 @@ fn gram_pack(g: &[u8; 3]) -> u32 {
 fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
     let mut ors = vec![];
     for branch in split_branches(pattern) {
+        // Soundness fallback: `(?` changes literal semantics (flags `(?i)`,
+        // groups `(?P<>)`, comments `(?#)`, lookaround) and `{n}` repetition
+        // can drop a required trigram (`ABCDEF{0}` matches `ABCDE`, which
+        // lacks `DEF`). Either forces a full scan.
+        if branch_needs_fallback(&branch) {
+            return None;
+        }
         let mut ands = HashSet::new();
         for run in literal_runs(&branch) {
             if run.len() >= 3 {
@@ -477,6 +542,53 @@ fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
         ors.push(grams);
     }
     Some(ors)
+}
+
+/// True when a split branch contains an unescaped `(?` (flags, named groups,
+/// comments, lookaround) or an unescaped `{`+digit repetition outside a
+/// `[...]` class. Escapes and class contents are skipped exactly as
+/// `literal_runs` skips them, so an escaped/literal `(?` or `{2}` never
+/// forces a fallback it does not need.
+fn branch_needs_fallback(branch: &str) -> bool {
+    let mut it = branch.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                let _ = it.next();
+            }
+            '[' => {
+                if it.peek() == Some(&'^') {
+                    it.next();
+                }
+                if it.peek() == Some(&']') {
+                    it.next();
+                }
+                let mut esc = false;
+                for c2 in it.by_ref() {
+                    if esc {
+                        esc = false;
+                        continue;
+                    }
+                    if c2 == '\\' {
+                        esc = true;
+                        continue;
+                    }
+                    if c2 == ']' {
+                        break;
+                    }
+                }
+            }
+            '(' => {
+                if it.peek() == Some(&'?') {
+                    return true;
+                }
+            }
+            '{' if it.peek().is_some_and(|p| p.is_ascii_digit()) => return true,
+            '{' => {}
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Split on unescaped `|` outside `[...]` classes. Verbatim copy otherwise
@@ -639,7 +751,7 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
         .par_iter()
         .filter_map(|p| {
             let bytes = std::fs::read(p).ok()?;
-            if bytes.iter().take(8192).any(|&b| b == 0) {
+            if is_binary(&bytes) {
                 return None;
             }
             // Root-relative entry: canonicalize both sides so symlinked
@@ -671,9 +783,22 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
         postings,
     };
     if idx_path.ends_with(".bin") {
-        std::fs::write(idx_path, encode_index_bin(&idx)).unwrap();
+        if let Err(e) = std::fs::write(idx_path, encode_index_bin(&idx)) {
+            eprintln!("nkgrep: cannot write index {idx_path}: {e}");
+            std::process::exit(2);
+        }
     } else {
-        std::fs::write(idx_path, serde_json::to_string(&idx).unwrap()).unwrap();
+        let data = match serde_json::to_string(&idx) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("nkgrep: cannot encode index {idx_path}: {e}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(e) = std::fs::write(idx_path, data) {
+            eprintln!("nkgrep: cannot write index {idx_path}: {e}");
+            std::process::exit(2);
+        }
     }
     eprintln!(
         "nkgrep: indexed {} files in {} ms -> {idx_path}",
@@ -691,12 +816,14 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
 /// to a concurrent replace retries once, then fails like any IO error.
 /// Any metadata/open failure falls back to plain open+read, so the cache
 /// never fails where the uncached path succeeds.
+#[cfg(unix)]
 struct CachedFd {
     fd: std::os::unix::io::RawFd,
     len: u64,
     modified: std::time::SystemTime,
 }
 
+#[cfg(unix)]
 impl Drop for CachedFd {
     fn drop(&mut self) {
         // SAFETY: fd owned from `into_raw_fd` on fill, closed exactly once
@@ -710,22 +837,33 @@ impl Drop for CachedFd {
 /// Dense per-file slots (ids are 0..nfiles): one small mutex per file, so a
 /// warm pread hit never waits on another file's open and never hashes.
 struct FdCache {
+    #[cfg(unix)]
     slots: Vec<std::sync::Mutex<Option<CachedFd>>>,
 }
 
 impl FdCache {
     fn new(nfiles: usize) -> Self {
-        let mut slots = Vec::with_capacity(nfiles);
-        for _ in 0..nfiles {
-            slots.push(std::sync::Mutex::new(None));
+        #[cfg(unix)]
+        {
+            let mut slots = Vec::with_capacity(nfiles);
+            for _ in 0..nfiles {
+                slots.push(std::sync::Mutex::new(None));
+            }
+            FdCache { slots }
         }
-        FdCache { slots }
+        #[cfg(not(unix))]
+        {
+            // No fd cache off unix: reads go through plain open+read.
+            let _ = nfiles;
+            FdCache {}
+        }
     }
 }
 
 /// Best-effort NOFILE bump so the daemon can hold one fd per indexed file.
 /// Never fails the daemon: when the ceiling stays low the cache just fills
 /// what fits and fill-open errors fall back to plain open+read.
+#[cfg(unix)]
 fn bump_nofile_for_cache(want_files: usize) {
     // SAFETY: getrlimit/setrlimit with a valid stack struct; daemon tuning.
     unsafe {
@@ -748,13 +886,20 @@ fn bump_nofile_for_cache(want_files: usize) {
         }
         let mut after: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut after as *mut _) == 0 {
-            eprintln!("nkgrep: NOFILE cur={} max={}", after.rlim_cur, after.rlim_max);
+            eprintln!(
+                "nkgrep: NOFILE cur={} max={}",
+                after.rlim_cur, after.rlim_max
+            );
         }
     }
 }
+/// Non-unix fallback: single-fd reads need no descriptor headroom.
+#[cfg(not(unix))]
+fn bump_nofile_for_cache(_want_files: usize) {}
 
 /// pread loop into `buf` from offset 0 to EOF (offset-free: safe on a fd
 /// shared across rayon workers). Appends like `read_to_end`.
+#[cfg(unix)]
 fn pread_all(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) -> std::io::Result<()> {
     let mut off: libc::off_t = 0;
     loop {
@@ -765,12 +910,7 @@ fn pread_all(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) -> std::io::Result
         // the bytes the kernel initialized; EINTR retries, EOF ends.
         let n = unsafe {
             let dst = buf.spare_capacity_mut();
-            libc::pread(
-                fd,
-                dst.as_mut_ptr() as *mut libc::c_void,
-                dst.len(),
-                off,
-            )
+            libc::pread(fd, dst.as_mut_ptr() as *mut libc::c_void, dst.len(), off)
         };
         if n < 0 {
             let e = std::io::Error::last_os_error();
@@ -801,6 +941,7 @@ fn plain_open_read(path: &str, buf: &mut Vec<u8>) -> std::io::Result<()> {
 /// no path walk); miss or edit opens fresh, validates the fd's own metadata,
 /// and caches it. `retried` bounds the EBADF re-read after a concurrent
 /// replace closed the fd under us.
+#[cfg(unix)]
 fn read_verify_bytes(
     fdc: Option<(&FdCache, u32)>,
     path: &str,
@@ -849,7 +990,10 @@ fn read_verify_bytes(
         Ok(f) => f,
         Err(_) => return plain_open_read(path, buf),
     };
-    let (flen, fmod) = match f.metadata().and_then(|m| m.modified().map(|t| (m.len(), t))) {
+    let (flen, fmod) = match f
+        .metadata()
+        .and_then(|m| m.modified().map(|t| (m.len(), t)))
+    {
         Ok(x) => x,
         Err(_) => return plain_open_read(path, buf),
     };
@@ -874,7 +1018,11 @@ fn read_verify_bytes(
             }
             _ => {
                 // Replace drops the old entry (closes its fd) if present.
-                *guard = Some(CachedFd { fd: fresh, len: flen, modified: fmod });
+                *guard = Some(CachedFd {
+                    fd: fresh,
+                    len: flen,
+                    modified: fmod,
+                });
                 fresh
             }
         }
@@ -887,6 +1035,17 @@ fn read_verify_bytes(
         }
         Err(e) => Err(e),
     }
+}
+/// Non-unix fallback: no fd cache, plain open+read — same bytes as the
+/// cold path.
+#[cfg(not(unix))]
+fn read_verify_bytes(
+    _: Option<(&FdCache, u32)>,
+    path: &str,
+    buf: &mut Vec<u8>,
+    _retried: bool,
+) -> std::io::Result<()> {
+    plain_open_read(path, buf)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -947,10 +1106,7 @@ fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
             (id, scores[id as usize] + bonus - depth)
         })
         .collect();
-    order.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     Some(order)
 }
 
@@ -1001,9 +1157,11 @@ fn banked_text<'a>(fh: &'a FileHits, m: &HitMeta) -> std::borrow::Cow<'a, str> {
     let raw = &fh.arena[m.start as usize..m.end as usize];
     let cow = String::from_utf8_lossy(raw);
     match cow {
-        std::borrow::Cow::Borrowed(b) => std::borrow::Cow::Borrowed(b.trim_end_matches(|c| c == '\n' || c == '\r')),
+        std::borrow::Cow::Borrowed(b) => {
+            std::borrow::Cow::Borrowed(b.trim_end_matches(['\n', '\r']))
+        }
         std::borrow::Cow::Owned(o) => {
-            std::borrow::Cow::Owned(o.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
+            std::borrow::Cow::Owned(o.trim_end_matches(['\n', '\r']).to_string())
         }
     }
 }
@@ -1066,9 +1224,12 @@ fn parallel_verify_batched_raw(
     all
 }
 
-
 fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let reader_src = match stream.try_clone() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(reader_src);
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stream);
     let mut line = String::new();
     while reader.read_line(&mut line).unwrap_or(0) > 0 {
@@ -1140,7 +1301,13 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                 }
             },
         }
-        if writeln!(writer, "{{\"done\":true,\"ms\":{}}}", t0.elapsed().as_millis()).is_err() {
+        if writeln!(
+            writer,
+            "{{\"done\":true,\"ms\":{}}}",
+            t0.elapsed().as_millis()
+        )
+        .is_err()
+        {
             broken = true;
         }
         if writer.flush().is_err() {
@@ -1164,7 +1331,10 @@ struct ServerInfo {
 }
 
 fn save_serve_info(idx_path: &str, port: u16) {
-    let info = ServerInfo { pid: std::process::id(), port };
+    let info = ServerInfo {
+        pid: std::process::id(),
+        port,
+    };
     if let Ok(s) = serde_json::to_string(&info) {
         let _ = std::fs::write(serve_info_path(idx_path), s + "\n");
     }
@@ -1174,7 +1344,9 @@ fn save_serve_info(idx_path: &str, port: u16) {
 /// server registered (missing or corrupt file reads as absent).
 fn load_serve_port(idx_path: &str) -> Option<u16> {
     let data = std::fs::read_to_string(serve_info_path(idx_path)).ok()?;
-    serde_json::from_str::<ServerInfo>(data.trim()).ok().map(|i| i.port)
+    serde_json::from_str::<ServerInfo>(data.trim())
+        .ok()
+        .map(|i| i.port)
 }
 
 fn cmd_serve(idx_path: &str, port: u16) {
@@ -1182,10 +1354,19 @@ fn cmd_serve(idx_path: &str, port: u16) {
     // O3: daemon-global warm-fd cache + fd headroom for one fd per file.
     bump_nofile_for_cache(idx.files.len());
     let fdc = Arc::new(FdCache::new(idx.files.len()));
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("nkgrep: bind 127.0.0.1:{port}: {e}");
+            std::process::exit(2);
+        }
+    };
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     save_serve_info(idx_path, bound);
-    eprintln!("nkgrep: serving {} files on 127.0.0.1:{bound}", idx.files.len());
+    eprintln!(
+        "nkgrep: serving {} files on 127.0.0.1:{bound}",
+        idx.files.len()
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -1202,21 +1383,33 @@ fn cmd_serve(idx_path: &str, port: u16) {
 /// count, without parsing Hits or re-serializing them. The server already
 /// emits final ranked order, so the bytes are stdout-ready; the old
 /// parse-then-to_string round trip only burned ~8-14 ms on heavy full.
-/// Skips blank lines and error lines exactly as the old `from_str::<Hit>`
-/// fallible parse dropped them (a bad-regex error reply yields empty
-/// stdout, exit 1 below).
-fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+/// Blank lines are skipped; a bad-regex error reply is reported as
+/// `Some(message)` (empty stdout) so the caller exits 2 like the cold path
+/// instead of masking it as zero matches.
+fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize, Option<String>) {
+    let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("nkgrep: connect 127.0.0.1:{port}: {e}");
+            std::process::exit(2);
+        }
+    };
     let req = serde_json::to_string(&Query {
         pattern: pattern.to_string(),
         top,
     })
     .unwrap();
-    stream.write_all(req.as_bytes()).unwrap();
-    stream.write_all(b"\n").unwrap();
+    if let Err(e) = stream
+        .write_all(req.as_bytes())
+        .and(stream.write_all(b"\n"))
+    {
+        eprintln!("nkgrep: serve write 127.0.0.1:{port}: {e}");
+        std::process::exit(2);
+    }
     let mut reader = BufReader::new(stream);
     let mut raw = vec![];
     let mut matches = 0usize;
+    let mut bad_regex: Option<String> = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -1227,13 +1420,24 @@ fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize
         if t.contains("\"done\"") {
             break;
         }
-        if t.is_empty() || t.contains("\"error\"") {
+        if t.contains("\"error\"") {
+            bad_regex = Some(
+                t.find("\"error\":\"")
+                    .map(|s| {
+                        let rest = &t[s + 9..];
+                        rest.strip_suffix('"').unwrap_or(rest).to_string()
+                    })
+                    .unwrap_or_default(),
+            );
+            continue;
+        }
+        if t.is_empty() {
             continue;
         }
         matches += 1;
         raw.extend_from_slice(line.as_bytes());
     }
-    (raw, matches)
+    (raw, matches, bad_regex)
 }
 /// Serve-first probe for `--use-index`: connect to the daemon registered in
 /// `<index>.serve.json`, if any. Any failure (no file, no listener, bad
@@ -1241,12 +1445,21 @@ fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize
 fn try_serve_query(idx_path: &str, pattern: &str, top: Option<usize>) -> Option<(Vec<u8>, usize)> {
     let port = load_serve_port(idx_path)?;
     let mut stream = TcpStream::connect_timeout(
-        &"127.0.0.1".parse().ok().map(|ip| std::net::SocketAddr::new(ip, port))?,
+        &"127.0.0.1"
+            .parse()
+            .ok()
+            .map(|ip| std::net::SocketAddr::new(ip, port))?,
         Duration::from_millis(200),
     )
     .ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
-    let req = serde_json::to_string(&Query { pattern: pattern.to_string(), top }).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
+    let req = serde_json::to_string(&Query {
+        pattern: pattern.to_string(),
+        top,
+    })
+    .ok()?;
     stream.write_all(req.as_bytes()).ok()?;
     stream.write_all(b"\n").ok()?;
     let mut reader = BufReader::new(stream);
@@ -1416,9 +1629,84 @@ fn usage() -> ! {
     eprintln!("       nkgrep [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]");
     std::process::exit(2);
 }
+/// Stdout write that never panics: BrokenPipe (e.g. `| head`) exits quietly
+/// with 0; any other IO error exits 2. Success-path bytes are unchanged.
+fn stdout_write_all(w: &mut impl Write, data: &[u8]) {
+    match w.write_all(data) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => {
+            eprintln!("nkgrep: stdout: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Stdout flush with the same BrokenPipe contract as `stdout_write_all`.
+fn stdout_flush(w: &mut impl Write) {
+    match w.flush() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => {
+            eprintln!("nkgrep: stdout: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `--help` text (stdout, exit 0). Usage errors still go through `usage()`
+/// (stderr, exit 2). Write errors are ignored: help under a closed pipe
+/// simply ends the process.
+fn print_help() {
+    let s = concat!(
+        "nkgrep ",
+        env!("CARGO_PKG_VERSION"),
+        " — ranked trigram code search\n",
+        "usage: nkgrep index <path> [--index FILE]\n",
+        "       nkgrep serve --index FILE --port PORT\n",
+        "       nkgrep [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]\n",
+        "options:\n",
+        "  --top N          keep top N matches\n",
+        "  --use-index FILE query the index at FILE\n",
+        "  --port PORT      query the daemon on PORT\n",
+        "  --help, -h       print this help\n",
+        "  --version, -V    print version\n",
+        "exit codes: 0 matches (or help/version), 1 no matches, 2 usage/IO/regex error\n"
+    );
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+    let _ = w.write_all(s.as_bytes());
+    let _ = w.flush();
+}
+
+/// `--version` (stdout, exit 0); same closed-pipe tolerance as help.
+fn print_version() {
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+    let _ = writeln!(w, "nkgrep {}", env!("CARGO_PKG_VERSION"));
+}
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    // --help/--version win before any subcommand; `--` ends the flag scan
+    // so `nkgrep -- --help` still searches the literal.
+    {
+        let mut dashdash = false;
+        for a in &raw {
+            if dashdash {
+                break;
+            }
+            if a == "--" {
+                dashdash = true;
+            } else if a == "--help" || a == "-h" {
+                print_help();
+                return;
+            } else if a == "--version" || a == "-V" {
+                print_version();
+                return;
+            }
+        }
+    }
     if raw.first().map(|s| s.as_str()) == Some("index") {
         if raw.len() < 2 {
             usage();
@@ -1519,8 +1807,8 @@ fn main() {
             if let Some((raw, matches)) = try_serve_query(idx_path, &pattern, top) {
                 let stdout = std::io::stdout();
                 let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-                writer.write_all(&raw).unwrap();
-                writer.flush().unwrap();
+                stdout_write_all(&mut writer, &raw);
+                stdout_flush(&mut writer);
                 eprintln!(
                     "nkgrep: {matches} matches via serve, {} ms",
                     t0.elapsed().as_millis()
@@ -1534,11 +1822,15 @@ fn main() {
         }
     }
     if let Some(p) = port {
-        let (raw, matches) = client_query(p, &pattern, top);
+        let (raw, matches, bad_regex) = client_query(p, &pattern, top);
+        if let Some(msg) = bad_regex {
+            eprintln!("nkgrep: bad regex: {msg}");
+            std::process::exit(2);
+        }
         let stdout = std::io::stdout();
         let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-        writer.write_all(&raw).unwrap();
-        writer.flush().unwrap();
+        stdout_write_all(&mut writer, &raw);
+        stdout_flush(&mut writer);
         eprintln!(
             "nkgrep: {matches} matches via serve, {} ms",
             t0.elapsed().as_millis()
@@ -1636,7 +1928,11 @@ fn main() {
             for id in order.iter() {
                 let p = &idx.files[*id as usize];
                 let depth = PathBuf::from(p).components().count() as f64;
-                let bonus = if p.contains(pattern.as_str()) { 100.0 } else { 0.0 };
+                let bonus = if p.contains(pattern.as_str()) {
+                    100.0
+                } else {
+                    0.0
+                };
                 scores[*id as usize] += bonus - depth;
             }
             order.sort_by(|a, b| {
@@ -1717,7 +2013,13 @@ fn main() {
     // this body so both stay byte-identical.
     let emit_one = |buf: &mut Vec<u8>, fh: &FileHits, m: &HitMeta, esc: &[Option<Vec<u8>>]| {
         let text = banked_text(fh, m);
-        emit_raw_with_path(buf, esc[fh.pid as usize].as_ref().unwrap(), m.line, &text, m.score);
+        emit_raw_with_path(
+            buf,
+            esc[fh.pid as usize].as_ref().unwrap(),
+            m.line,
+            &text,
+            m.score,
+        );
     };
     let stdout = std::io::stdout();
     let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
@@ -1728,7 +2030,7 @@ fn main() {
             let fh = &hits[fi as usize];
             emit_one(&mut buf, fh, &fh.metas[mi as usize], &esc);
         }
-        writer.write_all(&buf).unwrap();
+        stdout_write_all(&mut writer, &buf);
     } else {
         let parts: Vec<Vec<u8>> = ord
             .par_chunks(EMIT_CHUNK)
@@ -1740,16 +2042,22 @@ fn main() {
                     // chunk writes only its own buffer, joined in order below.
                     let fh: &FileHits = &hits[fi as usize];
                     let text = banked_text(fh, &fh.metas[mi as usize]);
-                    emit_raw_with_path(&mut buf, esc[fh.pid as usize].as_ref().unwrap(), fh.metas[mi as usize].line, &text, fh.metas[mi as usize].score);
+                    emit_raw_with_path(
+                        &mut buf,
+                        esc[fh.pid as usize].as_ref().unwrap(),
+                        fh.metas[mi as usize].line,
+                        &text,
+                        fh.metas[mi as usize].score,
+                    );
                 }
                 buf
             })
             .collect();
         for part in &parts {
-            writer.write_all(part).unwrap();
+            stdout_write_all(&mut writer, part);
         }
     }
-    writer.flush().unwrap();
+    stdout_flush(&mut writer);
     eprintln!(
         "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
         t0.elapsed().as_millis()
@@ -1830,6 +2138,18 @@ mod literal_tests {
         assert!(query_grams(".*").is_none());
         assert!(query_grams("a\\|b").is_none()); // single branch, runs < 3
     }
+    #[test]
+    fn group_and_repeat_falls_back() {
+        // `(?` (flags, named groups, comments, lookaround) and `{n}`
+        // repetition can drop a required trigram: full scan.
+        assert!(query_grams("(?i)needle_alpha").is_none());
+        assert!(query_grams("(?P<word>NEEDLE_ALPHA)").is_none());
+        assert!(query_grams("(?#comment)NEEDLE_ALPHA").is_none());
+        assert!(query_grams("NEEDLE_[A-Z]{2,}").is_none());
+        assert!(query_grams("confi{1,}g").is_none());
+        // Escaped or class-contained `(?` / `{d` stay literal: indexable.
+        assert!(query_grams("[(?]needle_alpha").is_some());
+    }
 
     #[test]
     fn plain_queries_unchanged() {
@@ -1861,12 +2181,9 @@ mod literal_tests {
             *b"abc", *b"abd", *b"bac", *b"aaa", *b"zzz", *b"a_c", *b"_aa",
         ];
         trips.sort();
-        let mut packed: Vec<u32> = trips.iter().map(|t| gram_pack(t)).collect();
+        let mut packed: Vec<u32> = trips.iter().map(gram_pack).collect();
         packed.sort();
-        assert_eq!(
-            packed,
-            trips.iter().map(|t| gram_pack(t)).collect::<Vec<_>>()
-        );
+        assert_eq!(packed, trips.iter().map(gram_pack).collect::<Vec<_>>());
     }
     #[test]
     fn top_zero_indexed_matches_scan_empty() {
@@ -1894,11 +2211,13 @@ mod literal_tests {
         // scores, top-0 truncate.
         let scanned_all: Vec<FileHits> = [(0u32, 10.0f64), (1u32, 5.0f64)]
             .into_iter()
-            .filter_map(|(id, s)| verify_one_raw_cached(id, &idx.files[id as usize], &matcher, s, None))
+            .filter_map(|(id, s)| {
+                verify_one_raw_cached(id, &idx.files[id as usize], &matcher, s, None)
+            })
             .collect();
         let (scanned_scores, _) = flat_scores(&scanned_all);
         let mut scanned_ord = raw_order(&scanned_scores);
-        scanned_ord.truncate(0);
+        scanned_ord.clear();
         assert!(batched.is_empty(), "top=0 batched must return 0 hits");
         assert!(scanned_ord.is_empty(), "top=0 scan must return 0 hits");
         assert!(!scanned_all.is_empty(), "fixture must match without top");
