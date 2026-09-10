@@ -715,7 +715,7 @@ fn parse_filesize(s: &str) -> Option<u64> {
     num.parse::<u64>().ok()?.checked_mul(mult)
 }
 
-fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
+fn walk_files(root: &PathBuf, opts: &WalkOptions) -> (Vec<PathBuf>, bool) {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(!opts.hidden)
@@ -804,6 +804,7 @@ fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
         });
     }
     let mut paths: Vec<PathBuf> = vec![];
+    let mut had_error = false;
     for entry in builder.build() {
         match entry {
             Ok(e) => {
@@ -811,10 +812,13 @@ fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
                     paths.push(e.path().to_path_buf());
                 }
             }
-            Err(e) => eprintln!("nkg: walk error: {e}"),
+            Err(e) => {
+                eprintln!("nkg: walk error: {e}");
+                had_error = true;
+            }
         }
     }
-    paths
+    (paths, had_error)
 }
 
 /// Label for the single stdin search unit (`-` operand or piped stdin with
@@ -1401,7 +1405,7 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
     let root_canon = canon_root(root);
     let (root_dev, root_ino) = root_cookie(&root_canon);
     let root_fp = root_canon.to_string_lossy().into_owned();
-    let paths = walk_files(root, &WalkOptions::default());
+    let (paths, _) = walk_files(root, &WalkOptions::default());
     let entries: Vec<(String, HashSet<[u8; 3]>)> = paths
         .par_iter()
         .filter_map(|p| {
@@ -3167,16 +3171,23 @@ fn stdout_flush(w: &mut impl Write) {
     }
 }
 /// `-q` exit: stdout stays empty (the flag's whole contract), stderr keeps
-/// the diagnostics line, exit 0 on the first match / 1 on none. The
+/// the diagnostics line: exit 2 on any walk error, else 0 on the first
+/// match / 1 on none. The
 /// short-circuit is the caller's `find_any`: rayon stops scheduling verify
 /// work once any worker banks a hit, so quiet latency is time-to-first-hit.
-fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant) -> ! {
+fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant, walk_error: bool) -> ! {
     eprintln!(
         "nkg: {} in {files} files, {} ms (index load {load_ms} ms)",
         if found { "1+ matches" } else { "0 matches" },
         t0.elapsed().as_millis()
     );
-    std::process::exit(if found { 0 } else { 1 });
+    std::process::exit(if walk_error {
+        2
+    } else if found {
+        0
+    } else {
+        1
+    });
 }
 
 /// `--help` text (stdout, exit 0). Usage errors still go through `usage()`
@@ -3194,6 +3205,8 @@ fn print_help() {
         "  -q, --quiet        suppress stdout, stop at first match\n",
         "  --silent           alias for --quiet\n",
         "  -                  read (standard input) instead of [path]\n",
+        "                     (no [path]: search . when stdin is a terminal,\n",
+        "                      else search stdin as one unit)\n",
         "  -c, --count        path:count per matching file, path-sorted\n",
         "  -l, --files-with-matches\n",
         "  -m, --max-count N  cap matching lines per file at N (0 matches\n",
@@ -3376,7 +3389,16 @@ fn main() {
             }
             top = raw[i].parse().ok();
             if top.is_none() {
+                eprintln!("nkg: bad --top {:?}: expected a number", raw[i]);
                 usage();
+            }
+        } else if raw[i].starts_with("--top=") {
+            match raw[i]["--top=".len()..].parse::<usize>() {
+                Ok(n) => top = Some(n),
+                Err(_) => {
+                    eprintln!("nkg: bad --top {:?}: expected a number", raw[i]);
+                    usage();
+                }
             }
         } else if raw[i] == "--use-index" {
             i += 1;
@@ -3392,7 +3414,19 @@ fn main() {
             match raw[i].as_str() {
                 "text" => format_text = true,
                 "json" => format_text = false,
-                _ => usage(),
+                _ => {
+                    eprintln!("nkg: bad --format {:?}: expected json|text", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("--format=") {
+            match &raw[i]["--format=".len()..] {
+                "text" => format_text = true,
+                "json" => format_text = false,
+                _ => {
+                    eprintln!("nkg: bad --format {:?}: expected json|text", raw[i]);
+                    usage();
+                }
             }
         } else if raw[i] == "--color" {
             // Bare --color forces on (GNU `[=WHEN]` convention; rg requires a
@@ -3408,7 +3442,13 @@ fn main() {
         } else if raw[i].starts_with("--color=") {
             match parse_color_when(&raw[i]["--color=".len()..]) {
                 Some(w) => color_when = w,
-                None => usage(),
+                None => {
+                    eprintln!(
+                        "nkg: bad --color {:?}: expected auto|always|never|ansi",
+                        raw[i]
+                    );
+                    usage();
+                }
             }
         } else if raw[i] == "--port" {
             i += 1;
@@ -3417,7 +3457,16 @@ fn main() {
             }
             port = raw[i].parse().ok();
             if port.is_none() {
+                eprintln!("nkg: bad --port {:?}: expected a port number", raw[i]);
                 usage();
+            }
+        } else if raw[i].starts_with("--port=") {
+            match raw[i]["--port=".len()..].parse::<u16>() {
+                Ok(p) => port = Some(p),
+                Err(_) => {
+                    eprintln!("nkg: bad --port {:?}: expected a port number", raw[i]);
+                    usage();
+                }
             }
         } else if raw[i] == "-m" || raw[i] == "--max-count" {
             // Per-file match cap (rg: matching lines per file; -c prints the
@@ -3751,26 +3800,48 @@ fn main() {
     // Stdin search unit (FlagsCLS): an explicit `-` operand, or piped stdin
     // with no path operand, searches stdin as one unit labeled
     // `(standard input)` instead of walking the tree. A terminal with no
-    // path stays a usage error (exit 2), as before. With -e/-f there is no
-    // pattern positional, so the path shifts to pos[0] (or none when piped).
+    // path defaults to root `.` (rg parity); piped stdin with no path keeps
+    // the stdin unit. With -e/-f there is no pattern positional, so the
+    // path shifts to pos[0] (or none when piped/terminal-default).
+    let stdin_is_term = std::io::stdin().is_terminal();
     let stdin_explicit = if explicit_patterns {
         pos.first().map(|s| s.as_str()) == Some("-")
     } else {
         pos.get(1).map(|s| s.as_str()) == Some("-")
     };
     let stdin_piped = if explicit_patterns {
-        pos.is_empty() && !std::io::stdin().is_terminal()
+        pos.is_empty() && !stdin_is_term
     } else {
-        pos.len() == 1 && !std::io::stdin().is_terminal()
+        pos.len() == 1 && !stdin_is_term
     };
+    // Terminal bare (no path, stdin is a tty): search `.` like rg. Piped
+    // stdin with no path stays the stdin unit via `stdin_piped` above.
+    let terminal_root = stdin_is_term
+        && (if explicit_patterns {
+            pos.is_empty()
+        } else {
+            pos.len() == 1
+        });
     if stdin_explicit && port.is_some() {
         eprintln!("nkg: stdin search cannot use --port");
         usage();
     }
-    if port.is_none() && explicit_patterns && pos.len() != 1 && !stdin_explicit && !stdin_piped {
+    if port.is_none()
+        && explicit_patterns
+        && pos.len() != 1
+        && !stdin_explicit
+        && !stdin_piped
+        && !terminal_root
+    {
         usage();
     }
-    if port.is_none() && !explicit_patterns && pos.len() != 2 && !stdin_explicit && !stdin_piped {
+    if port.is_none()
+        && !explicit_patterns
+        && pos.len() != 2
+        && !stdin_explicit
+        && !stdin_piped
+        && !terminal_root
+    {
         usage();
     }
     let stdin_mode = port.is_none() && (stdin_explicit || stdin_piped);
@@ -3941,6 +4012,7 @@ fn main() {
     // escaped paths. Serve emits the same banked path; the equality pins both
     // byte-identical.
     let mut hits: Vec<FileHits> = vec![];
+    let mut walk_error = false;
     let mut ptab: Vec<String> = vec![];
     let mut hits_indexed = false;
     let files: usize;
@@ -3981,7 +4053,7 @@ fn main() {
         };
         if quiet {
             // Existence only, mirroring the file branches: no stdout, 0/1 exit.
-            quiet_exit(stdin_hit.is_some(), files, load_ms, t0);
+            quiet_exit(stdin_hit.is_some(), files, load_ms, t0, false);
         }
         hits = stdin_hit.map(|h| vec![h]).unwrap_or_default();
         // `-m` caps the unit before rank/top/count/emit, like files below.
@@ -4029,7 +4101,8 @@ fn main() {
         }
         if fallback {
             eprintln!("nkg: no usable literal, falling back to scan");
-            let paths = walk_files(&root, &walk_opts);
+            let (paths, had_walk_error) = walk_files(&root, &walk_opts);
+            walk_error |= had_walk_error;
             files = paths.len();
             ptab = paths
                 .iter()
@@ -4054,7 +4127,7 @@ fn main() {
                         .is_some()
                     })
                     .is_some();
-                quiet_exit(found, files, load_ms, t0);
+                quiet_exit(found, files, load_ms, t0, walk_error);
             }
             hits = (0u32..ptab.len() as u32)
                 .into_par_iter()
@@ -4094,7 +4167,9 @@ fn main() {
                 || walk_opts.max_filesize.is_some()
                 || !walk_opts.globs.is_empty()
             {
-                let allowed: HashSet<String> = walk_files(&root, &walk_opts)
+                let (walked, had_walk_error) = walk_files(&root, &walk_opts);
+                walk_error |= had_walk_error;
+                let allowed: HashSet<String> = walked
                     .into_iter()
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect();
@@ -4117,7 +4192,7 @@ fn main() {
                         .is_some()
                     })
                     .is_some();
-                quiet_exit(found, files, load_ms, t0);
+                quiet_exit(found, files, load_ms, t0, walk_error);
             }
             // Rank-ordered parallel verify, kth early exit between batches
             // (spec §6: match score ≤ file score, exit moves only with proof).
@@ -4134,7 +4209,8 @@ fn main() {
             hits_indexed = true;
         }
     } else {
-        let paths = walk_files(&root, &walk_opts);
+        let (paths, had_walk_error) = walk_files(&root, &walk_opts);
+        walk_error |= had_walk_error;
         files = paths.len();
         ptab = paths
             .iter()
@@ -4159,7 +4235,7 @@ fn main() {
                     .is_some()
                 })
                 .is_some();
-            quiet_exit(found, files, load_ms, t0);
+            quiet_exit(found, files, load_ms, t0, walk_error);
         }
         hits = (0u32..ptab.len() as u32)
             .into_par_iter()
@@ -4222,6 +4298,9 @@ fn main() {
             "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
+        if walk_error {
+            std::process::exit(2);
+        }
         if matches == 0 {
             std::process::exit(1);
         }
@@ -4281,6 +4360,9 @@ fn main() {
             "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
+        if walk_error {
+            std::process::exit(2);
+        }
         if matches == 0 {
             std::process::exit(1);
         }
@@ -4313,6 +4395,9 @@ fn main() {
             "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
+        if walk_error {
+            std::process::exit(2);
+        }
         if matches == 0 {
             std::process::exit(1);
         }
@@ -4397,6 +4482,9 @@ fn main() {
         "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
         t0.elapsed().as_millis()
     );
+    if walk_error {
+        std::process::exit(2);
+    }
     if matches == 0 {
         std::process::exit(1);
     }
@@ -5077,6 +5165,7 @@ mod git_skip_tests {
 
     fn names(root: &PathBuf, opts: &WalkOptions) -> std::collections::HashSet<String> {
         walk_files(root, opts)
+            .0
             .into_iter()
             .map(|p| {
                 p.strip_prefix(root)
