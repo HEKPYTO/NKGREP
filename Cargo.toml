@@ -1,7 +1,8 @@
  [package]
  name = "nkgrep"
  version = "0.1.0"
- edition = "2021"
+edition = "2021"
+rust-version = "1.98"
  description = "Top-n,k ranked code search: trigram index, best-first verify, proven match sets"
  license = "Apache-2.0"
  repository = "https://github.com/HEKPYTO/NKGREP"
