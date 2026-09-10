@@ -20,9 +20,10 @@ rust-version = "1.98"
      "*.idx.json",
      "*.idx.bin",
      "corpus*/",
- ]
+]
 
 [dependencies]
+grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"

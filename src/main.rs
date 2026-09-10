@@ -7,7 +7,7 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -487,6 +487,88 @@ fn walk_files(root: &PathBuf) -> Vec<PathBuf> {
     paths
 }
 
+/// Label for the single stdin search unit (`-` operand or piped stdin with
+/// no path). Chosen over rg's `<stdin>` for shell-visibility; the `-c`
+/// shape stays `label:count` and `-l` prints the bare label.
+const STDIN_LABEL: &str = "(standard input)";
+
+/// Stdin slice-search: the same TLS Searcher + `search_slice` core and
+/// verbatim-banked ColCollector as `verify_one_raw`, but over an
+/// already-read stdin buffer instead of a file path. Empty/binary buffers
+/// hold no matches, mirroring the file path (binaries are skipped on both
+/// index and verify sides). Own TLS Searcher: no shared fn is changed.
+/// Scores fold path_bonus 0 / depth 0; the label comes from the ptab.
+fn search_stdin_raw(buf: &[u8], matcher: &RegexMatcher) -> Option<FileHits> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SEARCHER: RefCell<Searcher> = RefCell::new(SearcherBuilder::new().build());
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    if is_binary(buf) {
+        return None;
+    }
+    let mut sink = ColCollector {
+        arena: vec![],
+        metas: vec![],
+        path_bonus: 0.0,
+        depth_penalty: 0.0,
+    };
+    let ok = SEARCHER.with(|s| {
+        let mut searcher = s.borrow_mut();
+        searcher.search_slice(matcher, buf, &mut sink).is_ok()
+    });
+    if ok && !sink.metas.is_empty() {
+        Some(FileHits {
+            pid: 0,
+            arena: sink.arena,
+            metas: sink.metas,
+        })
+    } else {
+        None
+    }
+}
+
+/// Sorted per-file surviving-hit counts from served JSON lines (the --port /
+/// serve-first paths; --top is already applied server-side). Unparseable
+/// lines are skipped; the wire contract guarantees one object per line.
+fn served_path_counts(raw: &[u8]) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+            if let Some(p) = v.get("path").and_then(|p| p.as_str()) {
+                *counts.entry(p.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let mut rows: Vec<(String, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// `-c` / `-l` line writer: `path:count` per matching file, or matching
+/// paths only when `files_only` (`-l` wins over `-c`, matching rg:
+/// `--files-with-matches` overrides `--count`). Rows must arrive path-sorted
+/// from the caller. Zero-count files are omitted — rg prints `:0` rows, a
+/// deliberate deviation keeping indexed==scan identical (binaries, candidates)
+/// with stable order; the `path:count` shape itself is rg-compatible.
+fn write_aggregates(w: &mut impl Write, rows: &[(&str, usize)], files_only: bool) {
+    let mut buf = Vec::with_capacity(rows.len() * 64);
+    for (p, n) in rows {
+        buf.extend_from_slice(p.as_bytes());
+        if !files_only {
+            buf.push(b':');
+            buf.extend_from_slice(n.to_string().as_bytes());
+        }
+        buf.push(b'\n');
+    }
+    stdout_write_all(w, &buf);
+}
+
 /// Identical binary-file skip on both index and verify sides (soundness):
 /// a file is binary when its first 8192 bytes contain a NUL. `cmd_index`
 /// and every verify path share this predicate so indexed==scan on binaries.
@@ -520,9 +602,10 @@ fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
     let mut ors = vec![];
     for branch in split_branches(pattern) {
         // Soundness fallback: `(?` changes literal semantics (flags `(?i)`,
-        // groups `(?P<>)`, comments `(?#)`, lookaround) and `{n}` repetition
+        // groups `(?P<>)`, comments `(?#)`, lookaround) and `{n}`/`*`/`?`
         // can drop a required trigram (`ABCDEF{0}` matches `ABCDE`, which
-        // lacks `DEF`). Either forces a full scan.
+        // lacks `DEF`; `NEEDLE_ALPHA?` matches `NEEDLE_ALPH`, lacking `PHA`).
+        // Any of them forces a full scan; `+` keeps every literal run.
         if branch_needs_fallback(&branch) {
             return None;
         }
@@ -545,10 +628,14 @@ fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
 }
 
 /// True when a split branch contains an unescaped `(?` (flags, named groups,
-/// comments, lookaround) or an unescaped `{`+digit repetition outside a
-/// `[...]` class. Escapes and class contents are skipped exactly as
-/// `literal_runs` skips them, so an escaped/literal `(?` or `{2}` never
-/// forces a fallback it does not need.
+/// comments, lookaround), an unescaped `{`+digit repetition, or an unescaped
+/// `*`/`?` quantifier outside a `[...]` class. Each can drop a required
+/// trigram (`ABCDEF{0}` matches `ABCDE` which lacks `DEF`; `NEEDLE_ALPHA?`
+/// matches `NEEDLE_ALPH` which lacks `PHA`), so any of them forces a full
+/// scan. `+` stays indexed: it keeps at least one copy of its atom, so every
+/// match still contains the literal run. Escapes and class contents are
+/// skipped exactly as `literal_runs` skips them, so an escaped/literal
+/// `(?`, `{2}`, `*`, or `?` never forces a fallback it does not need.
 fn branch_needs_fallback(branch: &str) -> bool {
     let mut it = branch.chars().peekable();
     while let Some(c) = it.next() {
@@ -583,6 +670,7 @@ fn branch_needs_fallback(branch: &str) -> bool {
                     return true;
                 }
             }
+            '*' | '?' => return true,
             '{' if it.peek().is_some_and(|p| p.is_ascii_digit()) => return true,
             '{' => {}
             _ => {}
@@ -690,18 +778,29 @@ fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
     runs
 }
 
-/// ASCII-gated matcher construction (V1): when the pattern is ASCII, skip the
-/// Unicode tables (`unicode(false)` + `\n` line terminator, which unlocks the
-/// fast line-oriented search path); when it is additionally a pure literal,
-/// compile with `fixed_strings`. Each flag is independent and keeps
-/// independently. A builder error (e.g. the line terminator rejecting a
-/// pattern that can match `\n`) retries less-gated, ending at plain
-/// `RegexMatcher::new`, so construction never fails where it used to work.
-fn build_matcher(pattern: &str) -> Result<RegexMatcher, grep_regex::Error> {
-    let ascii_only = pattern.is_ascii();
+/// Matcher construction: ASCII-gated fast path (V1) plus the `-i` gate.
+/// Default (`case_insensitive=false`) is the exact V1 sequence: ASCII
+/// patterns skip the Unicode tables (`unicode(false)` + `\n` line
+/// terminator, unlocking the fast line-oriented path) and pure literals add
+/// `fixed_strings`; each keeps independently, builder errors retry
+/// less-gated down to plain `RegexMatcher::new`, so construction never
+/// fails where it used to work.
+/// `-i` keeps the Unicode tables on purpose: `case_insensitive(true)` with
+/// Unicode is full simple-fold insensitivity (ripgrep-compatible: `hello`
+/// finds `HELLO`, `café` finds `CAFÉ`), while adding `unicode(false)`
+/// would shrink folding to ASCII only. The cost is the Unicode tables on
+/// `-i` queries alone; the default path is untouched. `fixed_strings` still
+/// applies to pure literals (the engine folds literals itself). The final
+/// fallback keeps `case_insensitive(true)` so `-i` never silently degrades
+/// to case-sensitive; a truly bad pattern still returns Err (exit 2).
+fn build_matcher(pattern: &str, case_insensitive: bool) -> Result<RegexMatcher, grep_regex::Error> {
+    let ascii_only = pattern.is_ascii() && !case_insensitive;
     let literal_only = is_pure_literal(pattern);
-    if ascii_only || literal_only {
+    if case_insensitive || ascii_only || literal_only {
         let mut b = RegexMatcherBuilder::new();
+        if case_insensitive {
+            b.case_insensitive(true);
+        }
         if ascii_only {
             b.unicode(false);
             b.line_terminator(Some(b'\n'));
@@ -719,6 +818,13 @@ fn build_matcher(pattern: &str) -> Result<RegexMatcher, grep_regex::Error> {
                 bz.fixed_strings(true);
             }
             if let Ok(m) = bz.build(pattern) {
+                return Ok(m);
+            }
+        }
+        if case_insensitive {
+            let mut bi = RegexMatcherBuilder::new();
+            bi.case_insensitive(true);
+            if let Ok(m) = bi.build(pattern) {
                 return Ok(m);
             }
         }
@@ -1052,6 +1158,10 @@ fn read_verify_bytes(
 struct Query {
     pattern: String,
     top: Option<usize>,
+    /// `-i` over serve: false on old clients (serde default), so old/new
+    /// daemons interop — an old daemon just searches case-sensitively.
+    #[serde(default)]
+    ignore_case: bool,
 }
 
 /// Ranked candidate file ids with scores. None = no usable literal.
@@ -1243,16 +1353,24 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
         let mut broken = false;
         match serde_json::from_str::<Query>(line.trim()) {
             Err(_) => {}
-            Ok(q) => match build_matcher(&q.pattern) {
+            Ok(q) => match build_matcher(&q.pattern, q.ignore_case) {
                 Err(e) => {
                     if writeln!(writer, "{{\"error\":\"{e}\"}}").is_err() {
                         broken = true;
                     }
                 }
                 Ok(matcher) => {
-                    let order = ranked_candidates(&idx, &q.pattern).unwrap_or_else(|| {
+                    // `-i` skips trigram pruning: the postings are raw bytes,
+                    // so case-sensitive grams would false-negative
+                    // (`hello` grams miss `HELLO` files). Full-file verify
+                    // keeps serve==cold on every `-i` query.
+                    let order = if q.ignore_case {
                         (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect()
-                    });
+                    } else {
+                        ranked_candidates(&idx, &q.pattern).unwrap_or_else(|| {
+                            (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect()
+                        })
+                    };
                     let files: Vec<FileHits> = order
                         .par_iter()
                         .filter_map(|(id, s)| {
@@ -1367,18 +1485,12 @@ fn cmd_serve(idx_path: &str, port: u16) {
         "nkgrep: serving {} files on 127.0.0.1:{bound}",
         idx.files.len()
     );
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let idx = idx.clone();
-                let fdc = fdc.clone();
-                std::thread::spawn(move || handle_client(s, idx, fdc));
-            }
-            Err(e) => eprintln!("nkgrep: accept error: {e}"),
-        }
+    for s in listener.incoming().flatten() {
+        let idx = idx.clone();
+        let fdc = fdc.clone();
+        std::thread::spawn(move || handle_client(s, idx, fdc));
     }
 }
-
 /// Hot client fetch: returns the server's hit lines verbatim plus the hit
 /// count, without parsing Hits or re-serializing them. The server already
 /// emits final ranked order, so the bytes are stdout-ready; the old
@@ -1386,7 +1498,12 @@ fn cmd_serve(idx_path: &str, port: u16) {
 /// Blank lines are skipped; a bad-regex error reply is reported as
 /// `Some(message)` (empty stdout) so the caller exits 2 like the cold path
 /// instead of masking it as zero matches.
-fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize, Option<String>) {
+fn client_query(
+    port: u16,
+    pattern: &str,
+    top: Option<usize>,
+    ignore_case: bool,
+) -> (Vec<u8>, usize, Option<String>) {
     let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
         Ok(s) => s,
         Err(e) => {
@@ -1397,6 +1514,7 @@ fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize
     let req = serde_json::to_string(&Query {
         pattern: pattern.to_string(),
         top,
+        ignore_case,
     })
     .unwrap();
     if let Err(e) = stream
@@ -1442,7 +1560,12 @@ fn client_query(port: u16, pattern: &str, top: Option<usize>) -> (Vec<u8>, usize
 /// Serve-first probe for `--use-index`: connect to the daemon registered in
 /// `<index>.serve.json`, if any. Any failure (no file, no listener, bad
 /// reply) returns None so the caller falls back to the cold index load.
-fn try_serve_query(idx_path: &str, pattern: &str, top: Option<usize>) -> Option<(Vec<u8>, usize)> {
+fn try_serve_query(
+    idx_path: &str,
+    pattern: &str,
+    top: Option<usize>,
+    ignore_case: bool,
+) -> Option<(Vec<u8>, usize)> {
     let port = load_serve_port(idx_path)?;
     let mut stream = TcpStream::connect_timeout(
         &"127.0.0.1"
@@ -1458,6 +1581,7 @@ fn try_serve_query(idx_path: &str, pattern: &str, top: Option<usize>) -> Option<
     let req = serde_json::to_string(&Query {
         pattern: pattern.to_string(),
         top,
+        ignore_case,
     })
     .ok()?;
     stream.write_all(req.as_bytes()).ok()?;
@@ -1605,6 +1729,306 @@ fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str,
     serde_json::to_writer(&mut *buf, &score).unwrap();
     buf.extend_from_slice(b"}\n");
 }
+/// Grep-compatible text line (`--format text`): `path:line:text` in rank
+/// order — the same hits in the same order as JSON, only rendered without
+/// score. Line numbers are always on; text is the same banked decode as
+/// JSON, unescaped. ColorOut's hook point: wrap the text push below.
+fn emit_text_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
+    buf.extend_from_slice(path.as_bytes());
+    buf.push(b':');
+    // itoa verbatim from emit_raw_with_path (byte-identical digits, no fmt).
+    let mut tmp = [0u8; 20];
+    let mut v = line;
+    let mut len = 0usize;
+    if v == 0 {
+        tmp[19] = b'0';
+        len = 1;
+    } else {
+        while v > 0 {
+            len += 1;
+            tmp[20 - len] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    buf.extend_from_slice(&tmp[20 - len..]);
+    buf.push(b':');
+    buf.extend_from_slice(text.as_bytes());
+    buf.push(b'\n');
+}
+
+/// Context row (`-A`/`-B`/`-C`): `path:line-text` — the `-` marker mirrors
+/// rg's context-line shape (probed on 15.1.0: `:` match vs `-` context, `--`
+/// between disjoint in-file groups). Framing duplicates `emit_text_row`
+/// (the file's itoa convention); only the marker differs.
+fn emit_ctx_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
+    buf.extend_from_slice(path.as_bytes());
+    buf.push(b':');
+    // itoa verbatim from emit_text_row (byte-identical digits, no fmt).
+    let mut tmp = [0u8; 20];
+    let mut v = line;
+    let mut len = 0usize;
+    if v == 0 {
+        tmp[19] = b'0';
+        len = 1;
+    } else {
+        while v > 0 {
+            len += 1;
+            tmp[20 - len] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    buf.extend_from_slice(&tmp[20 - len..]);
+    buf.push(b'-');
+    buf.extend_from_slice(text.as_bytes());
+    buf.push(b'\n');
+}
+
+/// Serve-wire context line: same fields as `emit_raw_with_path` plus a
+/// trailing `,"ctx":true` marker, so clients can tell carried context from
+/// hits without reparsing ambiguity (a match *text* may itself contain the
+/// substring `"ctx":true`). `score` carries the file score (context inherits
+/// its file's rank weight; clients drop it at render). Only ever emitted
+/// when the query asked for context, so the default wire is untouched.
+fn emit_ctx_json(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, file_score: f64) {
+    buf.extend_from_slice(b"{\"path\":\"");
+    buf.extend_from_slice(path_esc);
+    buf.extend_from_slice(b"\",\"line\":");
+    // itoa verbatim from emit_raw_with_path (byte-identical digits, no fmt).
+    let mut tmp = [0u8; 20];
+    let mut v = line;
+    let mut len = 0usize;
+    if v == 0 {
+        tmp[19] = b'0';
+        len = 1;
+    } else {
+        while v > 0 {
+            len += 1;
+            tmp[20 - len] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    buf.extend_from_slice(&tmp[20 - len..]);
+    buf.extend_from_slice(b",\"text\":\"");
+    push_escaped_json(buf, text);
+    buf.extend_from_slice(b"\",\"score\":");
+    serde_json::to_writer(&mut *buf, &file_score).unwrap();
+    buf.extend_from_slice(b",\"ctx\":true}\n");
+}
+
+/// `--format text` over the serve wire: render served JSON hit lines as
+/// `path:line:text` in wire (rank) order. The daemon wire stays JSON so the
+/// default stays byte-identical; unparseable lines are skipped, mirroring
+/// served_path_counts.
+fn json_hits_to_text(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+            if let (Some(p), Some(n), Some(t)) = (
+                v.get("path").and_then(|p| p.as_str()),
+                v.get("line").and_then(|l| l.as_u64()),
+                v.get("text").and_then(|t| t.as_str()),
+            ) {
+                emit_text_row(&mut out, p, n, t);
+            }
+        }
+    }
+    out
+}
+
+/// Serve-wire context render (ContextLines): the daemon returns hits plus
+/// carried `"ctx":true` lines in rank-file group order. Regroup the hit
+/// lines (first-seen file order, lines ascending — the wire already arrives
+/// so), expand/merge windows with `compute_groups`, and print rg-shaped
+/// rows (`path:line:text` hits, `path:line-text` context, `sep` between
+/// disjoint in-file groups, none across files). Same groups the cold
+/// renderer prints from the same hit set; unparseable lines are skipped,
+/// mirroring `served_path_counts`. A line that is both hit and context
+/// renders as a hit.
+fn render_served_context(raw: &[u8], before: usize, after: usize, sep: &str) -> Vec<u8> {
+    // path -> (line -> (text, is_hit)), first-seen file order.
+    type ServedFileLines = (String, std::collections::BTreeMap<u64, (String, bool)>);
+    let mut files: Vec<ServedFileLines> = vec![];
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+            if let (Some(p), Some(n), Some(t)) = (
+                v.get("path").and_then(|p| p.as_str()),
+                v.get("line").and_then(|l| l.as_u64()),
+                v.get("text").and_then(|t| t.as_str()),
+            ) {
+                let hit = !v.get("ctx").and_then(|c| c.as_bool()).unwrap_or(false);
+                let idx = match files.iter().position(|(fp, _)| fp == p) {
+                    Some(i) => i,
+                    None => {
+                        files.push((p.to_string(), std::collections::BTreeMap::new()));
+                        files.len() - 1
+                    }
+                };
+                files[idx]
+                    .1
+                    .entry(n)
+                    .and_modify(|e| e.1 = e.1 || hit)
+                    .or_insert_with(|| (t.to_string(), hit));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for (path, lines) in &files {
+        let hits: Vec<u64> = lines
+            .iter()
+            .filter(|(_, (_, h))| *h)
+            .map(|(n, _)| *n)
+            .collect();
+        let mut first_group = true;
+        for (lo, hi) in compute_groups(&hits, before, after) {
+            if !first_group && !sep.is_empty() {
+                out.extend_from_slice(sep.as_bytes());
+                out.push(b'\n');
+            }
+            first_group = false;
+            // No EOF clamp available (nlines isn't on the wire): lines past
+            // EOF simply have no entry and are skipped — output-identical to
+            // clamping, by the same merge argument as `compute_groups`.
+            let mut ln = lo;
+            while ln <= hi {
+                if let Some((text, hit)) = lines.get(&ln) {
+                    if *hit {
+                        emit_text_row(&mut out, path, ln, text);
+                    } else {
+                        emit_ctx_row(&mut out, path, ln, text);
+                    }
+                }
+                if ln == u64::MAX {
+                    break;
+                }
+                ln += 1;
+            }
+        }
+    }
+    out
+}
+
+/// --color target state (ColorOut): auto (default), always, never, plus ansi
+/// as an rg-compatible alias for always. auto colorizes only when stdout is
+/// a TTY. Color applies to `--format text` match spans only; JSON stays
+/// machine-clean. GREP_COLORS is parked (not honored): match style is fixed
+/// bold-red, byte-probed on rg 15.1.0.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+    Ansi,
+}
+
+/// Parse a `--color` value; None means usage error (exit 2 at the call site).
+fn parse_color_when(s: &str) -> Option<ColorWhen> {
+    match s {
+        "auto" => Some(ColorWhen::Auto),
+        "always" => Some(ColorWhen::Always),
+        "never" => Some(ColorWhen::Never),
+        "ansi" => Some(ColorWhen::Ansi),
+        _ => None,
+    }
+}
+
+/// Resolve color for this process. Explicit always/ansi win everywhere (even
+/// piped, matching the rg `--color=always` probe); never wins nowhere; auto
+/// follows the stdout TTY only.
+fn color_enabled(when: ColorWhen) -> bool {
+    match when {
+        ColorWhen::Always | ColorWhen::Ansi => true,
+        ColorWhen::Never => false,
+        ColorWhen::Auto => std::io::stdout().is_terminal(),
+    }
+}
+
+/// Wrap each non-empty matcher span in `text` with rg's match style
+/// (`\x1b[0m\x1b[1m\x1b[31m` … `\x1b[0m`). Zero-width matches are skipped so
+/// patterns like `x*` never spray codes; a line with no spans borrows back
+/// unchanged. Byte splicing is safe: regex spans are char-boundary aligned.
+fn colorize_spans<'a>(text: &'a str, matcher: &RegexMatcher) -> std::borrow::Cow<'a, str> {
+    use grep_matcher::Matcher;
+    let b = text.as_bytes();
+    let mut spans: Vec<(usize, usize)> = vec![];
+    let _ = matcher.find_iter(b, |m| {
+        if m.start() < m.end() {
+            spans.push((m.start(), m.end()));
+        }
+        true
+    });
+    if spans.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = Vec::with_capacity(b.len() + spans.len() * 16);
+    let mut pos = 0usize;
+    for (s, e) in spans {
+        out.extend_from_slice(&b[pos..s]);
+        out.extend_from_slice(b"\x1b[0m\x1b[1m\x1b[31m");
+        out.extend_from_slice(&b[s..e]);
+        out.extend_from_slice(b"\x1b[0m");
+        pos = e;
+    }
+    out.extend_from_slice(&b[pos..]);
+    // Unreachable fallback: spans are char-boundary aligned and the SGR
+    // inserts are ASCII, so the splice stays valid UTF-8 by construction.
+    match String::from_utf8(out) {
+        Ok(s) => std::borrow::Cow::Owned(s),
+        Err(_) => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+/// Colored text row: same `path:line:text` framing as `emit_text_row` with
+/// match spans highlighted. Delegates framing so the two never diverge.
+fn emit_text_row_colored(
+    buf: &mut Vec<u8>,
+    path: &str,
+    line: u64,
+    text: &str,
+    matcher: &RegexMatcher,
+) {
+    let colored = colorize_spans(text, matcher);
+    emit_text_row(buf, path, line, &colored);
+}
+
+/// `--format text` + color over the serve wire: mirror of
+/// `json_hits_to_text` with each row highlighted. The daemon wire stays JSON.
+fn json_hits_to_text_colored(raw: &[u8], matcher: &RegexMatcher) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + 512);
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+            if let (Some(p), Some(n), Some(t)) = (
+                v.get("path").and_then(|p| p.as_str()),
+                v.get("line").and_then(|l| l.as_u64()),
+                v.get("text").and_then(|t| t.as_str()),
+            ) {
+                emit_text_row_colored(&mut out, p, n, t, matcher);
+            }
+        }
+    }
+    out
+}
+
+/// Serve-path text render with color: a client-side matcher highlights rows
+/// converted from the JSON wire; plain fallback when the matcher won't build
+/// (unreachable in practice — a bad regex exits 2 before render — so a good
+/// render never fails for a highlight miss).
+fn serve_text_out(raw: &[u8], pattern: &str, ignore_case: bool, color_on: bool) -> Vec<u8> {
+    if color_on {
+        if let Ok(m) = build_matcher(pattern, ignore_case) {
+            return json_hits_to_text_colored(raw, &m);
+        }
+    }
+    json_hits_to_text(raw)
+}
 
 /// Manual cold-emission Hit line with a pre-escaped path: field order and
 /// separators match the derived Serialize impl; only text/path escaping is
@@ -1626,7 +2050,7 @@ fn emit_hit_json(buf: &mut Vec<u8>, h: &Hit) {
 fn usage() -> ! {
     eprintln!("usage: nkgrep index <path> [--index FILE]");
     eprintln!("       nkgrep serve --index FILE --port PORT");
-    eprintln!("       nkgrep [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]");
+    eprintln!("       nkgrep [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]");
     std::process::exit(2);
 }
 /// Stdout write that never panics: BrokenPipe (e.g. `| head`) exits quietly
@@ -1653,6 +2077,18 @@ fn stdout_flush(w: &mut impl Write) {
         }
     }
 }
+/// `-q` exit: stdout stays empty (the flag's whole contract), stderr keeps
+/// the diagnostics line, exit 0 on the first match / 1 on none. The
+/// short-circuit is the caller's `find_any`: rayon stops scheduling verify
+/// work once any worker banks a hit, so quiet latency is time-to-first-hit.
+fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant) -> ! {
+    eprintln!(
+        "nkgrep: {} in {files} files, {} ms (index load {load_ms} ms)",
+        if found { "1+ matches" } else { "0 matches" },
+        t0.elapsed().as_millis()
+    );
+    std::process::exit(if found { 0 } else { 1 });
+}
 
 /// `--help` text (stdout, exit 0). Usage errors still go through `usage()`
 /// (stderr, exit 2). Write errors are ignored: help under a closed pipe
@@ -1664,14 +2100,15 @@ fn print_help() {
         " — ranked trigram code search\n",
         "usage: nkgrep index <path> [--index FILE]\n",
         "       nkgrep serve --index FILE --port PORT\n",
-        "       nkgrep [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]\n",
+        "       nkgrep [-i] [-q] [-c] [-l] [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]\n",
         "options:\n",
-        "  --top N          keep top N matches\n",
-        "  --use-index FILE query the index at FILE\n",
-        "  --port PORT      query the daemon on PORT\n",
-        "  --help, -h       print this help\n",
-        "  --version, -V    print version\n",
-        "exit codes: 0 matches (or help/version), 1 no matches, 2 usage/IO/regex error\n"
+        "  -i, --ignore-case  case-insensitive match\n",
+        "  -q, --quiet        suppress stdout, stop at first match\n",
+        "  --silent           alias for --quiet\n",
+        "  -                  read (standard input) instead of [path]\n",
+        "  -c, --count        path:count per matching file, path-sorted\n",
+        "  -l, --files-with-matches\n",
+        "                     matching paths only, path-sorted (-l wins over -c)\n",
     );
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
@@ -1756,6 +2193,10 @@ fn main() {
     let mut top: Option<usize> = None;
     let mut use_index: Option<String> = None;
     let mut port: Option<u16> = None;
+    let mut ignore_case = false;
+    let mut quiet = false;
+    let mut count_mode = false;
+    let mut files_only = false;
     let mut pos: Vec<String> = vec![];
     let mut i = 0;
     while i < raw.len() {
@@ -1778,6 +2219,32 @@ fn main() {
                 usage();
             }
             use_index = Some(raw[i].clone());
+        } else if raw[i] == "--format" {
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            match raw[i].as_str() {
+                "text" => format_text = true,
+                "json" => format_text = false,
+                _ => usage(),
+            }
+        } else if raw[i] == "--color" {
+            // Bare --color forces on (GNU `[=WHEN]` convention; rg requires a
+            // value, so bare is the one deliberate divergence). A following
+            // valid WHEN is consumed as the value (`--color always`); anything
+            // else stays positional (the pattern).
+            if i + 1 < raw.len() && parse_color_when(&raw[i + 1]).is_some() {
+                i += 1;
+                color_when = parse_color_when(&raw[i]).unwrap();
+            } else {
+                color_when = ColorWhen::Always;
+            }
+        } else if raw[i].starts_with("--color=") {
+            match parse_color_when(&raw[i]["--color=".len()..]) {
+                Some(w) => color_when = w,
+                None => usage(),
+            }
         } else if raw[i] == "--port" {
             i += 1;
             if i >= raw.len() {
@@ -1787,6 +2254,46 @@ fn main() {
             if port.is_none() {
                 usage();
             }
+        } else if raw[i] == "-i" || raw[i] == "--ignore-case" {
+            ignore_case = true;
+        } else if raw[i] == "-q" || raw[i] == "--quiet" || raw[i] == "--silent" {
+            quiet = true;
+        } else if raw[i] == "-c" || raw[i] == "--count" {
+            count_mode = true;
+        } else if raw[i] == "-l" || raw[i] == "--files-with-matches" {
+            files_only = true;
+        } else if raw[i].len() > 1
+            && raw[i].starts_with('-')
+            && !raw[i].starts_with("--")
+            && raw[i][1..].chars().all(|c| c == 'c' || c == 'l')
+        {
+            // Combined shorts (-cl, -lc, -cc): claimed only when EVERY char
+            // is in {c,l}, mirroring the {i,q} arm below. Mixed clusters
+            // (e.g. -ci) stay positional — the shared short-cluster protocol.
+            for c in raw[i][1..].chars() {
+                if c == 'c' {
+                    count_mode = true;
+                } else {
+                    files_only = true;
+                }
+            }
+        } else if raw[i].len() > 1
+            && raw[i].starts_with('-')
+            && !raw[i].starts_with("--")
+            && raw[i][1..].chars().all(|c| c == 'i' || c == 'q')
+        {
+            // Combined shorts (-iq, -qi): claimed only when EVERY char is in
+            // {i,q}. Anything with other letters falls through to positional
+            // (FlagsCLS owns all-{c,l} clusters; mixed clusters stay
+            // positional) — the shared short-cluster protocol. Bare `-`
+            // (stdin) never reaches here via the len>1 guard.
+            for c in raw[i][1..].chars() {
+                if c == 'i' {
+                    ignore_case = true;
+                } else {
+                    quiet = true;
+                }
+            }
         } else {
             pos.push(raw[i].clone());
         }
@@ -1795,20 +2302,72 @@ fn main() {
     if pos.is_empty() || pos.len() > 2 {
         usage();
     }
-    if port.is_none() && pos.len() != 2 {
+    // Stdin search unit (FlagsCLS): an explicit `-` operand, or piped stdin
+    // with no path operand, searches stdin as one unit labeled
+    // `(standard input)` instead of walking the tree. A terminal with no
+    // path stays a usage error (exit 2), as before.
+    let stdin_explicit = pos.get(1).map(|s| s.as_str()) == Some("-");
+    let stdin_piped = pos.len() == 1 && !std::io::stdin().is_terminal();
+    if stdin_explicit && port.is_some() {
+        eprintln!("nkgrep: stdin search cannot use --port");
         usage();
     }
+    if port.is_none() && pos.len() != 2 && !stdin_explicit && !stdin_piped {
+        usage();
+    }
+    let stdin_mode = port.is_none() && (stdin_explicit || stdin_piped);
     let pattern = pos[0].clone();
     let root = PathBuf::from(pos.get(1).map(|s| s.as_str()).unwrap_or("."));
 
     let t0 = Instant::now();
     if port.is_none() {
         if let Some(idx_path) = &use_index {
-            if let Some((raw, matches)) = try_serve_query(idx_path, &pattern, top) {
-                let stdout = std::io::stdout();
-                let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-                stdout_write_all(&mut writer, &raw);
-                stdout_flush(&mut writer);
+            if let Some((raw, matches)) = try_serve_query(idx_path, &pattern, top, ignore_case) {
+                // `-q` over serve suppresses stdout client-side; the daemon
+                // has no quiet protocol (short-circuit lives on the cold
+                // path). Exit codes keep the 0/1 contract.
+                if count_mode || files_only {
+                    // `-c` / `-l` over serve-first: aggregate the served JSON
+                    // lines client-side (--top already applied server-side;
+                    // `-l` wins over `-c`, `-q` still suppresses stdout).
+                    if !quiet {
+                        let rows = served_path_counts(&raw);
+                        let refs: Vec<(&str, usize)> =
+                            rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+                        let stdout = std::io::stdout();
+                        let mut writer =
+                            std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                        write_aggregates(&mut writer, &refs, files_only);
+                        stdout_flush(&mut writer);
+                    }
+                    eprintln!(
+                        "nkgrep: {matches} matches via serve, {} ms",
+                        t0.elapsed().as_millis()
+                    );
+                    if matches == 0 {
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+                if !quiet {
+                    let stdout = std::io::stdout();
+                    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                    if ctx_on {
+                        // Context owns the output: regrouped rg-shaped rows
+                        // from the carried hit+ctx wire (rank groups kept).
+                        let text = render_served_context(&raw, ctx_before, ctx_after, &group_sep);
+                        stdout_write_all(&mut writer, &text);
+                    } else if format_text {
+                        // Text renders client-side from the JSON wire (rank
+                        // order kept); the daemon wire is untouched. Color
+                        // highlights client-side via serve_text_out.
+                        let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
+                        stdout_write_all(&mut writer, &text);
+                    } else {
+                        stdout_write_all(&mut writer, &raw);
+                    }
+                    stdout_flush(&mut writer);
+                }
                 eprintln!(
                     "nkgrep: {matches} matches via serve, {} ms",
                     t0.elapsed().as_millis()
@@ -1822,15 +2381,38 @@ fn main() {
         }
     }
     if let Some(p) = port {
-        let (raw, matches, bad_regex) = client_query(p, &pattern, top);
+        let (raw, matches, bad_regex) = client_query(p, &pattern, top, ignore_case);
         if let Some(msg) = bad_regex {
             eprintln!("nkgrep: bad regex: {msg}");
             std::process::exit(2);
         }
-        let stdout = std::io::stdout();
-        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-        stdout_write_all(&mut writer, &raw);
-        stdout_flush(&mut writer);
+        if count_mode || files_only {
+            // `-c` / `-l` over --port: same client-side aggregation as the
+            // serve-first branch above.
+            if !quiet {
+                let rows = served_path_counts(&raw);
+                let refs: Vec<(&str, usize)> = rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+                let stdout = std::io::stdout();
+                let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                write_aggregates(&mut writer, &refs, files_only);
+                stdout_flush(&mut writer);
+            }
+        } else if !quiet {
+            let stdout = std::io::stdout();
+            let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+            if ctx_on && ctx_echo {
+                // Same regrouped render as the serve-first branch.
+                let text = render_served_context(&raw, ctx_before, ctx_after, &group_sep);
+                stdout_write_all(&mut writer, &text);
+            } else if format_text {
+                // Same client-side text render as the serve-first branch.
+                let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
+                stdout_write_all(&mut writer, &text);
+            } else {
+                stdout_write_all(&mut writer, &raw);
+            }
+            stdout_flush(&mut writer);
+        }
         eprintln!(
             "nkgrep: {matches} matches via serve, {} ms",
             t0.elapsed().as_millis()
@@ -1841,7 +2423,7 @@ fn main() {
         return;
     }
 
-    let matcher = match build_matcher(&pattern) {
+    let matcher = match build_matcher(&pattern, ignore_case) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("nkgrep: bad regex: {e}");
@@ -1857,7 +2439,11 @@ fn main() {
     let mut hits_indexed = false;
     let files: usize;
     let mut load_ms = 0u128;
-    let idx_opt: Option<Index> = if let Some(idx_path) = &use_index {
+    let idx_opt: Option<Index> = if stdin_mode {
+        // Stdin bypasses the index entirely: the piped bytes are not indexed
+        // content. --use-index is ignored, not an error.
+        None
+    } else if let Some(idx_path) = &use_index {
         let t_load = Instant::now();
         let idx = load_index_for_query(idx_path, &root);
         load_ms = t_load.elapsed().as_millis();
@@ -1865,12 +2451,46 @@ fn main() {
     } else {
         None
     };
-    if let Some(idx) = &idx_opt {
+    if stdin_mode {
+        // No walk, no index: stdin bytes are the only search unit, labeled
+        // `(standard input)`. The shared sort/emit tail below applies
+        // unchanged (--top truncates, -c/-l aggregate, JSON stays default).
+        files = 1;
+        ptab = vec![STDIN_LABEL.to_string()];
+        let mut input = Vec::new();
+        {
+            use std::io::Read;
+            if std::io::stdin().read_to_end(&mut input).is_err() {
+                eprintln!("nkgrep: stdin: read error");
+                std::process::exit(2);
+            }
+        }
+        if quiet {
+            // Existence only, mirroring the file branches: no stdout, 0/1 exit.
+            quiet_exit(
+                search_stdin_raw(&input, &matcher).is_some(),
+                files,
+                load_ms,
+                t0,
+            );
+        }
+        hits = search_stdin_raw(&input, &matcher)
+            .map(|h| vec![h])
+            .unwrap_or_default();
+    } else if let Some(idx) = &idx_opt {
         let n = idx.files.len() as f64;
         let mut scores = vec![0.0f64; idx.files.len()];
         let mut order: Vec<u32> = vec![];
-        let mut fallback = false;
-        match query_grams(&pattern) {
+        // `-i` forces the scan fallback: trigram postings are raw bytes, so
+        // case-sensitive grams would false-negative on case variants
+        // (`hello` grams miss `HELLO` files). Scanning makes indexed==scan
+        // hold by construction; the matcher itself folds case.
+        let mut fallback = ignore_case;
+        match if fallback {
+            None
+        } else {
+            query_grams(&pattern)
+        } {
             None => fallback = true,
             Some(ors) => {
                 let mut occ: Vec<(&[u32], f64)> = vec![];
@@ -1920,6 +2540,17 @@ fn main() {
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect();
+            if quiet {
+                // Existence only: `find_any` stops the parallel wave at the
+                // first banked hit instead of verifying every file.
+                let found = (0u32..ptab.len() as u32)
+                    .into_par_iter()
+                    .find_any(|pid| {
+                        verify_one_raw(*pid, &ptab[*pid as usize], &matcher, 0.0).is_some()
+                    })
+                    .is_some();
+                quiet_exit(found, files, load_ms, t0);
+            }
             hits = (0u32..ptab.len() as u32)
                 .into_par_iter()
                 .filter_map(|pid| verify_one_raw(pid, &ptab[pid as usize], &matcher, 0.0))
@@ -1941,6 +2572,23 @@ fn main() {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             files = order.len();
+            if quiet {
+                // Existence only over the pruned candidate set: same
+                // `find_any` short-circuit as the scan branches.
+                let found = order
+                    .par_iter()
+                    .find_any(|id| {
+                        verify_one_raw(
+                            **id,
+                            &idx.files[**id as usize],
+                            &matcher,
+                            scores[**id as usize],
+                        )
+                        .is_some()
+                    })
+                    .is_some();
+                quiet_exit(found, files, load_ms, t0);
+            }
             // Rank-ordered parallel verify, kth early exit between batches
             // (spec §6: match score ≤ file score, exit moves only with proof).
             hits = parallel_verify_batched_raw(idx, &matcher, &order, &scores, top);
@@ -1953,6 +2601,15 @@ fn main() {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
+        if quiet {
+            // Existence only: `find_any` stops the parallel wave at the
+            // first banked hit instead of verifying every file.
+            let found = (0u32..ptab.len() as u32)
+                .into_par_iter()
+                .find_any(|pid| verify_one_raw(*pid, &ptab[*pid as usize], &matcher, 0.0).is_some())
+                .is_some();
+            quiet_exit(found, files, load_ms, t0);
+        }
         hits = (0u32..ptab.len() as u32)
             .into_par_iter()
             .filter_map(|pid| {
@@ -1980,6 +2637,73 @@ fn main() {
         ord.truncate(n);
     }
     let matches = ord.len();
+    if count_mode || files_only {
+        // `-c` / `-l` cold emit: per-file surviving-hit (post---top) counts,
+        // path-sorted for a stable contract (rg emits walk-parallel order).
+        // `-l` wins over `-c`; `-q` never reaches here (quiet_exit above).
+        // Zero-count files are omitted (see write_aggregates).
+        let path_of = |pid: usize| -> &str {
+            match &idx_opt {
+                Some(idx) if hits_indexed => &idx.files[pid],
+                _ => &ptab[pid],
+            }
+        };
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for &i in &ord {
+            let (fi, _) = loc[i as usize];
+            *counts.entry(hits[fi as usize].pid as usize).or_default() += 1;
+        }
+        let mut rows: Vec<(&str, usize)> =
+            counts.iter().map(|(&pid, &n)| (path_of(pid), n)).collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        let stdout = std::io::stdout();
+        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+        write_aggregates(&mut writer, &rows, files_only);
+        stdout_flush(&mut writer);
+        eprintln!(
+            "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            t0.elapsed().as_millis()
+        );
+        if matches == 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if format_text {
+        // Text emit: same ranked `ord` as JSON (rank order preserved — same
+        // hits, same order, different rendering), no score, line numbers
+        // always on. Skips the JSON path-escape table; -c/-l/-q returned
+        // above. ContextLines' context>0 renderer takes over when context
+        // flags are set (plain text here is the no-context trigger).
+        let mut buf = Vec::with_capacity(ord.len() * 128);
+        for &i in &ord {
+            let (fi, mi) = loc[i as usize];
+            let fh = &hits[fi as usize];
+            let m = &fh.metas[mi as usize];
+            let ps: &str = match &idx_opt {
+                Some(idx) if hits_indexed => &idx.files[fh.pid as usize],
+                _ => &ptab[fh.pid as usize],
+            };
+            let text = banked_text(fh, m);
+            if color_on {
+                emit_text_row_colored(&mut buf, ps, m.line, &text, &matcher);
+            } else {
+                emit_text_row(&mut buf, ps, m.line, &text);
+            }
+        }
+        let stdout = std::io::stdout();
+        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+        stdout_write_all(&mut writer, &buf);
+        stdout_flush(&mut writer);
+        eprintln!(
+            "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            t0.elapsed().as_millis()
+        );
+        if matches == 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
     // Ordered parallel emission (cold emission only): manual memchr escaper
     // into chunk buffers per-thread, join in order, single sequential write.
     // Serial fallback under threshold keeps selective/small queries off the
@@ -2378,3 +3102,102 @@ mod escape_tests {
         assert!(n > 1000, "corpus fuzz saw too few lines: {n}");
     }
 }
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    fn lit(pat: &str) -> RegexMatcher {
+        build_matcher(pat, false).unwrap()
+    }
+
+    #[test]
+    fn parse_when_values() {
+        assert_eq!(parse_color_when("auto"), Some(ColorWhen::Auto));
+        assert_eq!(parse_color_when("always"), Some(ColorWhen::Always));
+        assert_eq!(parse_color_when("never"), Some(ColorWhen::Never));
+        assert_eq!(parse_color_when("ansi"), Some(ColorWhen::Ansi));
+        assert_eq!(parse_color_when("bogus"), None);
+        assert_eq!(parse_color_when(""), None);
+        assert_eq!(parse_color_when("Always"), None);
+    }
+
+    #[test]
+    fn enabled_explicit_wins() {
+        assert!(color_enabled(ColorWhen::Always));
+        assert!(color_enabled(ColorWhen::Ansi));
+        assert!(!color_enabled(ColorWhen::Never));
+        // Auto follows the TTY only — no assert (environment-dependent).
+    }
+
+    #[test]
+    fn span_wrap_matches_rg_bytes() {
+        // Exact SGR sequence byte-probed on rg 15.1.0 (`--color=always`).
+        let m = lit("hello");
+        assert_eq!(
+            &*colorize_spans("hello world", &m),
+            "\x1b[0m\x1b[1m\x1b[31mhello\x1b[0m world"
+        );
+    }
+
+    #[test]
+    fn no_match_borrows_back_verbatim() {
+        let m = lit("zzz");
+        let out = colorize_spans("hello world", &m);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*out, "hello world");
+    }
+
+    #[test]
+    fn zero_width_spans_skipped() {
+        // `x*` matches empty everywhere: must emit no codes at all.
+        let m = lit("x*");
+        let out = colorize_spans("ab", &m);
+        assert_eq!(&*out, "ab");
+        assert!(!out.bytes().any(|b| b == 0x1b));
+    }
+
+    #[test]
+    fn multi_span_all_wrapped() {
+        let m = lit("o");
+        assert_eq!(
+            &*colorize_spans("foo boo", &m),
+            "f\x1b[0m\x1b[1m\x1b[31mo\x1b[0m\x1b[0m\x1b[1m\x1b[31mo\x1b[0m b\x1b[0m\x1b[1m\x1b[31mo\x1b[0m\x1b[0m\x1b[1m\x1b[31mo\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn colored_row_delegates_framing() {
+        // Plain and colored rows share `path:line:` framing; only the text
+        // span differs.
+        let m = lit("needle");
+        let mut plain = Vec::new();
+        let mut colored = Vec::new();
+        emit_text_row(&mut plain, "a.txt", 7, "a needle here");
+        emit_text_row_colored(&mut colored, "a.txt", 7, "a needle here", &m);
+        assert_eq!(&plain, b"a.txt:7:a needle here\n");
+        assert_eq!(
+            &colored,
+            b"a.txt:7:a \x1b[0m\x1b[1m\x1b[31mneedle\x1b[0m here\n"
+        );
+    }
+
+    #[test]
+    fn serve_colored_mirrors_plain_shape() {
+        // Same rows, same order as the plain converter; only spans wrapped.
+        let raw = b"{\"path\":\"a.txt\",\"line\":1,\"text\":\"hi needle\"}\n\
+                    {\"path\":\"b.txt\",\"line\":2,\"text\":\"no hit here\"}\n";
+        let m = lit("needle");
+        let plain = json_hits_to_text(raw);
+        let colored = json_hits_to_text_colored(raw, &m);
+        assert_eq!(&plain, b"a.txt:1:hi needle\nb.txt:2:no hit here\n");
+        assert_eq!(
+            &colored,
+            b"a.txt:1:hi \x1b[0m\x1b[1m\x1b[31mneedle\x1b[0m\nb.txt:2:no hit here\n"
+        );
+        // serve_text_out gates on color_on: off == plain bytes.
+        assert_eq!(serve_text_out(raw, "needle", false, false), plain);
+        assert_eq!(serve_text_out(raw, "needle", false, true), colored);
+    }
+}
+
