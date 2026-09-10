@@ -368,6 +368,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--live", action="store_true", help="measure fresh medians")
     ap.add_argument("--runs", type=int, default=3, help="per-query runs for --live")
+    ap.add_argument("--date", default=str(date.today()), help="date key for --live rows")
     ap.add_argument("--public-simple", action="store_true", help="also write bench/benchmark.png")
     args = ap.parse_args()
 
