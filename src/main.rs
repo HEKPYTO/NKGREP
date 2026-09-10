@@ -314,6 +314,133 @@ fn gram_pack(g: &[u8; 3]) -> u32 {
 /// a superset of all matches. Escapes (`\x`) never contribute a literal
 /// (covers `\|`, `\d`, `\n`, `\\`); class contents contribute nothing.
 /// None = no usable literal in some branch, caller must full-scan.
+fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
+    let mut ors = vec![];
+    for branch in split_branches(pattern) {
+        let mut ands = HashSet::new();
+        for run in literal_runs(&branch) {
+            if run.len() >= 3 {
+                for w in run.windows(3) {
+                    ands.insert(gram_pack(&[w[0], w[1], w[2]]));
+                }
+            }
+        }
+        if ands.is_empty() {
+            return None;
+        }
+        let mut grams = ands.into_iter().collect::<Vec<_>>();
+        grams.sort();
+        ors.push(grams);
+    }
+    Some(ors)
+}
+
+/// Split on unescaped `|` outside `[...]` classes. Verbatim copy otherwise
+/// (escapes and classes preserved for `literal_runs` to interpret).
+fn split_branches(pattern: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![String::new()];
+    let mut it = pattern.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                out.last_mut().unwrap().push('\\');
+                if let Some(e) = it.next() {
+                    out.last_mut().unwrap().push(e);
+                }
+            }
+            '[' => {
+                let mut cls = String::from("[");
+                if it.peek() == Some(&'^') {
+                    cls.push(it.next().unwrap());
+                }
+                if it.peek() == Some(&']') {
+                    cls.push(it.next().unwrap()); // `[]...]` — first ] literal
+                }
+                {
+                    let iter = it.by_ref();
+                    while let Some(c2) = iter.next() {
+                        cls.push(c2);
+                        if c2 == '\\' {
+                            if let Some(e) = iter.next() {
+                                cls.push(e); // escaped char inside class
+                            }
+                            continue;
+                        }
+                        if c2 == ']' {
+                            break;
+                        }
+                    }
+                }
+                out.last_mut().unwrap().push_str(&cls);
+            }
+            '|' => out.push(String::new()),
+            c => out.last_mut().unwrap().push(c),
+        }
+    }
+    out
+}
+
+/// Definitely-literal alphanumeric-underscore runs: skips `\x` escapes and
+/// `[...]` class contents (an unclosed `[` swallows the rest, conservatively
+/// yielding fewer grams, never wrong ones).
+fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
+    let mut runs = vec![];
+    let mut cur: Vec<u8> = vec![];
+    let mut it = branch.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if !cur.is_empty() {
+                    runs.push(std::mem::take(&mut cur));
+                }
+                let _ = it.next(); // escaped char is never a literal
+            }
+            '[' => {
+                if !cur.is_empty() {
+                    runs.push(std::mem::take(&mut cur));
+                }
+                if it.peek() == Some(&'^') {
+                    it.next();
+                }
+                if it.peek() == Some(&']') {
+                    it.next();
+                }
+                let mut esc = false;
+                for c2 in it.by_ref() {
+                    if esc {
+                        esc = false;
+                        continue;
+                    }
+                    if c2 == '\\' {
+                        esc = true;
+                        continue;
+                    }
+                    if c2 == ']' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => cur.push(c as u8),
+            _ => {
+                if !cur.is_empty() {
+                    runs.push(std::mem::take(&mut cur));
+                }
+            }
+        }
+    }
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    runs
+}
+
+/// ASCII-gated matcher construction (V1): when the pattern is ASCII, skip the
+/// Unicode tables (`unicode(false)` + `\n` line terminator, which unlocks the
+/// fast line-oriented search path); when it is additionally a pure literal,
+/// compile with `fixed_strings`. Each flag is independent and keeps
+/// independently. A builder error (e.g. the line terminator rejecting a
+/// pattern that can match `\n`) retries less-gated, ending at plain
+/// `RegexMatcher::new`, so construction never fails where it used to work.
 fn cmd_index(root: &PathBuf, idx_path: &str) {
     let t0 = Instant::now();
     let root_canon = canon_root(root);
@@ -1214,6 +1341,153 @@ fn main() {
     );
     if matches == 0 {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+
+    fn sorted_branches(pat: &str) -> Option<Vec<Vec<u32>>> {
+        query_grams(pat).map(|mut ors| {
+            for b in &mut ors {
+                b.sort();
+            }
+            ors.sort();
+            ors
+        })
+    }
+
+    #[test]
+    fn escaped_pipe_stays_one_branch() {
+        // `abc\|def` is a single literal `abc|def`, not an alternation.
+        let got = sorted_branches("abc\\|def").unwrap();
+        assert_eq!(got.len(), 1, "escaped pipe must not split: {got:?}");
+        assert!(got[0].contains(&gram_pack(b"abc")), "{got:?}");
+        assert!(got[0].contains(&gram_pack(b"def")), "{got:?}");
+    }
+
+    #[test]
+    fn escaped_pipe_branch_still_indexes() {
+        // Naive `split('|')` yields a bare `x` branch -> None (full scan).
+        // Proper parse keeps 2 branches, both with usable literals.
+        let got = sorted_branches("needle_1\\|x|NEEDLE_ALPHA").unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+
+    #[test]
+    fn class_pipe_does_not_split() {
+        let got = sorted_branches("[a|b]+needle_1").unwrap();
+        assert_eq!(got.len(), 1, "class pipe must not split: {got:?}");
+        assert!(got[0].contains(&gram_pack(b"nee")), "{got:?}");
+    }
+
+    #[test]
+    fn group_alternation_splits() {
+        let got = sorted_branches("(needle_1|needle_2)_suffix").unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+    #[test]
+    fn cached_verify_matches_plain() {
+        // The fd-cache read path (`Some`) must bank the same hits as the
+        // plain path (`None`): byte-identical decoded text, line, and score.
+        let dir = std::env::temp_dir().join(format!("nkgrep_cached_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "needle here\nsecond needle\n").unwrap();
+        let ap = a.to_string_lossy().into_owned();
+        let matcher = RegexMatcher::new("needle").unwrap();
+        let fdc = FdCache::new(1);
+        let plain = verify_one_raw(0, &ap, &matcher, 10.0).expect("plain must hit");
+        let cached = verify_one_raw_cached(0, &ap, &matcher, 10.0, Some((&fdc, 0)))
+            .expect("cached must hit");
+        assert_eq!(cached.metas.len(), plain.metas.len());
+        for (c, p) in cached.metas.iter().zip(plain.metas.iter()) {
+            assert_eq!((c.line, c.score), (p.line, p.score));
+            assert_eq!(banked_text(&cached, c), banked_text(&plain, p));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_literal_falls_back() {
+        assert!(query_grams("a|b").is_none());
+        assert!(query_grams(".*").is_none());
+        assert!(query_grams("a\\|b").is_none()); // single branch, runs < 3
+    }
+
+    #[test]
+    fn plain_queries_unchanged() {
+        assert!(query_grams("TODO_FIXME_ALPHA").is_some());
+        assert_eq!(
+            sorted_branches("needle_1|needle_2|needle_3").unwrap().len(),
+            3
+        );
+        assert_eq!(sorted_branches("fn parse_config").unwrap().len(), 1);
+    }
+    #[test]
+    fn pack_bijective_and_ordered() {
+        // Bijective: distinct triples pack distinctly, top byte stays zero.
+        let mut seen = std::collections::HashSet::new();
+        for a in [0u8, 1, 65, 95, 122, 200, 255] {
+            for b in [0u8, 1, 65, 95, 122, 200, 255] {
+                for c in [0u8, 1, 65, 95, 122, 200, 255] {
+                    let k = gram_pack(&[a, b, c]);
+                    assert_eq!(k >> 24, 0, "top byte must stay zero");
+                    assert_eq!(((k >> 16) & 0xFF) as u8, a);
+                    assert_eq!(((k >> 8) & 0xFF) as u8, b);
+                    assert_eq!((k & 0xFF) as u8, c);
+                    assert!(seen.insert(k), "collision on [{a}, {b}, {c}]");
+                }
+            }
+        }
+        // Numeric order equals lexicographic byte order.
+        let mut trips: Vec<[u8; 3]> = vec![
+            *b"abc", *b"abd", *b"bac", *b"aaa", *b"zzz", *b"a_c", *b"_aa",
+        ];
+        trips.sort();
+        let mut packed: Vec<u32> = trips.iter().map(|t| gram_pack(t)).collect();
+        packed.sort();
+        assert_eq!(
+            packed,
+            trips.iter().map(|t| gram_pack(t)).collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn top_zero_indexed_matches_scan_empty() {
+        let dir = std::env::temp_dir().join(format!("nkgrep_top0_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "needle_haystack_content\n").unwrap();
+        std::fs::write(&b, "needle_haystack_content\n").unwrap();
+        let idx = Index {
+            root: String::new(),
+            root_dev: 0,
+            root_ino: 0,
+            files: vec![
+                a.to_string_lossy().into_owned(),
+                b.to_string_lossy().into_owned(),
+            ],
+            postings: HashMap::new(),
+        };
+        let matcher = RegexMatcher::new("needle_haystack_content").unwrap();
+        let order = vec![0u32, 1u32];
+        let scores = vec![10.0f64, 5.0f64];
+        let batched = parallel_verify_batched_raw(&idx, &matcher, &order, &scores, Some(0));
+        // Columnar flat scan (serve semantics): full verify, rank over side
+        // scores, top-0 truncate.
+        let scanned_all: Vec<FileHits> = [(0u32, 10.0f64), (1u32, 5.0f64)]
+            .into_iter()
+            .filter_map(|(id, s)| verify_one_raw_cached(id, &idx.files[id as usize], &matcher, s, None))
+            .collect();
+        let (scanned_scores, _) = flat_scores(&scanned_all);
+        let mut scanned_ord = raw_order(&scanned_scores);
+        scanned_ord.truncate(0);
+        assert!(batched.is_empty(), "top=0 batched must return 0 hits");
+        assert!(scanned_ord.is_empty(), "top=0 scan must return 0 hits");
+        assert!(!scanned_all.is_empty(), "fixture must match without top");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
