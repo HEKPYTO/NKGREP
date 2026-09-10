@@ -585,6 +585,50 @@ fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
 /// independently. A builder error (e.g. the line terminator rejecting a
 /// pattern that can match `\n`) retries less-gated, ending at plain
 /// `RegexMatcher::new`, so construction never fails where it used to work.
+fn build_matcher(pattern: &str) -> Result<RegexMatcher, grep_regex::Error> {
+    let ascii_only = pattern.is_ascii();
+    let literal_only = is_pure_literal(pattern);
+    if ascii_only || literal_only {
+        let mut b = RegexMatcherBuilder::new();
+        if ascii_only {
+            b.unicode(false);
+            b.line_terminator(Some(b'\n'));
+        }
+        if literal_only {
+            b.fixed_strings(true);
+        }
+        if let Ok(m) = b.build(pattern) {
+            return Ok(m);
+        }
+        if ascii_only {
+            let mut bz = RegexMatcherBuilder::new();
+            bz.unicode(false);
+            if literal_only {
+                bz.fixed_strings(true);
+            }
+            if let Ok(m) = bz.build(pattern) {
+                return Ok(m);
+            }
+        }
+    }
+    RegexMatcher::new(pattern)
+}
+/// Pure-literal probe for the `fixed_strings` gate: one `|`-free branch whose
+/// every byte survives `literal_runs` as a single run. Conservative on
+/// purpose: any metachar, escape, class, or alternation disqualifies (that
+/// query keeps the regex engine, gaining only `unicode(false)` when ASCII).
+fn is_pure_literal(pattern: &str) -> bool {
+    if pattern.is_empty() || !pattern.is_ascii() {
+        return false;
+    }
+    let branches = split_branches(pattern);
+    if branches.len() != 1 {
+        return false;
+    }
+    let runs = literal_runs(&branches[0]);
+    runs.len() == 1 && runs[0].len() == pattern.len()
+}
+
 fn cmd_index(root: &PathBuf, idx_path: &str) {
     let t0 = Instant::now();
     let root_canon = canon_root(root);
@@ -914,6 +958,56 @@ fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
 /// only, comparator verbatim the Hit-order one (NaN fallback included), so
 /// the order — ties included — matches the stable fat-Hit sort given the
 /// same collect sequence. Sort traffic touches 8 B scores, never payloads.
+fn raw_order(scores: &[f64]) -> Vec<u32> {
+    let mut ord: Vec<u32> = (0..scores.len() as u32).collect();
+    ord.sort_by(|a, b| {
+        scores[*b as usize]
+            .partial_cmp(&scores[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ord
+}
+
+/// Batched parallel verify in descending file-score order with provable
+/// top-k early exit (spec §6): every match scores at most its file score
+/// (match score = file score − line/1e6), so once k hits are banked, no
+/// unverified file whose file score does not exceed the kth-best match
+/// score can displace the top-k. Each batch uses the serve pattern
+/// (rayon par_iter + flat_map verify); the kth check runs between
+/// batches against the batch max (order[0] of the chunk, order is desc).
+/// Exiting before a batch whose max does not exceed kth exits before
+/// every file a per-file loop would skip — same proof, batch granularity.
+/// Final global sort + truncate stays with the caller.
+/// ST-5 columnar: banks verbatim match bytes per file (one amortized arena
+/// alloc per matched file, zero per hit) with zero Arc traffic; callers
+/// flatten metas to a side scores vec for the index-only sort.
+fn flat_scores(files: &[FileHits]) -> (Vec<f64>, Vec<(u32, u32)>) {
+    let n: usize = files.iter().map(|f| f.metas.len()).sum();
+    let mut scores = Vec::with_capacity(n);
+    let mut loc = Vec::with_capacity(n);
+    for (fi, f) in files.iter().enumerate() {
+        for (mi, m) in f.metas.iter().enumerate() {
+            scores.push(m.score);
+            loc.push((fi as u32, mi as u32));
+        }
+    }
+    (scores, loc)
+}
+
+/// Decode banked match bytes with the exact eager expression
+/// (`from_utf8_lossy` then char-trim of `\n`/`\r`): valid UTF-8 borrows the
+/// arena, only invalid-UTF8 hits allocate — the same hits as before.
+fn banked_text<'a>(fh: &'a FileHits, m: &HitMeta) -> std::borrow::Cow<'a, str> {
+    let raw = &fh.arena[m.start as usize..m.end as usize];
+    let cow = String::from_utf8_lossy(raw);
+    match cow {
+        std::borrow::Cow::Borrowed(b) => std::borrow::Cow::Borrowed(b.trim_end_matches(|c| c == '\n' || c == '\r')),
+        std::borrow::Cow::Owned(o) => {
+            std::borrow::Cow::Owned(o.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
+        }
+    }
+}
+
 fn parallel_verify_batched_raw(
     idx: &Index,
     matcher: &RegexMatcher,

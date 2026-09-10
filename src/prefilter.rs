@@ -71,3 +71,53 @@ pub fn intersect_all(lists: &mut Vec<&[u32]>) -> Vec<u32> {
     }
     acc
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn merge_matches_hashset_model() {
+        // Fixed adversarial cases: empty, disjoint, overlap, shared prefix.
+        let cases: &[(&[u32], &[u32])] = &[
+            (&[], &[]),
+            (&[], &[1, 2]),
+            (&[1, 2], &[]),
+            (&[1, 3, 5], &[2, 4, 6]),
+            (&[1, 2, 3], &[2, 3, 4]),
+            (&[1, 2, 3, 4], &[1, 2, 3, 4]),
+            (&[5], &[5]),
+            (&[1, 100, 1000], &[2, 100, 999, 1000]),
+        ];
+        for (a, b) in cases {
+            let mut inter = vec![];
+            intersect_sorted_into(a, b, &mut inter);
+            let set_a: HashSet<u32> = a.iter().cloned().collect();
+            let set_b: HashSet<u32> = b.iter().cloned().collect();
+            let mut model: Vec<u32> = set_a.intersection(&set_b).cloned().collect();
+            model.sort_unstable();
+            assert_eq!(inter, model, "intersect {a:?} {b:?}");
+            let mut union = vec![];
+            union_sorted_into(a, b, &mut union);
+            let mut model: Vec<u32> = set_a.union(&set_b).cloned().collect();
+            model.sort_unstable();
+            assert_eq!(union, model, "union {a:?} {b:?}");
+        }
+    }
+    #[test]
+    fn intersect_all_smallest_first_exact() {
+        let l1 = vec![1u32, 2, 3, 4, 5];
+        let l2 = vec![2u32, 4];
+        let l3 = vec![2u32, 3, 4, 9];
+        // Deliberately longest-first input; output must still be exact.
+        let mut lists: Vec<&[u32]> = vec![&l1, &l3, &l2];
+        assert_eq!(intersect_all(&mut lists), vec![2, 4]);
+        let mut empty: Vec<&[u32]> = vec![];
+        assert!(intersect_all(&mut empty).is_empty());
+        let e = vec![];
+        let mut with_empty: Vec<&[u32]> = vec![&l1, &e];
+        assert!(intersect_all(&mut with_empty).is_empty());
+    }
+
+}
