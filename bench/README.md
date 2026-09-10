@@ -14,7 +14,7 @@ competitive.
 | `bench.py` | Ripgrep vs `nkg` plain scan |
 | `bench_index.py` | Scan vs indexed search, plus gates A / B / C |
 | `bench_universe.py` | Every installed grep-like tool vs ripgrep |
-| `collect_progress.py` | Draws `local runs/progress.png` from past medians |
+| `collect_progress.py` | Draws `bench/benchmark.png` (public) from past medians |
 | `corpus/` | Synthetic corpus (generated, 3,000 files) |
 | `corpus-git/` | Same text under git, for `git grep` comparisons |
 | `corpus-tgrep/` | Same text served by a `tgrep` server |
@@ -44,7 +44,7 @@ byte-identically — the random generator uses a fixed seed):
 
 ```sh
 python3 bench/gen_corpus.py
-# files=3000 alpha_lines=... needles=...
+# files=3000 alpha_lines=146 needles={1: 26, 2: 31, 3: 29}
 ```
 
 `corpus-git/` and `corpus-tgrep/` are copies of the same text in the
@@ -82,8 +82,12 @@ Build the binary first (all scripts expect it at
 cargo build --release
 ```
 
-Run any script from the repo root, e.g. `python3 bench/bench.py`
-(the scripts locate the corpus and the binary relative to themselves).
+Run every script from the repo root (`bench.py`, `bench_index.py`,
+`bench_universe.py`, `collect_progress.py`) — each one locates the
+corpus and the binary relative to itself, so no `cd` is needed. The
+only step with a working-directory requirement is building the index
+(next section): it runs from `bench/` so the index records `corpus`
+as its root.
 
 ### `bench.py` — ripgrep vs plain scan
 
@@ -99,18 +103,17 @@ combined kill verdict (`SURVIVE` only if both pass).
 
 ### `bench_index.py` — scan vs indexed search, gates A / B / C
 
-Build the index first (indexed runs use `bench/` as the working
-directory with `corpus` as the search root, because index paths are
-stored under `corpus`):
+Build the index first. This step runs from `bench/` so the index
+records `corpus` as its root — the same root the script queries:
 
 ```sh
 cd bench && ../target/release/nkg index corpus --index nk.idx.json
 ```
 
-Then:
+Then, from the repo root:
 
 ```sh
-python3 bench/bench_index.py     # run from bench/
+python3 bench/bench_index.py
 ```
 
 What the three gates mean, in plain words:
@@ -149,13 +152,14 @@ are required.
 ### `collect_progress.py` — the progress chart
 
 ```sh
-python3 bench/collect_progress.py
-# writes local runs/progress.csv and local runs/progress.png
+python3 bench/collect_progress.py --public-simple
+# writes local runs/progress.csv + local runs/progress.png (private, gitignored)
+#   and bench/benchmark.png (the public chart, tracked in git)
 ```
 
 By default this plots a stored table of past medians (no measuring —
-fast and deterministic) and appends those rows to
-`local runs/progress.csv`, keyed by date, data set, query, and tool, so
+fast and deterministic) and upserts those rows into
+`local runs/progress.csv`, keyed by date, source, query, and tool, so
 re-runs never duplicate rows. To measure fresh numbers on your machine
 and overlay them instead (slow; needs the full tool set and
 `matplotlib`):
@@ -164,24 +168,26 @@ and overlay them instead (slow; needs the full tool set and
 python3 bench/collect_progress.py --live --runs 3 --date 2026-09-10
 ```
 
-## How to read `local runs/progress.png`
+## How to read `bench/benchmark.png`
 
 - **Groups on the horizontal axis are queries**: the three selective
   queries, then the heavy full query, then the heavy top-20 query.
-- **Bars within a group are tool modes**: `nkg` plain scan,
-  `nkg` with a cold index file, `nkg` against a hot already
-  running server, `tgrep`, ripgrep, and ugrep. The top-20 group
-  additionally shows full-run bars as latency context.
-- **Bar height is median milliseconds — shorter is faster.**
+- **Bars within a group are tools**: `nkgrep scan`, `nkgrep indexed`
+  (cold index file), `nkgrep serve` (hot already-running server),
+  `tgrep`, `rg`, and `ugrep`. The top-20 group additionally shows
+  full-run bars as latency context.
+- **Bar height is median milliseconds — shorter is faster.** Each bar
+  is labeled with its value.
 - **Every plotted bar passed match-set equality vs ripgrep.** A bar
   that diverged would not be plotted as a time at all.
-- **The footnotes are part of the chart**: they record the exact
-  command behind each bar series, the exact query behind each group,
-  and which session each number comes from. If two bars surprise you,
-  the footnotes tell you how to reproduce each one.
+
+The same run also writes `local runs/progress.png`, a detailed local-only
+variant with footnotes recording the exact command, query, and session
+behind each bar. It lives under `local runs/`, which is gitignored, so it
+stays on your disk — `bench/benchmark.png` is the chart to share.
 
 `local runs/progress.csv` holds the same data in tabular form
-(`date, data set, tool, query, median_ms`, plus the EQUAL/DIVERGE
+(`date, source, tool, query, median_ms`, plus the EQUAL/DIVERGE
 equality column), one row per plotted bar.
 
 `bench/archived runs/` keeps dated example snapshots of full result
