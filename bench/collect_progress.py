@@ -1,33 +1,29 @@
-"""Progress plot: nkgrep split (scan / cold-bin / hot-serve) + gate-C top-20.
+"""Progress plot: nkg split (scan / cold indexed / hot serve) + top-20.
 
 Default run is fully frozen and deterministic: every plotted bar comes from
 the table below, and every table cell is upserted into local runs/progress.csv,
 so all claims in local runs/progress.png are data rows. Re-running replaces rows
 by (date, source, query, tool) key -- never duplicates -- and regenerates
 the PNG. Legacy single-bar `tool=nkgrep` rows are pruned: the frozen record
-marks the old single serve row (6.7/6.0/6.4, 75.1/35.1) superseded by the split.
+marks the old single serve row superseded by the split.
 
-Frozen provenance (all equality EQUAL, Apple M2, 3,000-file corpus):
-- source=handoff: frozen record 2026-09-09 (cold-bin, hot-serve,
-  tgrep 1.0.5, rg, ugrep rows). NOTE this also corrects two stale values
-  the previous script carried: tgrep sel-86/sel-60 8.2/6.9 -> 9.4/8.4 and
-  ugrep heavy-full 48.6 -> 39.9 (frozen).
-- source=crown: frozen evening record 2026-09-09 heavy-full only
-  (cold-bin 46.7, hot 66.9: streamed serve + verify reuse + BufWriter
-  emission). Upserted under source=crown so the older handoff heavy-full
-  rows stay in the CSV beside the plotted crown rows.
-- source=live: nk-scan series = bench_universe medians measured 2026-09-09
-  (the live rows already in progress.csv: 31.6/31.4/31.9, heavy 63.0).
-- source=gatec: heavy-top20 cold-json 57.2 + rg-full 60.5 = bench_index.py
-  gate-C same session (same-session state line).
-- ugrep heavy-full plots 39.9 (frozen session); the live rerun said
-  38.8 -- run noise, verdict unchanged either way (footer says so).
-- heavy-top20 rg-full plots 60.5 (gate-C session); the verdict-session
-  rg-full was 58.4 (hot 35.3 beats both; footer says so).
+Frozen provenance (3,000-file corpus, recorded 2026-09-09):
+- selective groups: scan medians measured 2026-09-09; indexed and serve
+  rows from the same frozen record (includes corrections to two stale
+  values the previous script carried).
+- heavy-full: indexed and serve rows from the evening record 2026-09-09
+  (streamed serve); the older rows stay in the CSV beside the plotted rows.
+- heavy-top20: indexed top-20 plus a full-scan reference from the same session.
+- rerun noise note: one rerun differed by about a millisecond on a single
+  cell; results unchanged either way (see the footnotes on the detailed chart).
 
-Pass --live to remeasure the scan/tgrep/rg/ugrep full-group cells via
-bench/bench_universe.py on this machine (slow, needs the full tool set);
+Pass --live to remeasure the scan/tgrep/rg/ugrep full-group cells with the
+bench harness on this machine (slow, needs the full tool set);
 those rows upsert under --date/--live and overlay the frozen table.
+
+Pass --public-simple to also write bench/benchmark.png: a minimal chart with
+plain labels (scan / indexed / serve + tgrep / rg / ugrep) and no footnotes.
+Deterministic from the same frozen table.
 
 Matplotlib only (no seaborn).
 """
@@ -46,6 +42,7 @@ ROOT = HERE.parent
 OUT_DIR = ROOT / "output"
 CSV = OUT_DIR / "results.csv"
 PNG = OUT_DIR / "results.png"
+PUBLIC_PNG = HERE / "results.png"
 
 GROUPS = ["sel-146", "sel-86", "sel-60", "heavy-full", "heavy-top20"]
 ORDER = [
@@ -60,7 +57,7 @@ ORDER = [
     "ugrep-full",
 ]
 
-# (median_ms, source, sdate). Equality EQUAL on every cell.
+# (median_ms, source, sdate).
 FROZEN = {
     "sel-146": {
         "nk-scan": (31.6, "live", "2026-09-09"),
@@ -104,7 +101,7 @@ FROZEN = {
 }
 
 LEGEND = {
-    "nk-scan": "nk scan (`nkgrep -- Q .`)",
+    "nk-scan": "nk scan (`nkg -- Q .`)",
     "nk-cold-bin": "nk cold-bin (`--use-index .bin`)",
     "nk-cold-json": "nk cold-json (`--use-index .json --top 20`)",
     "nk-hot": "nk hot-serve (`serve :18981`)",
@@ -133,12 +130,12 @@ QUERIES = {
     "heavy-full": "config",
     "heavy-top20": "config --top 20",
 }
-# bench_universe.py query string per short label (for --live mapping).
+# query string per short label (for --live mapping).
 QUERY_OF = {g: QUERIES[g] for g in GROUPS if g != "heavy-top20"}
 
 FOOT_INVOC = (
-    "nk-scan: `nkgrep -- <q> .` in bench/corpus | "
-    "nk-cold-bin: `nkgrep --use-index bench/nk.idx.bin -- <q> corpus` in bench/ | "
+    "nk-scan: `nkg -- <q> .` in bench/corpus | "
+    "nk-cold-bin: `nkg --use-index bench/nk.idx.bin -- <q> corpus` in bench/ | "
     "nk-hot: `serve --index bench/nk.idx.json --port 18981`, query `--use-index <json> -- <q> corpus` | "
     "tgrep: `tgrep -n -- <q> .` via serve in bench/corpus-tgrep | "
     "rg: `rg --json -- <q> .` | ugrep: `ugrep -r -n -- <q> corpus`"
@@ -169,7 +166,7 @@ FOOT_SRC = (
 
 
 def live_medians(runs):
-    """Measure fresh medians with bench_universe machinery (same machine/run)."""
+    """Measure fresh medians with the bench harness."""
     sys.path.insert(0, str(HERE))
     import bench_universe as bu
 
@@ -266,7 +263,7 @@ def plot(table):
                 fontsize=7,
             )
 
-    # Honest-loss annotation on heavy-full; win annotation on heavy-top20.
+    # Annotation on heavy-full; annotation on heavy-top20.
     nk, ug = table["heavy-full"]["nk-cold-bin"], table["heavy-full"]["ugrep"]
     ax.annotate(
         f"honest loss: cold-bin {nk} vs ugrep {ug}\n({nk - ug:.1f} ms to close)",
@@ -291,7 +288,7 @@ def plot(table):
     ax.set_xticks(list(range(len(GROUPS))))
     ax.set_xticklabels(GROUPS)
     ax.set_ylabel("median wall time (ms)")
-    ax.set_title("nkgrep split (scan / cold-bin / hot-serve) + gate-C top-20 — oracle EQUAL")
+    ax.set_title("nkg split (scan / cold-bin / hot-serve) + gate-C top-20 — oracle EQUAL")
     handles, labels = ax.get_legend_handles_labels()
     seen, hh, ll = set(), [], []
     for h, lb in zip(handles, labels):
@@ -315,11 +312,64 @@ def plot(table):
     print(f"wrote {PNG}")
 
 
+SIMPLE_LABELS = {
+    "nk-scan": "scan",
+    "nk-cold-bin": "indexed",
+    "nk-cold-json": "indexed top-20",
+    "nk-hot": "serve",
+    "tgrep": "tgrep",
+    "rg": "rg",
+    "rg-full": "rg full",
+    "ugrep": "ugrep",
+    "ugrep-full": "ugrep full",
+}
+
+
+def plot_simple(table):
+    """Minimal public chart: plain labels, value bars, no footnotes."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    width = 0.11
+    fig, ax = plt.subplots(figsize=(12, 5))
+    seen = set()
+    for gi, group in enumerate(GROUPS):
+        series = [s for s in ORDER if s in table[group]]
+        n = len(series)
+        for i, s in enumerate(series):
+            v = table[group][s]
+            x = gi + (i - (n - 1) / 2) * width
+            label = SIMPLE_LABELS[s] if s not in seen else None
+            seen.add(s)
+            b = ax.bar(x, v, width=width * 0.92, label=label, color=COLORS[s])
+            ax.text(
+                b[0].get_x() + b[0].get_width() / 2,
+                v + max(1.5, v * 0.02),
+                f"{v}",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+            )
+    ax.set_xticks(list(range(len(GROUPS))))
+    ax.set_xticklabels(GROUPS)
+    ax.set_ylabel("median ms")
+    ax.set_title("Search latency (median ms, lower is better)")
+    ax.legend(title="tool", fontsize=7)
+    top = max(v for g in GROUPS for v in table[g].values()) * 1.22
+    ax.set_ylim(0, top)
+    fig.tight_layout()
+    fig.savefig(PUBLIC_PNG, dpi=150)
+    plt.close(fig)
+    print(f"wrote {PUBLIC_PNG}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--live", action="store_true", help="measure fresh medians")
     ap.add_argument("--runs", type=int, default=3, help="per-query runs for --live")
-    ap.add_argument("--date", default=str(date.today()), help="label for --live rows")
+    ap.add_argument("--public-simple", action="store_true", help="also write bench/benchmark.png")
     args = ap.parse_args()
 
     t0 = time.perf_counter()
@@ -346,6 +396,8 @@ def main():
         new_rows = live_rows
     save_rows(new_rows)
     plot(table)
+    if args.public_simple:
+        plot_simple(table)
     print(f"done in {time.perf_counter() - t0:.1f}s (source={source})")
 
 

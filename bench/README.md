@@ -1,6 +1,6 @@
 # Benchmarks
 
-This directory measures one thing: **does `nkgrep` return exactly the same
+This directory measures one thing: **does `nkg` return exactly the same
 matches as ripgrep, and how fast is it?** Every script below compares
 match sets against ripgrep (`rg`) and reports wall-clock time. A result
 counts as good only if the match sets are equal *and* the time is
@@ -11,7 +11,7 @@ competitive.
 | Path | What it is |
 | --- | --- |
 | `gen_corpus.py` | Builds the synthetic corpus deterministically |
-| `bench.py` | Ripgrep vs `nkgrep` plain scan |
+| `bench.py` | Ripgrep vs `nkg` plain scan |
 | `bench_index.py` | Scan vs indexed search, plus gates A / B / C |
 | `bench_universe.py` | Every installed grep-like tool vs ripgrep |
 | `collect_progress.py` | Draws `local runs/progress.png` from past medians |
@@ -76,7 +76,7 @@ the table above.
 ## Scripts and commands
 
 Build the binary first (all scripts expect it at
-`target/release/nkgrep`):
+`target/release/nkg`):
 
 ```sh
 cargo build --release
@@ -91,10 +91,10 @@ Run any script from the repo root, e.g. `python3 bench/bench.py`
 python3 bench/bench.py
 ```
 
-For each of the four queries it checks that the `nkgrep` match set
+For each of the four queries it checks that the `nkg` match set
 (file, line, text per match) equals the ripgrep match set, then prints
 median milliseconds for both tools plus three verdict lines: match-set
-equality, speed (`nkgrep` at or under ripgrep on every query), and the
+equality, speed (`nkg` at or under ripgrep on every query), and the
 combined kill verdict (`SURVIVE` only if both pass).
 
 ### `bench_index.py` — scan vs indexed search, gates A / B / C
@@ -104,7 +104,7 @@ directory with `corpus` as the search root, because index paths are
 stored under `corpus`):
 
 ```sh
-cd bench && ../target/release/nkgrep index corpus --index nk.idx.json
+cd bench && ../target/release/nkg index corpus --index nk.idx.json
 ```
 
 Then:
@@ -137,13 +137,13 @@ line.
 python3 bench/bench_universe.py
 ```
 
-Measures `rg`, `nkgrep` (scan and indexed), `grep`, `git grep`, `ugrep`,
+Measures `rg`, `nkg` (scan and indexed), `grep`, `git grep`, `ugrep`,
 `ag`, `ack`, and `tgrep` on the four queries. Each cell is either the
 median milliseconds (when that tool's match set equals ripgrep's) or a
 `DIVERGE(a/b)` marker counting matches only that tool found (a) and
 matches only ripgrep found (b). Tools that cannot run on this corpus
 are listed under `N/A (not comparable here)` with a reason instead of
-a number. Missing tools are simply skipped; only ripgrep and `nkgrep`
+a number. Missing tools are simply skipped; only ripgrep and `nkg`
 are required.
 
 ### `collect_progress.py` — the progress chart
@@ -168,8 +168,8 @@ python3 bench/collect_progress.py --live --runs 3 --date 2026-09-10
 
 - **Groups on the horizontal axis are queries**: the three selective
   queries, then the heavy full query, then the heavy top-20 query.
-- **Bars within a group are tool modes**: `nkgrep` plain scan,
-  `nkgrep` with a cold index file, `nkgrep` against a hot already
+- **Bars within a group are tool modes**: `nkg` plain scan,
+  `nkg` with a cold index file, `nkg` against a hot already
   running server, `tgrep`, ripgrep, and ugrep. The top-20 group
   additionally shows full-run bars as latency context.
 - **Bar height is median milliseconds — shorter is faster.**

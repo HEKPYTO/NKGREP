@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_nkgrep"))
+    PathBuf::from(env!("CARGO_BIN_EXE_nkg"))
 }
 
 fn fixture() -> PathBuf {
@@ -13,7 +13,7 @@ fn fixture() -> PathBuf {
 }
 
 fn fixture_in(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nkgrep-oracle-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("nkg-oracle-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for pkg in 0..4 {
         let d = dir.join(format!("pkg_{pkg}"));

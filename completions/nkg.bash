@@ -1,7 +1,7 @@
-# bash completion for nkgrep — static flag list, mirrors `nkgrep --help`
+# bash completion for nkg — static flag list, mirrors `nkg --help`
 # Install: copy to /etc/bash_completion.d/ or source from ~/.bashrc:
-#   source /path/to/nkgrep.bash
-_nkgrep() {
+#   source /path/to/nkg.bash
+_nkg() {
     local cur prev words cword
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
@@ -69,4 +69,4 @@ _nkgrep() {
     esac
 }
 
-complete -F _nkgrep nkgrep
+complete -F _nkg nkg

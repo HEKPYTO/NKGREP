@@ -1,4 +1,4 @@
-// nkgrep — ranked trigram code search.
+// nkg — ranked trigram code search.
 
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::Searcher;
@@ -299,7 +299,7 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
 struct Index {
     /// Canonical absolute path of the tree the index was built from.
     /// Required: old absolute-path indexes without it fail to parse and are
-    /// rejected loudly at load (rebuild with `nkgrep index`).
+    /// rejected loudly at load (rebuild with `nkg index`).
     root: String,
     /// (device, inode) cookie of the build root; 0/0 where unavailable.
     /// Catches a replaced tree behind an unchanged path.
@@ -319,7 +319,7 @@ fn canon_root(root: &std::path::Path) -> PathBuf {
     match std::fs::canonicalize(root) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("nkgrep: bad root {}: {e}", root.display());
+            eprintln!("nkg: bad root {}: {e}", root.display());
             std::process::exit(2);
         }
     }
@@ -354,12 +354,12 @@ fn validate_stored_files(idx_path: &str, files: &[String]) {
     for p in files {
         let path = PathBuf::from(p);
         if path.is_absolute() {
-            eprintln!("nkgrep: stale absolute-path index {idx_path}: rebuild with `nkgrep index`");
+            eprintln!("nkg: stale absolute-path index {idx_path}: rebuild with `nkg index`");
             std::process::exit(2);
         }
         if path.components().any(|c| matches!(c, Component::ParentDir)) {
             eprintln!(
-                "nkgrep: hostile index {idx_path} (path escapes root {p:?}): rebuild with `nkgrep index`"
+                "nkg: hostile index {idx_path} (path escapes root {p:?}): rebuild with `nkg index`"
             );
             std::process::exit(2);
         }
@@ -372,7 +372,7 @@ fn validate_stored_files(idx_path: &str, files: &[String]) {
 fn write_index_file(idx_path: &str, bytes: &[u8]) {
     if let Ok(m) = std::fs::symlink_metadata(idx_path) {
         if m.file_type().is_symlink() {
-            eprintln!("nkgrep: refusing to write index through symlink {idx_path}");
+            eprintln!("nkg: refusing to write index through symlink {idx_path}");
             std::process::exit(2);
         }
     }
@@ -386,12 +386,12 @@ fn write_index_file(idx_path: &str, bytes: &[u8]) {
         match opts.open(idx_path) {
             Ok(mut f) => {
                 if let Err(e) = f.write_all(bytes) {
-                    eprintln!("nkgrep: cannot write index {idx_path}: {e}");
+                    eprintln!("nkg: cannot write index {idx_path}: {e}");
                     std::process::exit(2);
                 }
             }
             Err(e) => {
-                eprintln!("nkgrep: cannot write index {idx_path}: {e}");
+                eprintln!("nkg: cannot write index {idx_path}: {e}");
                 std::process::exit(2);
             }
         }
@@ -399,7 +399,7 @@ fn write_index_file(idx_path: &str, bytes: &[u8]) {
     #[cfg(not(unix))]
     {
         if let Err(e) = std::fs::write(idx_path, bytes) {
-            eprintln!("nkgrep: cannot write index {idx_path}: {e}");
+            eprintln!("nkg: cannot write index {idx_path}: {e}");
             std::process::exit(2);
         }
     }
@@ -416,13 +416,13 @@ fn parse_index(idx_path: &str, data: &str) -> Index {
                 .values()
                 .any(|ids| ids.iter().any(|&id| id as usize >= idx.files.len()))
             {
-                eprintln!("nkgrep: unreadable index {idx_path} (posting id out of range? rebuild with `nkgrep index`)");
+                eprintln!("nkg: unreadable index {idx_path} (posting id out of range? rebuild with `nkg index`)");
                 std::process::exit(2);
             }
             idx
         }
         Err(e) => {
-            eprintln!("nkgrep: unreadable index {idx_path} (old format? rebuild with `nkgrep index`): {e}");
+            eprintln!("nkg: unreadable index {idx_path} (old format? rebuild with `nkg index`): {e}");
             std::process::exit(2);
         }
     }
@@ -472,7 +472,7 @@ fn encode_index_bin(idx: &Index) -> Vec<u8> {
 
 fn parse_index_bin(idx_path: &str, data: &[u8]) -> Index {
     let refuse = |why: &str| -> ! {
-        eprintln!("nkgrep: unreadable index {idx_path} (truncated binary? rebuild with `nkgrep index`): {why}");
+        eprintln!("nkg: unreadable index {idx_path} (truncated binary? rebuild with `nkg index`): {why}");
         std::process::exit(2);
     };
     let mut cur = BIN_MAGIC.len();
@@ -572,7 +572,7 @@ fn read_index_bytes(idx_path: &str) -> Vec<u8> {
     let f = match std::fs::File::open(idx_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("nkgrep: cannot read index {idx_path}: {e}");
+            eprintln!("nkg: cannot read index {idx_path}: {e}");
             std::process::exit(2);
         }
     };
@@ -580,19 +580,19 @@ fn read_index_bytes(idx_path: &str) -> Vec<u8> {
         .map(|m| m.len() > MAX_INDEX_BYTES)
         .unwrap_or(false)
     {
-        eprintln!("nkgrep: index {idx_path} exceeds 4 GiB: rebuild with `nkgrep index`");
+        eprintln!("nkg: index {idx_path} exceeds 4 GiB: rebuild with `nkg index`");
         std::process::exit(2);
     }
     let mut d = Vec::new();
     match f.take(MAX_INDEX_BYTES + 1).read_to_end(&mut d) {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("nkgrep: cannot read index {idx_path}: {e}");
+            eprintln!("nkg: cannot read index {idx_path}: {e}");
             std::process::exit(2);
         }
     }
     if d.len() as u64 > MAX_INDEX_BYTES {
-        eprintln!("nkgrep: index {idx_path} exceeds 4 GiB: rebuild with `nkgrep index`");
+        eprintln!("nkg: index {idx_path} exceeds 4 GiB: rebuild with `nkg index`");
         std::process::exit(2);
     }
     d
@@ -602,13 +602,13 @@ fn parse_index_auto(idx_path: &str, data: &[u8]) -> Index {
         return parse_index_bin(idx_path, data);
     }
     if data.starts_with(OLD_BIN_MAGIC) || data.starts_with(b"NKGREP") {
-        eprintln!("nkgrep: stale index format {idx_path} (expected NKGREP02): rebuild with `nkgrep index`");
+        eprintln!("nkg: stale index format {idx_path} (expected NKGREP02): rebuild with `nkg index`");
         std::process::exit(2);
     }
     match std::str::from_utf8(data) {
         Ok(s) => parse_index(idx_path, s),
         Err(e) => {
-            eprintln!("nkgrep: unreadable index {idx_path} (old format? rebuild with `nkgrep index`): {e}");
+            eprintln!("nkg: unreadable index {idx_path} (old format? rebuild with `nkg index`): {e}");
             std::process::exit(2);
         }
     }
@@ -622,7 +622,7 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
     let q_canon = canon_root(query_root);
     if q_canon.to_string_lossy() != idx.root {
         eprintln!(
-            "nkgrep: index root mismatch (built at {}, queried at {})",
+            "nkg: index root mismatch (built at {}, queried at {})",
             idx.root,
             q_canon.display()
         );
@@ -631,7 +631,7 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
     let (dev, ino) = root_cookie(&q_canon);
     if (dev, ino) != (idx.root_dev, idx.root_ino) {
         eprintln!(
-            "nkgrep: index root mismatch (built at {}, queried at {}: root replaced)",
+            "nkg: index root mismatch (built at {}, queried at {}: root replaced)",
             idx.root,
             q_canon.display()
         );
@@ -655,7 +655,7 @@ fn load_index_for_serve(idx_path: &str) -> Index {
     let (dev, ino) = root_cookie(&live);
     if live.to_string_lossy() != idx.root || (dev, ino) != (idx.root_dev, idx.root_ino) {
         eprintln!(
-            "nkgrep: index root mismatch (built at {}, now at {})",
+            "nkg: index root mismatch (built at {}, now at {})",
             idx.root,
             live.display()
         );
@@ -727,14 +727,14 @@ fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
         let mut ob = OverrideBuilder::new(root);
         for g in &opts.globs {
             if let Err(e) = ob.add(g) {
-                eprintln!("nkgrep: bad --glob {g:?}: {e}");
+                eprintln!("nkg: bad --glob {g:?}: {e}");
                 std::process::exit(2);
             }
         }
         match ob.build() {
             Ok(ov) => glob_matcher = Some(ov),
             Err(e) => {
-                eprintln!("nkgrep: bad --glob: {e}");
+                eprintln!("nkg: bad --glob: {e}");
                 std::process::exit(2);
             }
         }
@@ -795,7 +795,7 @@ fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
                     paths.push(e.path().to_path_buf());
                 }
             }
-            Err(e) => eprintln!("nkgrep: walk error: {e}"),
+            Err(e) => eprintln!("nkg: walk error: {e}"),
         }
     }
     paths
@@ -1442,14 +1442,14 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
         let data = match serde_json::to_string(&idx) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("nkgrep: cannot encode index {idx_path}: {e}");
+                eprintln!("nkg: cannot encode index {idx_path}: {e}");
                 std::process::exit(2);
             }
         };
         write_index_file(idx_path, data.as_bytes());
     }
     eprintln!(
-        "nkgrep: indexed {} files in {} ms -> {idx_path}",
+        "nkg: indexed {} files in {} ms -> {idx_path}",
         entries.len(),
         t0.elapsed().as_millis()
     );
@@ -1535,7 +1535,7 @@ fn bump_nofile_for_cache(want_files: usize) {
         let mut after: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut after as *mut _) == 0 {
             eprintln!(
-                "nkgrep: NOFILE cur={} max={}",
+                "nkg: NOFILE cur={} max={}",
                 after.rlim_cur, after.rlim_max
             );
         }
@@ -2109,7 +2109,7 @@ fn parallel_verify_batched_raw(args: BatchVerify<'_>) -> Vec<FileHits> {
     let mut done = 0usize;
     for chunk in order.chunks(BATCH) {
         if total >= k && scores[chunk[0] as usize] <= kth {
-            eprintln!("nkgrep: early exit after {done} of {} files", order.len());
+            eprintln!("nkg: early exit after {done} of {} files", order.len());
             break;
         }
         // Per-file exit at file granularity (spec §6, same proof as the
@@ -2465,7 +2465,7 @@ fn save_serve_info(idx_path: &str, port: u16) {
                 let _ = f.write_all(b"\n");
             }
             Err(e) => {
-                eprintln!("nkgrep: refuse serve sidecar {path}: {e}");
+                eprintln!("nkg: refuse serve sidecar {path}: {e}");
             }
         }
     }
@@ -2493,7 +2493,7 @@ fn load_serve_port(idx_path: &str) -> Option<u16> {
     let info: ServerInfo = serde_json::from_str(data.trim()).ok()?;
     if info.port == 0 || !pid_alive(info.pid) {
         eprintln!(
-            "nkgrep: stale serve file {path} (pid {} not running); falling back to cold index load",
+            "nkg: stale serve file {path} (pid {} not running); falling back to cold index load",
             info.pid
         );
         return None;
@@ -2503,7 +2503,7 @@ fn load_serve_port(idx_path: &str) -> Option<u16> {
             Some(cur) if cur == info.starttime => {}
             _ => {
                 eprintln!(
-                    "nkgrep: stale serve file {path} (pid {} reused); falling back to cold index load",
+                    "nkg: stale serve file {path} (pid {} reused); falling back to cold index load",
                     info.pid
                 );
                 return None;
@@ -2521,14 +2521,14 @@ fn cmd_serve(idx_path: &str, port: u16) {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("nkgrep: bind 127.0.0.1:{port}: {e}");
+            eprintln!("nkg: bind 127.0.0.1:{port}: {e}");
             std::process::exit(2);
         }
     };
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     save_serve_info(idx_path, bound);
     eprintln!(
-        "nkgrep: serving {} files on 127.0.0.1:{bound}",
+        "nkg: serving {} files on 127.0.0.1:{bound}",
         idx.files.len()
     );
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2571,7 +2571,7 @@ fn client_query(
     let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("nkgrep: connect 127.0.0.1:{port}: {e}");
+            eprintln!("nkg: connect 127.0.0.1:{port}: {e}");
             std::process::exit(2);
         }
     };
@@ -2592,7 +2592,7 @@ fn client_query(
         .write_all(req.as_bytes())
         .and(stream.write_all(b"\n"))
     {
-        eprintln!("nkgrep: serve write 127.0.0.1:{port}: {e}");
+        eprintln!("nkg: serve write 127.0.0.1:{port}: {e}");
         std::process::exit(2);
     }
     let mut reader = BufReader::new(stream);
@@ -3125,7 +3125,7 @@ fn serve_text_out(raw: &[u8], pattern: &str, ignore_case: bool, color_on: bool) 
 // Real emission fns (`emit_raw_with_path` + `push_escaped_json`) are exercised
 // directly by the escape equality below; no test-only wrappers.
 
-const USAGE: &str = "usage: nkgrep index <path> [--index FILE]\n       nkgrep serve --index FILE --port PORT\n       nkgrep [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
+const USAGE: &str = "usage: nkg index <path> [--index FILE]\n       nkg serve --index FILE --port PORT\n       nkg [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
 
 fn usage() -> ! {
     eprint!("{USAGE}");
@@ -3136,7 +3136,7 @@ fn stdout_err(e: std::io::Error) -> ! {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
         std::process::exit(0);
     }
-    eprintln!("nkgrep: stdout: {e}");
+    eprintln!("nkg: stdout: {e}");
     std::process::exit(2);
 }
 
@@ -3159,7 +3159,7 @@ fn stdout_flush(w: &mut impl Write) {
 /// work once any worker banks a hit, so quiet latency is time-to-first-hit.
 fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant) -> ! {
     eprintln!(
-        "nkgrep: {} in {files} files, {} ms (index load {load_ms} ms)",
+        "nkg: {} in {files} files, {} ms (index load {load_ms} ms)",
         if found { "1+ matches" } else { "0 matches" },
         t0.elapsed().as_millis()
     );
@@ -3171,7 +3171,7 @@ fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant) -> ! {
 /// simply ends the process.
 fn print_help() {
     let head = concat!(
-        "nkgrep ",
+        "nkg ",
         env!("CARGO_PKG_VERSION"),
         " — ranked trigram code search\n",
     );
@@ -3228,7 +3228,7 @@ fn print_help() {
         "  --                 end the flag scan, so a pattern beginning with -\n",
         "                     is searched literally\n",
         "  --index FILE       for index and serve, use FILE as the index file\n",
-        "                     (default: .nkgrep.json)\n",
+        "                     (default: .nkg.json)\n",
         "  -h, --help         print help to stdout and exit 0\n",
         "  -V, --version      print the version to stdout and exit 0\n",
     );
@@ -3244,13 +3244,13 @@ fn print_help() {
 fn print_version() {
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
-    let _ = writeln!(w, "nkgrep {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(w, "nkg {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     // --help/--version win before any subcommand; `--` ends the flag scan
-    // so `nkgrep -- --help` still searches the literal.
+    // so `nkg -- --help` still searches the literal.
     {
         let mut dashdash = false;
         for a in &raw {
@@ -3273,7 +3273,7 @@ fn main() {
             usage();
         }
         let root = PathBuf::from(&raw[1]);
-        let mut idx = String::from(".nkgrep.json");
+        let mut idx = String::from(".nkg.json");
         let mut j = 2;
         while j < raw.len() {
             if raw[j] == "--index" {
@@ -3289,7 +3289,7 @@ fn main() {
         return;
     }
     if raw.first().map(|s| s.as_str()) == Some("serve") {
-        let mut idx = String::from(".nkgrep.json");
+        let mut idx = String::from(".nkg.json");
         let mut port: u16 = 0;
         let mut j = 1;
         while j < raw.len() {
@@ -3345,7 +3345,7 @@ fn main() {
     let mut fixed_strings = false;
     let mut invert_match = false;
     let mut word_regexp = false;
-    // Group separator between disjoint in-file context groups (nkgrep
+    // Group separator between disjoint in-file context groups (nkg
     // extension — rg 15.1.0 has no such flag but prints `--`); empty means
     // no separator lines.
     let mut group_sep = String::from("--");
@@ -3416,7 +3416,7 @@ fn main() {
             match raw[i].parse::<usize>() {
                 Ok(n) => max_count = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad --max-count {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad --max-count {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3424,7 +3424,7 @@ fn main() {
             match raw[i]["--max-count=".len()..].parse::<usize>() {
                 Ok(n) => max_count = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad --max-count {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad --max-count {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3433,7 +3433,7 @@ fn main() {
             match raw[i][2..].parse::<usize>() {
                 Ok(n) => max_count = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad -m {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad -m {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3477,7 +3477,7 @@ fn main() {
             // Parked matcher flags: loud exit 2, never a positional pattern.
             // (`--no-pcre2`/`--no-encoding` below are silent no-ops: the
             // default engine already satisfies them.)
-            eprintln!("nkgrep: {} is not supported", raw[i]);
+            eprintln!("nkg: {} is not supported", raw[i]);
             usage();
         } else if raw[i] == "--no-pcre2" || raw[i] == "--no-encoding" {
             // No-op: requests the default engine/byte behavior we already do.
@@ -3518,7 +3518,7 @@ fn main() {
             match raw[i].parse::<usize>() {
                 Ok(d) => walk_max_depth = Some(d),
                 Err(_) => {
-                    eprintln!("nkgrep: bad --max-depth {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad --max-depth {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3526,7 +3526,7 @@ fn main() {
             match raw[i]["--max-depth=".len()..].parse::<usize>() {
                 Ok(d) => walk_max_depth = Some(d),
                 Err(_) => {
-                    eprintln!("nkgrep: bad --max-depth {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad --max-depth {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3535,7 +3535,7 @@ fn main() {
             match raw[i][2..].parse::<usize>() {
                 Ok(d) => walk_max_depth = Some(d),
                 Err(_) => {
-                    eprintln!("nkgrep: bad -d {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad -d {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3547,7 +3547,7 @@ fn main() {
             match parse_filesize(&raw[i]) {
                 Some(n) => walk_max_filesize = Some(n),
                 None => {
-                    eprintln!("nkgrep: bad --max-filesize {:?}: expected bytes with optional K/M/G suffix", raw[i]);
+                    eprintln!("nkg: bad --max-filesize {:?}: expected bytes with optional K/M/G suffix", raw[i]);
                     usage();
                 }
             }
@@ -3555,7 +3555,7 @@ fn main() {
             match parse_filesize(&raw[i]["--max-filesize=".len()..]) {
                 Some(n) => walk_max_filesize = Some(n),
                 None => {
-                    eprintln!("nkgrep: bad --max-filesize {:?}: expected bytes with optional K/M/G suffix", raw[i]);
+                    eprintln!("nkg: bad --max-filesize {:?}: expected bytes with optional K/M/G suffix", raw[i]);
                     usage();
                 }
             }
@@ -3567,7 +3567,7 @@ fn main() {
             match raw[i].parse::<usize>() {
                 Ok(n) => ctx_a = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad -A {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad -A {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3579,7 +3579,7 @@ fn main() {
             match raw[i].parse::<usize>() {
                 Ok(n) => ctx_b = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad -B {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad -B {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3591,7 +3591,7 @@ fn main() {
             match raw[i].parse::<usize>() {
                 Ok(n) => ctx_c = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad -C {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad -C {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3600,7 +3600,7 @@ fn main() {
                 Ok(n) => ctx_a = Some(n),
                 Err(_) => {
                     eprintln!(
-                        "nkgrep: bad --after-context {:?}: expected a number",
+                        "nkg: bad --after-context {:?}: expected a number",
                         raw[i]
                     );
                     usage();
@@ -3611,7 +3611,7 @@ fn main() {
                 Ok(n) => ctx_b = Some(n),
                 Err(_) => {
                     eprintln!(
-                        "nkgrep: bad --before-context {:?}: expected a number",
+                        "nkg: bad --before-context {:?}: expected a number",
                         raw[i]
                     );
                     usage();
@@ -3621,7 +3621,7 @@ fn main() {
             match raw[i]["--context=".len()..].parse::<usize>() {
                 Ok(n) => ctx_c = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad --context {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad --context {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3640,7 +3640,7 @@ fn main() {
             match raw[i][2..].parse::<usize>() {
                 Ok(n) => ctx_a = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad -A {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad -A {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3649,7 +3649,7 @@ fn main() {
             match raw[i][2..].parse::<usize>() {
                 Ok(n) => ctx_b = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad -B {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad -B {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3658,7 +3658,7 @@ fn main() {
             match raw[i][2..].parse::<usize>() {
                 Ok(n) => ctx_c = Some(n),
                 Err(_) => {
-                    eprintln!("nkgrep: bad -C {:?}: expected a number", raw[i]);
+                    eprintln!("nkg: bad -C {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3706,7 +3706,7 @@ fn main() {
     }
     // `-f` files load here (after usage checks, before dispatch): each line
     // a pattern, interior empties kept (match-all, probed on rg 15.1.0),
-    // `-` reads piped stdin once. A missing file exits 2 with `nkgrep: msg`.
+    // `-` reads piped stdin once. A missing file exits 2 with `nkg: msg`.
     let mut patterns: Vec<String> = patterns_e;
     if !pattern_files.is_empty() {
         let mut stdin_pats: Option<Vec<u8>> = None;
@@ -3716,7 +3716,7 @@ fn main() {
                     let mut b = Vec::new();
                     use std::io::Read;
                     if std::io::stdin().read_to_end(&mut b).is_err() {
-                        eprintln!("nkgrep: stdin: read error");
+                        eprintln!("nkg: stdin: read error");
                         std::process::exit(2);
                     }
                     stdin_pats = Some(b);
@@ -3726,7 +3726,7 @@ fn main() {
                 match std::fs::read(f) {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!("nkgrep: {f}: {e}");
+                        eprintln!("nkg: {f}: {e}");
                         std::process::exit(2);
                     }
                 }
@@ -3763,7 +3763,7 @@ fn main() {
         pos.len() == 1 && !std::io::stdin().is_terminal()
     };
     if stdin_explicit && port.is_some() {
-        eprintln!("nkgrep: stdin search cannot use --port");
+        eprintln!("nkg: stdin search cannot use --port");
         usage();
     }
     if port.is_none() && explicit_patterns && pos.len() != 1 && !stdin_explicit && !stdin_piped {
@@ -3839,7 +3839,7 @@ fn main() {
                         stdout_flush(&mut writer);
                     }
                     eprintln!(
-                        "nkgrep: {matches} matches via serve, {} ms",
+                        "nkg: {matches} matches via serve, {} ms",
                         t0.elapsed().as_millis()
                     );
                     if matches == 0 {
@@ -3867,7 +3867,7 @@ fn main() {
                     stdout_flush(&mut writer);
                 }
                 eprintln!(
-                    "nkgrep: {matches} matches via serve, {} ms",
+                    "nkg: {matches} matches via serve, {} ms",
                     t0.elapsed().as_millis()
                 );
                 if matches == 0 {
@@ -3875,21 +3875,21 @@ fn main() {
                 }
                 return;
             }
-            eprintln!("nkgrep: server unreachable, falling back to local index");
+            eprintln!("nkg: server unreachable, falling back to local index");
         }
     }
     if let Some(p) = port {
         let (raw, matches, bad_regex, ctx_echo) =
             client_query(p, &pattern, top, ignore_case, ctx_before, ctx_after, &mspec);
         if let Some(msg) = bad_regex {
-            eprintln!("nkgrep: bad regex: {msg}");
+            eprintln!("nkg: bad regex: {msg}");
             std::process::exit(2);
         }
         if ctx_on && !ctx_echo {
             // Old daemon ignored the context fields: matches render without
             // carried context (the serve-first path fails over to cold
             // instead — no cold tree exists for an explicit --port).
-            eprintln!("nkgrep: server ignored context flags (old daemon?)");
+            eprintln!("nkg: server ignored context flags (old daemon?)");
         }
         if count_mode || files_only {
             // `-c` / `-l` over --port: same client-side aggregation as the
@@ -3919,7 +3919,7 @@ fn main() {
             stdout_flush(&mut writer);
         }
         eprintln!(
-            "nkgrep: {matches} matches via serve, {} ms",
+            "nkg: {matches} matches via serve, {} ms",
             t0.elapsed().as_millis()
         );
         if matches == 0 {
@@ -3931,7 +3931,7 @@ fn main() {
     let matcher = match build_matcher_opts(&pattern, ignore_case, word_regexp, fixed_single) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("nkgrep: bad regex: {e}");
+            eprintln!("nkg: bad regex: {e}");
             std::process::exit(2);
         }
     };
@@ -3966,7 +3966,7 @@ fn main() {
         {
             use std::io::Read;
             if std::io::stdin().read_to_end(&mut input).is_err() {
-                eprintln!("nkgrep: stdin: read error");
+                eprintln!("nkg: stdin: read error");
                 std::process::exit(2);
             }
         }
@@ -4027,7 +4027,7 @@ fn main() {
             }
         }
         if fallback {
-            eprintln!("nkgrep: no usable literal, falling back to scan");
+            eprintln!("nkg: no usable literal, falling back to scan");
             let paths = walk_files(&root, &walk_opts);
             files = paths.len();
             ptab = paths
@@ -4218,7 +4218,7 @@ fn main() {
         write_aggregates(&mut writer, &rows, files_only);
         stdout_flush(&mut writer);
         eprintln!(
-            "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
         if matches == 0 {
@@ -4277,7 +4277,7 @@ fn main() {
         stdout_write_all(&mut writer, &buf);
         stdout_flush(&mut writer);
         eprintln!(
-            "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
         if matches == 0 {
@@ -4309,7 +4309,7 @@ fn main() {
         stdout_write_all(&mut writer, &buf);
         stdout_flush(&mut writer);
         eprintln!(
-            "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
         if matches == 0 {
@@ -4393,7 +4393,7 @@ fn main() {
     }
     stdout_flush(&mut writer);
     eprintln!(
-        "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+        "nkg: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
         t0.elapsed().as_millis()
     );
     if matches == 0 {
@@ -4448,7 +4448,7 @@ mod literal_tests {
     fn cached_verify_matches_plain() {
         // The fd-cache read path (`Some`) must bank the same hits as the
         // plain path (`None`): byte-identical decoded text, line, and score.
-        let dir = std::env::temp_dir().join(format!("nkgrep_cached_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nkg_cached_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.txt");
         std::fs::write(&a, "needle here\nsecond needle\n").unwrap();
@@ -4521,7 +4521,7 @@ mod literal_tests {
     }
     #[test]
     fn top_zero_indexed_matches_scan_empty() {
-        let dir = std::env::temp_dir().join(format!("nkgrep_top0_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nkg_top0_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.txt");
         let b = dir.join("b.txt");
@@ -4659,7 +4659,7 @@ mod literal_tests {
 
     #[test]
     fn matchflags_invert_and_max_count() {
-        let dir = std::env::temp_dir().join(format!("nkgrep_matchflags_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nkg_matchflags_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.txt");
         std::fs::write(&a, "foo one\nbar two\nfoo three\nbaz four\n").unwrap();
@@ -5004,7 +5004,7 @@ mod context_tests {
         // attach_context must not change decoded hit text: metas remapped
         // into the full-file arena decode exactly what the match-banked
         // arena decoded (CRLF + missing-trailing-newline included).
-        let dir = std::env::temp_dir().join(format!("nkgrep_ctx_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nkg_ctx_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.txt");
         std::fs::write(&f, "first\r\nneedle one\nmiddle\nneedle two").unwrap();
@@ -5101,7 +5101,7 @@ mod git_skip_tests {
     fn git_four_contexts_match_rg() {
         // Probed rg 15.1.0 on this repo: default/hidden/no-ignore all skip
         // `.git`; only --hidden+--no-ignore descends it.
-        let dir = std::env::temp_dir().join(format!("nkgrep_gitskip_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nkg_gitskip_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         plant(&dir);
@@ -5137,7 +5137,7 @@ mod git_skip_tests {
     #[test]
     fn git_explicit_operand_still_searches() {
         // Probed rg: `rg --hidden pat .git` searches the explicit dir.
-        let dir = std::env::temp_dir().join(format!("nkgrep_gitroot_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nkg_gitroot_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();

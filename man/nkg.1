@@ -1,19 +1,19 @@
-.TH NKGREP 1 "September 2026" "nkgrep 0.1.0" "User Commands"
+.TH NKG 1 "September 2026" "nkg 0.1.0" "User Commands"
 .SH NAME
-nkgrep \- ranked trigram code search
+nkg \- ranked trigram code search
 .SH SYNOPSIS
-.B nkgrep index
+.B nkg index
 .I path
 .RB [ \-\-index
 .IR FILE ]
 .br
-.B nkgrep serve
+.B nkg serve
 .B \-\-index
 .I FILE
 .B \-\-port
 .I PORT
 .br
-.B nkgrep
+.B nkg
 .RB [ \-i ]
 .RB [ \-q ]
 .RB [ \-v ]
@@ -57,13 +57,13 @@ nkgrep \- ranked trigram code search
 .I pattern
 .RI [ path ]
 .br
-.B nkgrep
+.B nkg
 .RB [ options ]
 .B \-\-
 .I pattern
 .B \-
 .SH DESCRIPTION
-.B nkgrep
+.B nkg
 searches code with a trigram index that finds candidate files, then a
 best-first verify step ranks them. On covered query classes (plain
 literals) every result set equals ripgrep.
@@ -80,7 +80,7 @@ A diagnostics line always goes to stderr:
 .PP
 .RS
 .nf
-nkgrep: 2 matches in 2 files, 2 ms (index load 0 ms)
+nkg: 2 matches in 2 files, 2 ms (index load 0 ms)
 .fi
 .RE
 .PP
@@ -344,7 +344,7 @@ and
 use
 .I FILE
 as the index file (default:
-.BR .nkgrep.json ).
+.BR .nkg.json ).
 .TP
 .BR \-h ", " \-\-help
 Print help to stdout and exit 0.
@@ -396,39 +396,39 @@ value, missing
 file, unreadable or stale index, unresolvable root,
 bind/connect failure, or other I/O error. Usage errors print the
 usage text to stderr; bad patterns and values report as
-.BR "nkgrep: " msg .
+.BR "nkg: " msg .
 .SH EXAMPLES
 .PP
 .RS
 .nf
-nkgrep index . \-\-index nkgrep.idx.json
-nkgrep \-\- 'pattern' src
-nkgrep \-i \-\- 'hello.*world' .
-nkgrep \-\-top 20 \-\- 'TODO|FIXME' .
-nkgrep \-c \-\- 'pattern' src
-nkgrep \-l \-\- 'pattern' src
-nkgrep \-q \-\- 'pattern' src && echo found
-printf 'hello piped\\n' | nkgrep \-\- 'hello'
-nkgrep \-e 'TODO' \-e 'FIXME' src
-nkgrep \-w \-\- 'word' src
-nkgrep \-\-format text \-\- 'pattern' src
-nkgrep \-\-format text \-\-color=always \-\- 'pattern' src | cat
-nkgrep \-A 2 \-B 1 \-\- 'pattern' src
-nkgrep \-C 1 \-\-group-separator '' \-\- 'pattern' src
-nkgrep \-g '*.rs' \-\- 'pattern' src
-nkgrep \-g '!*.min.js' \-\- 'pattern' src
-nkgrep \-\-hidden \-\- 'pattern' src
-nkgrep \-\-no-ignore \-\- 'pattern' src
-nkgrep \-L \-\- 'pattern' src
-nkgrep \-d 2 \-\- 'pattern' src
-nkgrep \-\-max-filesize 1M \-\- 'pattern' src
-nkgrep \-F \-\- 'literal (parens)' src
-nkgrep \-v \-\- 'pattern' src
-nkgrep \-m 5 \-\- 'pattern' src
-nkgrep \-\- 'pattern' \- < input.txt
-nkgrep serve \-\-index nkgrep.idx.json \-\-port 17632 &
-nkgrep \-\-port 17632 \-\-top 20 \-\- 'pattern'
-nkgrep \-\-use-index nkgrep.idx.json \-\- 'pattern' .
+nkg index . \-\-index nkg.idx.json
+nkg \-\- 'pattern' src
+nkg \-i \-\- 'hello.*world' .
+nkg \-\-top 20 \-\- 'TODO|FIXME' .
+nkg \-c \-\- 'pattern' src
+nkg \-l \-\- 'pattern' src
+nkg \-q \-\- 'pattern' src && echo found
+printf 'hello piped\\n' | nkg \-\- 'hello'
+nkg \-e 'TODO' \-e 'FIXME' src
+nkg \-w \-\- 'word' src
+nkg \-\-format text \-\- 'pattern' src
+nkg \-\-format text \-\-color=always \-\- 'pattern' src | cat
+nkg \-A 2 \-B 1 \-\- 'pattern' src
+nkg \-C 1 \-\-group-separator '' \-\- 'pattern' src
+nkg \-g '*.rs' \-\- 'pattern' src
+nkg \-g '!*.min.js' \-\- 'pattern' src
+nkg \-\-hidden \-\- 'pattern' src
+nkg \-\-no-ignore \-\- 'pattern' src
+nkg \-L \-\- 'pattern' src
+nkg \-d 2 \-\- 'pattern' src
+nkg \-\-max-filesize 1M \-\- 'pattern' src
+nkg \-F \-\- 'literal (parens)' src
+nkg \-v \-\- 'pattern' src
+nkg \-m 5 \-\- 'pattern' src
+nkg \-\- 'pattern' \- < input.txt
+nkg serve \-\-index nkg.idx.json \-\-port 17632 &
+nkg \-\-port 17632 \-\-top 20 \-\- 'pattern'
+nkg \-\-use-index nkg.idx.json \-\- 'pattern' .
 .fi
 .RE
 .SH SEE ALSO
