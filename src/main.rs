@@ -405,6 +405,22 @@ fn write_index_file(idx_path: &str, bytes: &[u8]) {
     }
 }
 
+/// Loud index refusal shared by every index loader (exit 2): `detail` is
+/// the parenthesized cause (`"old format"`, `"truncated binary"`). One
+/// short `eprintln!` site keeps the stderr bytes identical at every call
+/// while fitting on a single line under every rustfmt version.
+fn refuse_index(idx_path: &str, detail: &str, why: &dyn std::fmt::Display) -> ! {
+    eprintln!("nkg: unreadable index {idx_path} ({detail}? rebuild with `nkg index`): {why}");
+    std::process::exit(2);
+}
+
+/// Loud refusal for a stale binary index magic (exit 2), split out of
+/// `parse_index_auto` for the same single-line-fits-everywhere reason.
+fn refuse_stale_index(idx_path: &str) -> ! {
+    eprintln!("nkg: stale index format {idx_path} (expected NKGREP02): rebuild with `nkg index`");
+    std::process::exit(2);
+}
+
 /// Parse index JSON; old absolute-path indexes (missing `root`) and corrupt
 /// files are refused loudly instead of silently matching nothing.
 fn parse_index(idx_path: &str, data: &str) -> Index {
@@ -421,10 +437,7 @@ fn parse_index(idx_path: &str, data: &str) -> Index {
             }
             idx
         }
-        Err(e) => {
-            eprintln!("nkg: unreadable index {idx_path} (old format? rebuild with `nkg index`): {e}");
-            std::process::exit(2);
-        }
+        Err(e) => refuse_index(idx_path, "old format", &e),
     }
 }
 /// Binary index magic (8 B) + plain-LE linear layout, no codec (NKGREP02):
@@ -472,8 +485,7 @@ fn encode_index_bin(idx: &Index) -> Vec<u8> {
 
 fn parse_index_bin(idx_path: &str, data: &[u8]) -> Index {
     let refuse = |why: &str| -> ! {
-        eprintln!("nkg: unreadable index {idx_path} (truncated binary? rebuild with `nkg index`): {why}");
-        std::process::exit(2);
+        refuse_index(idx_path, "truncated binary", &why);
     };
     let mut cur = BIN_MAGIC.len();
     let take = |cur: &mut usize, n: usize| -> &[u8] {
@@ -602,15 +614,11 @@ fn parse_index_auto(idx_path: &str, data: &[u8]) -> Index {
         return parse_index_bin(idx_path, data);
     }
     if data.starts_with(OLD_BIN_MAGIC) || data.starts_with(b"NKGREP") {
-        eprintln!("nkg: stale index format {idx_path} (expected NKGREP02): rebuild with `nkg index`");
-        std::process::exit(2);
+        refuse_stale_index(idx_path);
     }
     match std::str::from_utf8(data) {
         Ok(s) => parse_index(idx_path, s),
-        Err(e) => {
-            eprintln!("nkg: unreadable index {idx_path} (old format? rebuild with `nkg index`): {e}");
-            std::process::exit(2);
-        }
+        Err(e) => refuse_index(idx_path, "old format", &e),
     }
 }
 /// Load an index for a query rooted at `query_root`: refuse (exit 2) on
@@ -680,6 +688,14 @@ struct WalkOptions {
     max_depth: Option<usize>,
     max_filesize: Option<u64>,
     globs: Vec<String>,
+}
+
+/// Loud refusal for an unparsable `--max-filesize` value (exit 2 via
+/// `usage`): keeps the long `eprintln!` at a shallow indent so it fits on
+/// one line under every rustfmt version; stderr bytes are unchanged.
+fn refuse_bad_filesize(arg: &str) -> ! {
+    eprintln!("nkg: bad --max-filesize {arg:?}: expected bytes with optional K/M/G suffix");
+    usage();
 }
 
 /// `--max-filesize` human size: plain bytes or a K/M/G suffix (powers of
@@ -1534,10 +1550,7 @@ fn bump_nofile_for_cache(want_files: usize) {
         }
         let mut after: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut after as *mut _) == 0 {
-            eprintln!(
-                "nkg: NOFILE cur={} max={}",
-                after.rlim_cur, after.rlim_max
-            );
+            eprintln!("nkg: NOFILE cur={} max={}", after.rlim_cur, after.rlim_max);
         }
     }
 }
@@ -3546,18 +3559,12 @@ fn main() {
             }
             match parse_filesize(&raw[i]) {
                 Some(n) => walk_max_filesize = Some(n),
-                None => {
-                    eprintln!("nkg: bad --max-filesize {:?}: expected bytes with optional K/M/G suffix", raw[i]);
-                    usage();
-                }
+                None => refuse_bad_filesize(&raw[i]),
             }
         } else if raw[i].starts_with("--max-filesize=") {
             match parse_filesize(&raw[i]["--max-filesize=".len()..]) {
                 Some(n) => walk_max_filesize = Some(n),
-                None => {
-                    eprintln!("nkg: bad --max-filesize {:?}: expected bytes with optional K/M/G suffix", raw[i]);
-                    usage();
-                }
+                None => refuse_bad_filesize(&raw[i]),
             }
         } else if raw[i] == "-A" || raw[i] == "--after-context" {
             i += 1;
@@ -3599,10 +3606,7 @@ fn main() {
             match raw[i]["--after-context=".len()..].parse::<usize>() {
                 Ok(n) => ctx_a = Some(n),
                 Err(_) => {
-                    eprintln!(
-                        "nkg: bad --after-context {:?}: expected a number",
-                        raw[i]
-                    );
+                    eprintln!("nkg: bad --after-context {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
@@ -3610,10 +3614,7 @@ fn main() {
             match raw[i]["--before-context=".len()..].parse::<usize>() {
                 Ok(n) => ctx_b = Some(n),
                 Err(_) => {
-                    eprintln!(
-                        "nkg: bad --before-context {:?}: expected a number",
-                        raw[i]
-                    );
+                    eprintln!("nkg: bad --before-context {:?}: expected a number", raw[i]);
                     usage();
                 }
             }
