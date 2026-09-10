@@ -315,20 +315,19 @@ def plot(table):
 SIMPLE_LABELS = {
     "nk-scan": "scan",
     "nk-cold-bin": "indexed",
-    "nk-cold-json": "indexed top-20",
+    "nk-cold-json": "indexed",
     "nk-hot": "serve",
     "tgrep": "tgrep",
     "rg": "rg",
-    "rg-full": "rg full",
+    "rg-full": "rg",
     "ugrep": "ugrep",
-    "ugrep-full": "ugrep full",
+    "ugrep-full": "ugrep",
 }
 
 
 def plot_simple(table):
-    """Minimal public chart: plain labels, value bars, no footnotes."""
+    """Minimal public chart: plain labels, value bars."""
     import matplotlib
-
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -341,8 +340,8 @@ def plot_simple(table):
         for i, s in enumerate(series):
             v = table[group][s]
             x = gi + (i - (n - 1) / 2) * width
-            label = SIMPLE_LABELS[s] if s not in seen else None
-            seen.add(s)
+            label = SIMPLE_LABELS[s] if SIMPLE_LABELS[s] not in seen else None
+            seen.add(SIMPLE_LABELS[s])
             b = ax.bar(x, v, width=width * 0.92, label=label, color=COLORS[s])
             ax.text(
                 b[0].get_x() + b[0].get_width() / 2,
@@ -356,8 +355,8 @@ def plot_simple(table):
     ax.set_xticklabels(GROUPS)
     ax.set_ylabel("median ms")
     ax.set_title("Search latency (median ms, lower is better)")
-    ax.legend(title="tool", fontsize=7)
-    top = max(v for g in GROUPS for v in table[g].values()) * 1.22
+    top = max(v for g in GROUPS for v in table[g].values()) * 1.32
+    ax.legend(fontsize=7)
     ax.set_ylim(0, top)
     fig.tight_layout()
     fig.savefig(PUBLIC_PNG, dpi=150)
