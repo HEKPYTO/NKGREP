@@ -3,6 +3,7 @@
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::Searcher;
 use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
+use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,12 @@ struct FileHits {
     pid: u32,
     arena: Vec<u8>,
     metas: Vec<HitMeta>,
+    /// Context line table (ContextLines): byte offset of each 1-based line
+    /// start over `arena`. Empty unless verified with context>0, in which
+    /// case the arena holds the full file bytes verbatim (one copy — match
+    /// bytes are slices of it, never duplicated) and every meta points into
+    /// it. The no-context path never fills it, so default output is untouched.
+    line_starts: Vec<u32>,
 }
 
 struct ColCollector {
@@ -68,13 +75,34 @@ impl Sink for ColCollector {
     }
 }
 
-/// Columnar verify: same TLS Searcher + 64 KB buffer + search_slice core as
-/// the serve-side cached verify, but the sink banks verbatim match bytes.
+/// Frozen no-context wrapper: the quiet paths and the MatchFlags invert
+/// contract call this signature; the body lives in `verify_one_raw_ctx`
+/// with `before = after = 0`, so the default path is untouched.
 fn verify_one_raw(
     pid: u32,
     path: &str,
     matcher: &RegexMatcher,
     file_score: f64,
+) -> Option<FileHits> {
+    verify_one_raw_ctx(pid, path, matcher, file_score, 0, 0, false)
+}
+
+/// Columnar verify with context attach: same TLS Searcher + 64 KB buffer +
+/// search_slice core as the serve-side cached verify, but the sink banks
+/// verbatim match bytes. When `before`/`after` is nonzero the file's line
+/// table is attached over the same arena (see `attach_context`); the hit
+/// set, scores, and rank order are identical either way. `invert` builds a
+/// local inverted searcher per file (non-matching lines banked instead);
+/// the TLS default searcher is untouched, so invert=false is byte-identical
+/// to the old path.
+fn verify_one_raw_ctx(
+    pid: u32,
+    path: &str,
+    matcher: &RegexMatcher,
+    file_score: f64,
+    before: usize,
+    after: usize,
+    invert: bool,
 ) -> Option<FileHits> {
     use std::cell::RefCell;
     thread_local! {
@@ -94,7 +122,20 @@ fn verify_one_raw(
         BUF.with(|b| {
             let mut buf = b.borrow_mut();
             buf.clear();
-            let mut searcher = s.borrow_mut();
+            // Inverted search needs `invert_match(true)`; the TLS searcher is
+            // fixed-config, so invert builds a local searcher per file (no
+            // TLS pair to keep in sync; invert is off the hot default path).
+            // The `match` reads the initial None on the default path, so no
+            // dead assignment (warnings are denied).
+            let mut local: Option<Searcher> = None;
+            let mut normal = s.borrow_mut();
+            if invert {
+                local = Some(SearcherBuilder::new().invert_match(true).build());
+            }
+            let searcher: &mut Searcher = match local.as_mut() {
+                Some(inv) => inv,
+                None => &mut normal,
+            };
             (|| -> std::io::Result<bool> {
                 use std::io::Read;
                 std::fs::File::open(path)?.read_to_end(&mut buf)?;
@@ -115,18 +156,25 @@ fn verify_one_raw(
         })
     });
     if ok && !sink.metas.is_empty() {
-        Some(FileHits {
+        let mut fh = FileHits {
             pid,
             arena: sink.arena,
             metas: sink.metas,
-        })
+            line_starts: vec![],
+        };
+        if before > 0 || after > 0 {
+            // The TLS buffer still holds this file's bytes (cleared only on
+            // the next call); attach copies them into the arena — no extra
+            // read, one copy, no duplicate storage.
+            BUF.with(|b| attach_context(&mut fh, &b.borrow()));
+        }
+        Some(fh)
     } else {
         None
     }
 }
-/// Serve-side columnar verify: same TLS Searcher + 64 KB buffer +
-/// search_slice core and verbatim-banked sink as `verify_one_raw`, but the
-/// file bytes come through the daemon fd cache (`read_verify_bytes`).
+/// Frozen no-context wrapper over `verify_one_raw_cached_ctx` (same
+/// wrapper contract as `verify_one_raw`).
 fn verify_one_raw_cached(
     pid: u32,
     path: &str,
@@ -134,6 +182,47 @@ fn verify_one_raw_cached(
     file_score: f64,
     fdc: Option<(&FdCache, u32)>,
 ) -> Option<FileHits> {
+    verify_one_raw_cached_ctx(CachedVerify {
+        pid,
+        path,
+        matcher,
+        file_score,
+        before: 0,
+        after: 0,
+        fdc,
+        invert: false,
+    })
+}
+
+/// Serve-side cached verify arguments, bundled so the entry stays under
+/// clippy's argument-count limit. One struct, zero behavior change.
+struct CachedVerify<'a> {
+    pid: u32,
+    path: &'a str,
+    matcher: &'a RegexMatcher,
+    file_score: f64,
+    before: usize,
+    after: usize,
+    fdc: Option<(&'a FdCache, u32)>,
+    invert: bool,
+}
+
+/// Serve-side columnar verify with context attach: same TLS Searcher +
+/// 64 KB buffer + search_slice core and verbatim-banked sink as
+/// `verify_one_raw_ctx`, but the file bytes come through the daemon fd
+/// cache (`read_verify_bytes`). Context attach is the same post-pass over
+/// the surviving hits; the hit set is identical either way.
+fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
+    let CachedVerify {
+        pid,
+        path,
+        matcher,
+        file_score,
+        before,
+        after,
+        fdc,
+        invert,
+    } = args;
     use std::cell::RefCell;
     thread_local! {
         static SEARCHER: RefCell<Searcher> = RefCell::new(SearcherBuilder::new().build());
@@ -152,7 +241,16 @@ fn verify_one_raw_cached(
         BUF.with(|b| {
             let mut buf = b.borrow_mut();
             buf.clear();
-            let mut searcher = s.borrow_mut();
+            // Same local-inverted-searcher contract as the cold twin.
+            let mut local: Option<Searcher> = None;
+            let mut normal = s.borrow_mut();
+            if invert {
+                local = Some(SearcherBuilder::new().invert_match(true).build());
+            }
+            let searcher: &mut Searcher = match local.as_mut() {
+                Some(inv) => inv,
+                None => &mut normal,
+            };
             (|| -> std::io::Result<bool> {
                 read_verify_bytes(fdc, path, &mut buf, false)?;
                 // Twin of the `verify_one_raw` early exit: empty files hold
@@ -171,11 +269,18 @@ fn verify_one_raw_cached(
         })
     });
     if ok && !sink.metas.is_empty() {
-        Some(FileHits {
+        let mut fh = FileHits {
             pid,
             arena: sink.arena,
             metas: sink.metas,
-        })
+            line_starts: vec![],
+        };
+        if before > 0 || after > 0 {
+            // Same TLS-buffer reuse as the cold twin: the buffer still holds
+            // this file's bytes; attach copies them into the arena.
+            BUF.with(|b| attach_context(&mut fh, &b.borrow()));
+        }
+        Some(fh)
     } else {
         None
     }
@@ -464,17 +569,107 @@ fn load_index_for_serve(idx_path: &str) -> Index {
     idx
 }
 
-fn walk_files(root: &PathBuf) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = vec![];
-    for entry in WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+/// Traversal filters (rg-compatible shapes): `--hidden`, `--no-ignore`,
+/// `-L/--follow`, `-g/--glob`, `-d/--max-depth`, `--max-filesize`.
+/// Default holds historical behavior: hidden skipped, ignore files
+/// respected, links unfollowed, unbounded depth/size, no globs.
+#[derive(Default)]
+struct WalkOptions {
+    hidden: bool,
+    no_ignore: bool,
+    follow: bool,
+    max_depth: Option<usize>,
+    max_filesize: Option<u64>,
+    globs: Vec<String>,
+}
+
+/// `--max-filesize` human size: plain bytes or a K/M/G suffix (powers of
+/// 1024, either case — probed live against rg 15.1.0: `1K` keeps a 1010 B
+/// file). None on garbage; the caller exits 2 like rg's `invalid size`.
+fn parse_filesize(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = match s.chars().last().unwrap() {
+        'K' | 'k' => (&s[..s.len() - 1], 1024u64),
+        'M' | 'm' => (&s[..s.len() - 1], 1024 * 1024),
+        'G' | 'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        c if c.is_ascii_digit() => (s, 1),
+        _ => return None,
+    };
+    num.parse::<u64>().ok()?.checked_mul(mult)
+}
+
+fn walk_files(root: &PathBuf, opts: &WalkOptions) -> Vec<PathBuf> {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(!opts.hidden)
+        .git_ignore(!opts.no_ignore)
+        .ignore(!opts.no_ignore)
+        .git_global(!opts.no_ignore)
+        .git_exclude(!opts.no_ignore)
         .parents(true)
         .require_git(true)
-        .build()
-    {
+        .follow_links(opts.follow);
+    if let Some(d) = opts.max_depth {
+        builder.max_depth(Some(d));
+    }
+    // -g/--glob runs in `filter_entry`, NOT `builder.overrides`: probed rg
+    // 15.1.0 keeps gitignore above -g whitelists (a gitignored file matching
+    // `-g '*.txt'` is still skipped), while builder-level overrides would
+    // whitelist it past gitignore ("overrides have the highest precedence").
+    // The walker's own ignore machinery runs first, so gitignore still wins
+    // and the Override only further restricts. Same matcher, same input
+    // (leading `./` stripped exactly as dir.rs feeds it): bare globs
+    // whitelist, `!` globs exclude, neg-only keeps everything else, dirs
+    // never prune traversal on a non-match.
+    let mut glob_matcher: Option<ignore::overrides::Override> = None;
+    if !opts.globs.is_empty() {
+        let mut ob = OverrideBuilder::new(root);
+        for g in &opts.globs {
+            if let Err(e) = ob.add(g) {
+                eprintln!("nkgrep: bad --glob {g:?}: {e}");
+                std::process::exit(2);
+            }
+        }
+        match ob.build() {
+            Ok(ov) => glob_matcher = Some(ov),
+            Err(e) => {
+                eprintln!("nkgrep: bad --glob: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if glob_matcher.is_some() || opts.max_filesize.is_some() {
+        let root_path = root.clone();
+        let max_opt = opts.max_filesize;
+        builder.filter_entry(move |e| {
+            // Explicit file operands bypass traversal filters (probed rg:
+            // -g, -d, hidden, and --max-filesize all still search them).
+            if e.path() == root_path {
+                return true;
+            }
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if let Some(max) = max_opt {
+                // Files only: dir metadata lengths are filesystem noise —
+                // filtering them would prune whole subtrees (probed: rg
+                // keeps subdir files under --max-filesize 100).
+                if !is_dir && e.metadata().map(|m| m.len() > max).unwrap_or(false) {
+                    return false;
+                }
+            }
+            match &glob_matcher {
+                Some(ov) => {
+                    let p = e.path();
+                    let rel = p.strip_prefix("./").unwrap_or(p);
+                    !ov.matched(rel, is_dir).is_ignore()
+                }
+                None => true,
+            }
+        });
+    }
+    let mut paths: Vec<PathBuf> = vec![];
+    for entry in builder.build() {
         match entry {
             Ok(e) => {
                 if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
@@ -498,7 +693,15 @@ const STDIN_LABEL: &str = "(standard input)";
 /// hold no matches, mirroring the file path (binaries are skipped on both
 /// index and verify sides). Own TLS Searcher: no shared fn is changed.
 /// Scores fold path_bonus 0 / depth 0; the label comes from the ptab.
+/// Frozen stdin wrapper (same wrapper contract as `verify_one_raw`): the
+/// body lives in `search_stdin_raw_inv` with `invert = false`.
 fn search_stdin_raw(buf: &[u8], matcher: &RegexMatcher) -> Option<FileHits> {
+    search_stdin_raw_inv(buf, matcher, false)
+}
+
+/// Stdin slice-search with MatchFlags invert: same contract as
+/// `verify_one_raw_ctx`'s invert (local inverted searcher per call).
+fn search_stdin_raw_inv(buf: &[u8], matcher: &RegexMatcher, invert: bool) -> Option<FileHits> {
     use std::cell::RefCell;
     thread_local! {
         static SEARCHER: RefCell<Searcher> = RefCell::new(SearcherBuilder::new().build());
@@ -516,7 +719,15 @@ fn search_stdin_raw(buf: &[u8], matcher: &RegexMatcher) -> Option<FileHits> {
         depth_penalty: 0.0,
     };
     let ok = SEARCHER.with(|s| {
-        let mut searcher = s.borrow_mut();
+        let mut local: Option<Searcher> = None;
+        let mut normal = s.borrow_mut();
+        if invert {
+            local = Some(SearcherBuilder::new().invert_match(true).build());
+        }
+        let searcher: &mut Searcher = match local.as_mut() {
+            Some(inv) => inv,
+            None => &mut normal,
+        };
         searcher.search_slice(matcher, buf, &mut sink).is_ok()
     });
     if ok && !sink.metas.is_empty() {
@@ -524,6 +735,7 @@ fn search_stdin_raw(buf: &[u8], matcher: &RegexMatcher) -> Option<FileHits> {
             pid: 0,
             arena: sink.arena,
             metas: sink.metas,
+            line_starts: vec![],
         })
     } else {
         None
@@ -533,6 +745,8 @@ fn search_stdin_raw(buf: &[u8], matcher: &RegexMatcher) -> Option<FileHits> {
 /// Sorted per-file surviving-hit counts from served JSON lines (the --port /
 /// serve-first paths; --top is already applied server-side). Unparseable
 /// lines are skipped; the wire contract guarantees one object per line.
+/// Carried context lines (`"ctx":true`) never count — `-c`/`-l` aggregate
+/// hits, mirroring the cold path (which counts `ord`, context ignored).
 fn served_path_counts(raw: &[u8]) -> Vec<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for line in raw.split(|&b| b == b'\n') {
@@ -540,6 +754,9 @@ fn served_path_counts(raw: &[u8]) -> Vec<(String, usize)> {
             continue;
         }
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+            if v.get("ctx").and_then(|c| c.as_bool()).unwrap_or(false) {
+                continue;
+            }
             if let Some(p) = v.get("path").and_then(|p| p.as_str()) {
                 *counts.entry(p.to_string()).or_default() += 1;
             }
@@ -846,13 +1063,211 @@ fn is_pure_literal(pattern: &str) -> bool {
     let runs = literal_runs(&branches[0]);
     runs.len() == 1 && runs[0].len() == pattern.len()
 }
+/// MatchFlags (-m/-e/-f/-F/-v/-w): multi-pattern + matcher-flag layer.
+/// Shapes probed against rg 15.1.0; deviations noted inline.
+///
+/// Patterns arrive as a list (positional, `-e` repeats, `-f` lines). The
+/// matcher sees one alternation; the prefilter sees per-pattern branches.
+fn regex_escape_into(out: &mut String, s: &str) {
+    // Escape set for regex-syntax: every other byte (incl. multibyte UTF-8)
+    // passes through verbatim.
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\\' | '.'
+                | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '|'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '^'
+                | '$'
+                | '#'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+}
+
+/// Combine CLI patterns into one alternation. Every branch is wrapped in
+/// `(?:...)` so inline flags (`(?i)`) stay scoped to their own pattern —
+/// rg 15.1.0 does not leak flags across `-e` (probed) — and an inner `|`
+/// can never merge branches (a naive join would split `(a|b)|c` into
+/// `(a`, `b)`, `c`, requiring `a` of every match: unsound). Fixed mode
+/// pre-escapes each pattern so the combined string stays a plain regex
+/// alternation (`fixed_strings` would treat the separators literally).
+fn combine_patterns(patterns: &[String], fixed: bool) -> String {
+    // A lone pattern needs no alternation: return it verbatim. (Wrapping a
+    // single fixed pattern in `(?:...)` would make `fixed_strings` search
+    // for the wrappers literally.)
+    if patterns.len() == 1 {
+        return patterns[0].clone();
+    }
+    let mut out = String::new();
+    for (k, p) in patterns.iter().enumerate() {
+        if k > 0 {
+            out.push('|');
+        }
+        out.push_str("(?:");
+        if fixed {
+            regex_escape_into(&mut out, p);
+        } else {
+            out.push_str(p);
+        }
+        out.push(')');
+    }
+    out
+}
+
+/// Extended matcher entry: `word` adds word-boundary matching and keeps the
+/// Unicode tables on (the ASCII `unicode(false)` gate would shrink
+/// boundaries to ASCII, but rg 15.1.0 treats é as a word char — probed:
+/// `-w foo` skips `fooé` yet takes `foo-bar`); `fixed` treats the pattern
+/// literally (callers pass it only for a single pattern; multi-pattern
+/// fixed arrives pre-escaped via `combine_patterns`). With both unset this
+/// delegates to `build_matcher` exactly, so the default path is untouched
+/// by construction.
+fn build_matcher_opts(
+    pattern: &str,
+    case_insensitive: bool,
+    word: bool,
+    fixed: bool,
+) -> Result<RegexMatcher, grep_regex::Error> {
+    if !word && !fixed {
+        return build_matcher(pattern, case_insensitive);
+    }
+    let ascii_only = pattern.is_ascii() && !case_insensitive && !word;
+    let mut b = RegexMatcherBuilder::new();
+    if case_insensitive {
+        b.case_insensitive(true);
+    }
+    if word {
+        b.word(true);
+    }
+    if ascii_only {
+        b.unicode(false);
+        b.line_terminator(Some(b'\n'));
+    }
+    if fixed {
+        b.fixed_strings(true);
+    }
+    if let Ok(m) = b.build(pattern) {
+        return Ok(m);
+    }
+    // Same less-gated retries as `build_matcher`, each keeping word+fixed
+    // so a retry never silently drops them; the final fallback keeps them
+    // too, and a truly bad pattern still returns Err (exit 2).
+    if ascii_only {
+        let mut bz = RegexMatcherBuilder::new();
+        bz.unicode(false);
+        if word {
+            bz.word(true);
+        }
+        if fixed {
+            bz.fixed_strings(true);
+        }
+        if let Ok(m) = bz.build(pattern) {
+            return Ok(m);
+        }
+    }
+    if case_insensitive {
+        let mut bi = RegexMatcherBuilder::new();
+        bi.case_insensitive(true);
+        if word {
+            bi.word(true);
+        }
+        if fixed {
+            bi.fixed_strings(true);
+        }
+        if let Ok(m) = bi.build(pattern) {
+            return Ok(m);
+        }
+    }
+    let mut bf = RegexMatcherBuilder::new();
+    if word {
+        bf.word(true);
+    }
+    if fixed {
+        bf.fixed_strings(true);
+    }
+    bf.build(pattern)
+}
+
+/// Multi-pattern prefilter branches. Single non-fixed delegates to
+/// `query_grams` exactly (default path identical). Fixed patterns are
+/// literals: every 3-byte window is required (a literal matches only text
+/// containing it whole), so short (<3 B) or empty patterns yield None
+/// (full scan — an empty pattern matches every line). Multi-pattern ORs
+/// every pattern's branches; any pattern without usable grams forces None,
+/// since it can match files lacking the other patterns' grams.
+fn query_grams_multi(patterns: &[String], fixed: bool) -> Option<Vec<Vec<u32>>> {
+    if !fixed && patterns.len() == 1 {
+        return query_grams(&patterns[0]);
+    }
+    let mut ors: Vec<Vec<u32>> = vec![];
+    for p in patterns {
+        if fixed {
+            let bytes = p.as_bytes();
+            if bytes.len() < 3 {
+                return None;
+            }
+            let mut set = HashSet::new();
+            for w in bytes.windows(3) {
+                set.insert(gram_pack(&[w[0], w[1], w[2]]));
+            }
+            ors.push(set.into_iter().collect());
+        } else {
+            let mut branches = query_grams(p)?;
+            ors.append(&mut branches);
+        }
+    }
+    Some(ors)
+}
+
+/// Per-file cap (`-m`): keep the first m banked hits per file. Bank order is
+/// file order, so this equals early exit with the same survivors; it runs
+/// after verify (no sink change) and before rank/top/count/emit, matching
+/// rg's capped `-c` shape. `None` (no `-m`) is a no-op.
+fn apply_max_count(hits: &mut [FileHits], max_count: Option<usize>) {
+    if let Some(m) = max_count {
+        for fh in hits.iter_mut() {
+            fh.metas.truncate(m);
+        }
+    }
+}
+
+/// Split `-f` bytes into patterns: one per `\n`, a single trailing `\r`
+/// stripped per line, interior empty lines kept (rg 15.1.0: an empty `-f`
+/// line matches every line — probed), the trailing-newline artifact
+/// dropped, and a fully empty file yielding zero patterns (rg: `-f` with
+/// no patterns matches nothing — probed).
+fn split_pattern_lines(data: &[u8]) -> Vec<String> {
+    if data.is_empty() {
+        return vec![];
+    }
+    let text = String::from_utf8_lossy(data);
+    let mut out: Vec<String> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+        .collect();
+    if text.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
 
 fn cmd_index(root: &PathBuf, idx_path: &str) {
     let t0 = Instant::now();
     let root_canon = canon_root(root);
     let (root_dev, root_ino) = root_cookie(&root_canon);
     let root_fp = root_canon.to_string_lossy().into_owned();
-    let paths = walk_files(root);
+    let paths = walk_files(root, &WalkOptions::default());
     let entries: Vec<(String, HashSet<[u8; 3]>)> = paths
         .par_iter()
         .filter_map(|p| {
@@ -1162,18 +1577,60 @@ struct Query {
     /// daemons interop — an old daemon just searches case-sensitively.
     #[serde(default)]
     ignore_case: bool,
+    /// `-B`/`-C` over serve: 0 on old clients (serde default), so an old
+    /// client gets plain hits from a new daemon and an old daemon (which
+    /// ignores the unknown fields) serves plain hits to a new client.
+    #[serde(default)]
+    before: usize,
+    /// `-A`/`-C` over serve: same interop contract as `before`.
+    #[serde(default)]
+    after: usize,
+    /// MatchFlags over serve (all serde-defaulted: old clients omit them and
+    /// get today's behavior from a new daemon; old daemons ignore them):
+    /// `-w` word bounds, `-v` invert, `-m` per-file cap, the pattern list
+    /// for grams/bonus (`patterns` empty = legacy single `pattern`), and
+    /// whether that list is literal (`-F`).
+    #[serde(default)]
+    word: bool,
+    #[serde(default)]
+    invert: bool,
+    #[serde(default)]
+    max_count: Option<usize>,
+    #[serde(default)]
+    patterns: Vec<String>,
+    #[serde(default)]
+    fixed: bool,
 }
 
 /// Ranked candidate file ids with scores. None = no usable literal.
 fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
     let ors = query_grams(pattern)?;
+    let (order, scores) = rank_ors(idx, &ors, &|p| p.contains(pattern));
+    Some(
+        order
+            .into_iter()
+            .map(|id| (id, scores[id as usize]))
+            .collect(),
+    )
+}
+
+/// Shared rank core (intersect/union/idf scoring, path bonus, depth penalty,
+/// descending file-score order). `ranked_candidates` and the cold indexed
+/// path both run it; the comparator and scoring are verbatim the old bodies.
+/// Returns ordered candidate ids plus per-file scores with bonus/depth
+/// folded (the cold early-exit proof reads `scores` by file id).
+fn rank_ors(
+    idx: &Index,
+    ors: &[Vec<u32>],
+    path_bonus: &dyn Fn(&str) -> bool,
+) -> (Vec<u32>, Vec<f64>) {
     let n = idx.files.len() as f64;
     // (postings, idf weight) per gram occurrence, in query order, for
     // deferred exact scoring of survivors only.
     let mut occ: Vec<(&[u32], f64)> = vec![];
     let mut cand: Vec<u32> = vec![];
     let mut tmp: Vec<u32> = vec![];
-    for ands in &ors {
+    for ands in ors {
         let mut lists: Vec<&[u32]> = Vec::with_capacity(ands.len());
         let mut empty = false;
         for g in ands {
@@ -1207,17 +1664,19 @@ fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
             }
         }
     }
-    let mut order: Vec<(u32, f64)> = cand
-        .into_iter()
-        .map(|id| {
-            let p = &idx.files[id as usize];
-            let depth = PathBuf::from(p).components().count() as f64;
-            let bonus = if p.contains(pattern) { 100.0 } else { 0.0 };
-            (id, scores[id as usize] + bonus - depth)
-        })
-        .collect();
-    order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    Some(order)
+    for &id in &cand {
+        let p = &idx.files[id as usize];
+        let depth = PathBuf::from(p).components().count() as f64;
+        let bonus = if path_bonus(p) { 100.0 } else { 0.0 };
+        scores[id as usize] += bonus - depth;
+    }
+    let mut order = cand;
+    order.sort_by(|a, b| {
+        scores[*b as usize]
+            .partial_cmp(&scores[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    (order, scores)
 }
 
 /// Rank order over a standalone scores vec (ST-5 columnar sort): indices
@@ -1260,11 +1719,11 @@ fn flat_scores(files: &[FileHits]) -> (Vec<f64>, Vec<(u32, u32)>) {
     (scores, loc)
 }
 
-/// Decode banked match bytes with the exact eager expression
-/// (`from_utf8_lossy` then char-trim of `\n`/`\r`): valid UTF-8 borrows the
-/// arena, only invalid-UTF8 hits allocate — the same hits as before.
-fn banked_text<'a>(fh: &'a FileHits, m: &HitMeta) -> std::borrow::Cow<'a, str> {
-    let raw = &fh.arena[m.start as usize..m.end as usize];
+/// Decode an arena slice with the exact eager expression (`from_utf8_lossy`
+/// then char-trim of `\n`/`\r`): valid UTF-8 borrows the arena, only
+/// invalid-UTF8 hits allocate — the same hits as before.
+fn banked_slice<'a>(arena: &'a [u8], start: u32, end: u32) -> std::borrow::Cow<'a, str> {
+    let raw = &arena[start as usize..end as usize];
     let cow = String::from_utf8_lossy(raw);
     match cow {
         std::borrow::Cow::Borrowed(b) => {
@@ -1276,12 +1735,127 @@ fn banked_text<'a>(fh: &'a FileHits, m: &HitMeta) -> std::borrow::Cow<'a, str> {
     }
 }
 
+/// Decode banked match bytes (unchanged contract: same expression as before,
+/// now shared with context lines through `banked_slice`).
+fn banked_text<'a>(fh: &'a FileHits, m: &HitMeta) -> std::borrow::Cow<'a, str> {
+    banked_slice(&fh.arena, m.start, m.end)
+}
+
+/// Context attach (ContextLines): rebuild `fh` over the full file bytes.
+/// The arena becomes one verbatim copy of `buf` (the match-banked bytes are
+/// dropped — no duplicate storage), `line_starts` records the byte offset
+/// of every 1-based line start (split on `\n`, mirroring the searcher), and
+/// each meta is remapped to its line's byte range, so `banked_text` decodes
+/// byte-identical text. Call only when context>0 with surviving hits.
+fn attach_context(fh: &mut FileHits, buf: &[u8]) {
+    let mut starts: Vec<u32> = vec![0];
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\n' && i + 1 < buf.len() {
+            starts.push((i + 1) as u32);
+        }
+    }
+    for m in fh.metas.iter_mut() {
+        let k = m.line as usize - 1;
+        let s = starts[k] as usize;
+        let e = if k + 1 < starts.len() {
+            starts[k + 1] as usize
+        } else {
+            buf.len()
+        };
+        m.start = s as u32;
+        m.end = e as u32;
+    }
+    fh.arena = buf.to_vec();
+    fh.line_starts = starts;
+}
+
+/// Context windows over sorted unique 1-based match lines: `[line-before,
+/// line+after]` clamped low at 1 (file top), merged when overlapping or
+/// adjacent (rg merges `[2,4]+[5,7]` with no separator — probed on 15.1.0).
+/// The high end stays unclamped: callers skip lines past EOF, and the merge
+/// outcome is identical with or without the clamp (a clamp can only split
+/// below a later window's start, which implies the unclamped span splits
+/// there too).
+fn compute_groups(lines: &[u64], before: usize, after: usize) -> Vec<(u64, u64)> {
+    let mut groups: Vec<(u64, u64)> = vec![];
+    for &l in lines {
+        let lo = l.saturating_sub(before as u64).max(1);
+        let hi = l.saturating_add(after as u64).max(1);
+        match groups.last_mut() {
+            Some(g) if lo <= g.1.saturating_add(1) => {
+                if hi > g.1 {
+                    g.1 = hi;
+                }
+            }
+            _ => groups.push((lo, hi)),
+        }
+    }
+    groups
+}
+
+/// Context line text over an attached file: the `line_no`-th line decoded
+/// with the same expression as `banked_text`.
+fn ctx_line_text<'a>(fh: &'a FileHits, line_no: u64) -> std::borrow::Cow<'a, str> {
+    let k = line_no as usize - 1;
+    let s = fh.line_starts[k];
+    let e = if k + 1 < fh.line_starts.len() {
+        fh.line_starts[k + 1]
+    } else {
+        fh.arena.len() as u32
+    };
+    banked_slice(&fh.arena, s, e)
+}
+
+/// Rank-ordered file groups for context render: the ranked flat order `ord`
+/// folded into per-file surviving-meta lists in first-seen (rank) order,
+/// metas ascending by line within a file. Rank by hit, context attached:
+/// `--top` truncates `ord` first, so groups only ever cover survivors.
+/// Shared by the cold and serve renderers so both print the same groups in
+/// the same order from the same hit set.
+fn ctx_file_groups(
+    files: &[FileHits],
+    loc: &[(u32, u32)],
+    ord: &[u32],
+) -> Vec<(usize, Vec<usize>)> {
+    let mut by_file: Vec<Vec<usize>> = vec![Vec::new(); files.len()];
+    let mut seen: Vec<bool> = vec![false; files.len()];
+    let mut order: Vec<usize> = vec![];
+    for &i in ord {
+        let (fi, mi) = loc[i as usize];
+        let fi = fi as usize;
+        if !seen[fi] {
+            seen[fi] = true;
+            order.push(fi);
+        }
+        by_file[fi].push(mi as usize);
+    }
+    let mut out = Vec::with_capacity(order.len());
+    for fi in order {
+        let mis = &mut by_file[fi];
+        mis.sort_by_key(|&mi| files[fi].metas[mi].line);
+        out.push((fi, std::mem::take(mis)));
+    }
+    out
+}
+
+/// Sorted unique match lines for one group file: the merge input for
+/// `compute_groups` (deduped — a line with several hits renders once, like
+/// rg — while hit *counts* still come from `ord`, multiplicity intact).
+fn ctx_group_lines(files: &[FileHits], fi: usize, mis: &[usize]) -> Vec<u64> {
+    let mut v: Vec<u64> = mis.iter().map(|&mi| files[fi].metas[mi].line).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 fn parallel_verify_batched_raw(
     idx: &Index,
     matcher: &RegexMatcher,
     order: &[u32],
     scores: &[f64],
     top: Option<usize>,
+    before: usize,
+    after: usize,
 ) -> Vec<FileHits> {
     if top == Some(0) {
         return vec![];
@@ -1294,7 +1868,15 @@ fn parallel_verify_batched_raw(
         return order
             .par_iter()
             .filter_map(|id| {
-                verify_one_raw(*id, &idx.files[*id as usize], matcher, scores[*id as usize])
+                verify_one_raw_ctx(
+                    *id,
+                    &idx.files[*id as usize],
+                    matcher,
+                    scores[*id as usize],
+                    before,
+                    after,
+                    false,
+                )
             })
             .collect();
     }
@@ -1319,7 +1901,15 @@ fn parallel_verify_batched_raw(
             .par_iter()
             .filter(|id| !armed || scores[**id as usize] > kth_now)
             .filter_map(|id| {
-                verify_one_raw(*id, &idx.files[*id as usize], matcher, scores[*id as usize])
+                verify_one_raw_ctx(
+                    *id,
+                    &idx.files[*id as usize],
+                    matcher,
+                    scores[*id as usize],
+                    before,
+                    after,
+                    false,
+                )
             })
             .collect();
         total += batch.iter().map(|f| f.metas.len()).sum::<usize>();
@@ -1351,75 +1941,187 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
         // no per-hit serde struct setup, no Arc path clones, no per-hit
         // path escaping.
         let mut broken = false;
+        // Echoed on the done line when the query asked for context, so new
+        // clients can tell an old (context-ignoring) daemon from a new one.
+        let mut ctx_asked = false;
         match serde_json::from_str::<Query>(line.trim()) {
             Err(_) => {}
-            Ok(q) => match build_matcher(&q.pattern, q.ignore_case) {
-                Err(e) => {
-                    if writeln!(writer, "{{\"error\":\"{e}\"}}").is_err() {
-                        broken = true;
-                    }
-                }
-                Ok(matcher) => {
-                    // `-i` skips trigram pruning: the postings are raw bytes,
-                    // so case-sensitive grams would false-negative
-                    // (`hello` grams miss `HELLO` files). Full-file verify
-                    // keeps serve==cold on every `-i` query.
-                    let order = if q.ignore_case {
-                        (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect()
-                    } else {
-                        ranked_candidates(&idx, &q.pattern).unwrap_or_else(|| {
-                            (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect()
-                        })
-                    };
-                    let files: Vec<FileHits> = order
-                        .par_iter()
-                        .filter_map(|(id, s)| {
-                            verify_one_raw_cached(
-                                *id,
-                                &idx.files[*id as usize],
-                                &matcher,
-                                *s,
-                                Some((&*fdc, *id)),
-                            )
-                        })
-                        .collect();
-                    let (hit_scores, loc) = flat_scores(&files);
-                    let mut ord = raw_order(&hit_scores);
-                    if let Some(n) = q.top {
-                        ord.truncate(n);
-                    }
-                    let mut esc: Vec<Option<Vec<u8>>> = vec![None; idx.files.len()];
-                    for &i in &ord {
-                        let (fi, _) = loc[i as usize];
-                        let pid = files[fi as usize].pid as usize;
-                        if esc[pid].is_none() {
-                            let ps = &idx.files[pid];
-                            let mut v = Vec::with_capacity(ps.len() + 2);
-                            push_escaped_json(&mut v, ps);
-                            esc[pid] = Some(v);
+            Ok(q) => {
+                ctx_asked = q.before > 0 || q.after > 0;
+                // MatchFlags serve half: legacy clients send only `pattern`
+                // (`patterns` empty); new clients send the pattern list plus
+                // flags, and the combined alternation rebuilds server-side so
+                // serve==cold on every flag mix.
+                let q_pats: Vec<String> = if q.patterns.is_empty() {
+                    vec![q.pattern.clone()]
+                } else {
+                    q.patterns.clone()
+                };
+                let q_combined = combine_patterns(&q_pats, q.fixed);
+                let q_fixed_single = q.fixed && q_pats.len() == 1;
+                match build_matcher_opts(&q_combined, q.ignore_case, q.word, q_fixed_single) {
+                    Err(e) => {
+                        if writeln!(writer, "{{\"error\":\"{e}\"}}").is_err() {
+                            broken = true;
                         }
                     }
-                    let mut buf = Vec::with_capacity(ord.len() * 160);
-                    for &i in &ord {
-                        let (fi, mi) = loc[i as usize];
-                        let fh = &files[fi as usize];
-                        let m = &fh.metas[mi as usize];
-                        let text = banked_text(fh, m);
-                        emit_raw_with_path(
-                            &mut buf,
-                            esc[fh.pid as usize].as_ref().unwrap(),
-                            m.line,
-                            &text,
-                            m.score,
-                        );
-                    }
-                    if writer.write_all(&buf).is_err() {
-                        broken = true;
+                    Ok(matcher) => {
+                        // `-i` skips trigram pruning: the postings are raw bytes,
+                        // so case-sensitive grams would false-negative
+                        // (`hello` grams miss `HELLO` files). Full-file verify
+                        // keeps serve==cold on every `-i` query. `-v` skips it
+                        // too: inverted matches live outside the gram files, so
+                        // pruning would false-negative by construction.
+                        let all_files =
+                            || (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect();
+                        let order: Vec<(u32, f64)> = if q.ignore_case || q.invert {
+                            all_files()
+                        } else if q.patterns.is_empty() && !q.fixed {
+                            ranked_candidates(&idx, &q.pattern).unwrap_or_else(all_files)
+                        } else {
+                            match query_grams_multi(&q_pats, q.fixed) {
+                                None => all_files(),
+                                Some(ors) => {
+                                    let (o, s) = rank_ors(&idx, &ors, &|p| {
+                                        q_pats.iter().any(|pat| p.contains(pat.as_str()))
+                                    });
+                                    o.into_iter().map(|id| (id, s[id as usize])).collect()
+                                }
+                            }
+                        };
+                        let mut files: Vec<FileHits> = order
+                            .par_iter()
+                            .filter_map(|(id, s)| {
+                                // Frozen-wrapper fast path (agreed with
+                                // ContextLines): plain non-inverted queries run
+                                // the frozen entry (exactly _ctx(0,0,false));
+                                // context/invert go direct. Zero behavior change.
+                                if q.before == 0 && q.after == 0 && !q.invert {
+                                    verify_one_raw_cached(
+                                        *id,
+                                        &idx.files[*id as usize],
+                                        &matcher,
+                                        *s,
+                                        Some((&*fdc, *id)),
+                                    )
+                                } else {
+                                    verify_one_raw_cached_ctx(CachedVerify {
+                                        pid: *id,
+                                        path: &idx.files[*id as usize],
+                                        matcher: &matcher,
+                                        file_score: *s,
+                                        before: q.before,
+                                        after: q.after,
+                                        fdc: Some((&*fdc, *id)),
+                                        invert: q.invert,
+                                    })
+                                }
+                            })
+                            .collect();
+                        // `-m` caps each file before rank/top, mirroring the cold
+                        // path (capped `-c` shapes come out of the wire for free).
+                        apply_max_count(&mut files, q.max_count);
+                        let (hit_scores, loc) = flat_scores(&files);
+                        let mut ord = raw_order(&hit_scores);
+                        if let Some(n) = q.top {
+                            ord.truncate(n);
+                        }
+                        let mut esc: Vec<Option<Vec<u8>>> = vec![None; idx.files.len()];
+                        for &i in &ord {
+                            let (fi, _) = loc[i as usize];
+                            let pid = files[fi as usize].pid as usize;
+                            if esc[pid].is_none() {
+                                let ps = &idx.files[pid];
+                                let mut v = Vec::with_capacity(ps.len() + 2);
+                                push_escaped_json(&mut v, ps);
+                                esc[pid] = Some(v);
+                            }
+                        }
+                        let ctx_on = q.before > 0 || q.after > 0;
+                        let mut buf = Vec::with_capacity(ord.len() * 160);
+                        if ctx_on {
+                            // Rank by hit, context attached: the ranked `ord` is
+                            // folded into per-file groups (first-seen = rank
+                            // order, `--top` already applied), windows expanded
+                            // and merged, then hits ride as hit JSON with carried
+                            // context lines (`"ctx":true`, file score) in span
+                            // order. Same groups the cold renderer prints.
+                            let mut fscore = vec![0.0f64; idx.files.len()];
+                            for (id, s) in &order {
+                                fscore[*id as usize] = *s;
+                            }
+                            for (fi, mis) in ctx_file_groups(&files, &loc, &ord) {
+                                let fh = &files[fi];
+                                let pe = esc[fh.pid as usize].as_ref().unwrap();
+                                let nlines = fh.line_starts.len() as u64;
+                                let mlines = ctx_group_lines(&files, fi, &mis);
+                                let mut k = 0usize;
+                                for (lo, hi) in compute_groups(&mlines, q.before, q.after) {
+                                    // No separator travels the wire: the client
+                                    // owns `--group-separator` and recomputes the
+                                    // same groups from the hit lines.
+                                    let hi = hi.min(nlines);
+                                    let mut ln = lo;
+                                    while ln <= hi {
+                                        if k < mis.len() && fh.metas[mis[k]].line == ln {
+                                            while k < mis.len() && fh.metas[mis[k]].line == ln {
+                                                let m = &fh.metas[mis[k]];
+                                                let text = banked_text(fh, m);
+                                                emit_raw_with_path(
+                                                    &mut buf, pe, m.line, &text, m.score,
+                                                );
+                                                k += 1;
+                                            }
+                                        } else {
+                                            let text = ctx_line_text(fh, ln);
+                                            emit_ctx_json(
+                                                &mut buf,
+                                                pe,
+                                                ln,
+                                                &text,
+                                                fscore[fh.pid as usize],
+                                            );
+                                        }
+                                        ln += 1;
+                                    }
+                                }
+                            }
+                        } else {
+                            for &i in &ord {
+                                let (fi, mi) = loc[i as usize];
+                                let fh = &files[fi as usize];
+                                let m = &fh.metas[mi as usize];
+                                let text = banked_text(fh, m);
+                                emit_raw_with_path(
+                                    &mut buf,
+                                    esc[fh.pid as usize].as_ref().unwrap(),
+                                    m.line,
+                                    &text,
+                                    m.score,
+                                );
+                            }
+                        }
+                        if writer.write_all(&buf).is_err() {
+                            broken = true;
+                        }
                     }
                 }
-            },
+            }
         }
-        if writeln!(
+        // Context echo (ContextLines): `,"ctx":true` only when the query
+        // asked for context, so new clients detect old daemons (fail over
+        // to cold). The default done line is byte-identical to before.
+        if ctx_asked {
+            if writeln!(
+                writer,
+                "{{\"done\":true,\"ms\":{},\"ctx\":true}}",
+                t0.elapsed().as_millis()
+            )
+            .is_err()
+            {
+                broken = true;
+            }
+        } else if writeln!(
             writer,
             "{{\"done\":true,\"ms\":{}}}",
             t0.elapsed().as_millis()
@@ -1491,19 +2193,27 @@ fn cmd_serve(idx_path: &str, port: u16) {
         std::thread::spawn(move || handle_client(s, idx, fdc));
     }
 }
+/// MatchFlags half of a serve query (MatchFlags owns; ContextLines owns the
+/// before/after half). `pattern` (kept positional) is the combined
+/// alternation the matcher compiles; the spec carries the branches for
+/// server-side grams/bonus plus the flags.
+struct MatchSpec<'a> {
+    patterns: &'a [String],
+    fixed: bool,
+    word: bool,
+    invert: bool,
+    max_count: Option<usize>,
+}
 /// Hot client fetch: returns the server's hit lines verbatim plus the hit
-/// count, without parsing Hits or re-serializing them. The server already
-/// emits final ranked order, so the bytes are stdout-ready; the old
-/// parse-then-to_string round trip only burned ~8-14 ms on heavy full.
-/// Blank lines are skipped; a bad-regex error reply is reported as
-/// `Some(message)` (empty stdout) so the caller exits 2 like the cold path
-/// instead of masking it as zero matches.
 fn client_query(
     port: u16,
     pattern: &str,
     top: Option<usize>,
     ignore_case: bool,
-) -> (Vec<u8>, usize, Option<String>) {
+    before: usize,
+    after: usize,
+    mspec: &MatchSpec,
+) -> (Vec<u8>, usize, Option<String>, bool) {
     let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
         Ok(s) => s,
         Err(e) => {
@@ -1515,6 +2225,13 @@ fn client_query(
         pattern: pattern.to_string(),
         top,
         ignore_case,
+        before,
+        after,
+        word: mspec.word,
+        invert: mspec.invert,
+        max_count: mspec.max_count,
+        patterns: mspec.patterns.to_vec(),
+        fixed: mspec.fixed,
     })
     .unwrap();
     if let Err(e) = stream
@@ -1528,6 +2245,8 @@ fn client_query(
     let mut raw = vec![];
     let mut matches = 0usize;
     let mut bad_regex: Option<String> = None;
+    let mut ctx_echo = false;
+    let ctx_on = before > 0 || after > 0;
     let mut line = String::new();
     loop {
         line.clear();
@@ -1536,6 +2255,11 @@ fn client_query(
         }
         let t = line.trim();
         if t.contains("\"done\"") {
+            // New daemons echo `"ctx":true` when the query asked for
+            // context; without it an old daemon silently served plain hits.
+            if t.contains("\"ctx\":true") {
+                ctx_echo = true;
+            }
             break;
         }
         if t.contains("\"error\"") {
@@ -1543,7 +2267,7 @@ fn client_query(
                 t.find("\"error\":\"")
                     .map(|s| {
                         let rest = &t[s + 9..];
-                        rest.strip_suffix('"').unwrap_or(rest).to_string()
+                        rest.strip_suffix("\"}").unwrap_or(rest).to_string()
                     })
                     .unwrap_or_default(),
             );
@@ -1552,19 +2276,37 @@ fn client_query(
         if t.is_empty() {
             continue;
         }
+        if ctx_on {
+            // Carried context lines ride the wire as JSON with `"ctx":true`
+            // (parsed, never substring-matched — a match *text* may contain
+            // the marker). They collect verbatim but never count as hits, so
+            // `matches` and `-c`/`-l` stay hit counts like the cold path.
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line.as_bytes()) {
+                if v.get("ctx").and_then(|c| c.as_bool()).unwrap_or(false) {
+                    raw.extend_from_slice(line.as_bytes());
+                    continue;
+                }
+            }
+        }
         matches += 1;
         raw.extend_from_slice(line.as_bytes());
     }
-    (raw, matches, bad_regex)
+    (raw, matches, bad_regex, ctx_echo)
 }
 /// Serve-first probe for `--use-index`: connect to the daemon registered in
 /// `<index>.serve.json`, if any. Any failure (no file, no listener, bad
 /// reply) returns None so the caller falls back to the cold index load.
+/// Context behaves like `client_query`: carried `"ctx":true` lines collect
+/// verbatim but never count, and a missing context echo from an old daemon
+/// fails over to the cold path.
 fn try_serve_query(
     idx_path: &str,
     pattern: &str,
     top: Option<usize>,
     ignore_case: bool,
+    before: usize,
+    after: usize,
+    mspec: &MatchSpec,
 ) -> Option<(Vec<u8>, usize)> {
     let port = load_serve_port(idx_path)?;
     let mut stream = TcpStream::connect_timeout(
@@ -1582,6 +2324,13 @@ fn try_serve_query(
         pattern: pattern.to_string(),
         top,
         ignore_case,
+        before,
+        after,
+        word: mspec.word,
+        invert: mspec.invert,
+        max_count: mspec.max_count,
+        patterns: mspec.patterns.to_vec(),
+        fixed: mspec.fixed,
     })
     .ok()?;
     stream.write_all(req.as_bytes()).ok()?;
@@ -1591,6 +2340,8 @@ fn try_serve_query(
     // per line. Collect them verbatim instead of parsing each Hit and
     // re-serializing it. Blank lines are skipped and error lines fail over
     // to the cold path, matching the old fallible-parse behavior.
+    let ctx_on = before > 0 || after > 0;
+    let mut ctx_echo = false;
     let mut raw = vec![];
     let mut matches = 0usize;
     let mut line = String::new();
@@ -1601,6 +2352,11 @@ fn try_serve_query(
         }
         let t = line.trim();
         if t.contains("\"done\"") {
+            // New daemons echo `"ctx":true` when the query asked for
+            // context (daemon-generated line: substring match is sound).
+            if t.contains("\"ctx\":true") {
+                ctx_echo = true;
+            }
             break;
         }
         if t.contains("\"error\"") {
@@ -1609,8 +2365,23 @@ fn try_serve_query(
         if t.is_empty() {
             continue;
         }
+        if ctx_on {
+            // Same carried-context rule as `client_query`: collect verbatim,
+            // count hits only (parsed marker, never substring).
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line.as_bytes()) {
+                if v.get("ctx").and_then(|c| c.as_bool()).unwrap_or(false) {
+                    raw.extend_from_slice(line.as_bytes());
+                    continue;
+                }
+            }
+        }
         matches += 1;
         raw.extend_from_slice(line.as_bytes());
+    }
+    if ctx_on && !ctx_echo {
+        // Old daemon ignored the context fields and served plain hits: fail
+        // over to the cold path, which attaches context locally.
+        return None;
     }
     Some((raw, matches))
 }
@@ -2100,7 +2871,7 @@ fn print_help() {
         " — ranked trigram code search\n",
         "usage: nkgrep index <path> [--index FILE]\n",
         "       nkgrep serve --index FILE --port PORT\n",
-        "       nkgrep [-i] [-q] [-c] [-l] [--top N] [--use-index FILE | --port PORT] [--] <pattern> [path]\n",
+        "       nkgrep [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n",
         "options:\n",
         "  -i, --ignore-case  case-insensitive match\n",
         "  -q, --quiet        suppress stdout, stop at first match\n",
@@ -2108,7 +2879,43 @@ fn print_help() {
         "  -                  read (standard input) instead of [path]\n",
         "  -c, --count        path:count per matching file, path-sorted\n",
         "  -l, --files-with-matches\n",
-        "                     matching paths only, path-sorted (-l wins over -c)\n",
+        "  -m, --max-count N  cap matching lines per file at N (0 matches\n",
+        "                     nothing; -c prints capped counts; applies\n",
+        "                     per-file before --top)\n",
+        "  -e, --regexp PAT   search pattern, OR (repeatable; an inline flag\n",
+        "                     like (?i) stays scoped to its pattern; any -e/-f\n",
+        "                     makes every positional a path)\n",
+        "  -f, --file FILE    patterns from FILE, one per line (repeatable;\n",
+        "                     empty line matches every line; - reads stdin;\n",
+        "                     missing file exits 2)\n",
+        "  -F, --fixed-strings\n",
+        "                     treat all patterns literally\n",
+        "  -v, --invert-match select non-matching lines (forces full scan\n",
+        "                     under --use-index)\n",
+        "  -w, --word-regexp  word-boundary match (Unicode word chars)\n",
+        "  --format json|text output rendering (default json; text emits\n",
+        "                     path:line:text in rank order — same hits, same\n",
+        "                     order as json, no score; ignored under -c/-l/-q)\n",
+        "  --color[=WHEN]     highlight match spans in --format text (default auto:\n",
+        "                     colorize only when stdout is a tty; always/never force\n",
+        "                     or suppress; ansi aliases always; json stays clean;\n",
+        "                     GREP_COLORS not honored)\n",
+        "  -., --hidden       search hidden files and directories\n",
+        "  --no-ignore        skip .gitignore/.ignore/.rgignore/exclude files\n",
+        "  -L, --follow       follow symbolic links\n",
+        "  -g, --glob GLOB    include/exclude paths, gitignore-style (repeatable;\n",
+        "                     leading ! excludes, neg-only keeps the rest)\n",
+        "  -d, --max-depth N  limit directory traversal depth\n",
+        "  --max-filesize N   skip files larger than N bytes (K/M/G suffixes)\n",
+        "  -A, --after-context N\n",
+        "                     print N lines after each match (`-A2` also works)\n",
+        "  -B, --before-context N\n",
+        "                     print N lines before each match (`-B2` also works)\n",
+        "  -C, --context N    print N lines around each match (`-C1` also works;\n",
+        "                     an explicit -A/-B beats -C on its side)\n",
+        "  --group-separator SEP\n",
+        "                     separator between disjoint context groups in one\n",
+        "                     file (default `--`; empty prints none)\n",
     );
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
@@ -2197,6 +3004,34 @@ fn main() {
     let mut quiet = false;
     let mut count_mode = false;
     let mut files_only = false;
+    let mut format_text = false;
+    let mut color_when = ColorWhen::Auto;
+    let mut walk_hidden = false;
+    let mut walk_no_ignore = false;
+    let mut walk_follow = false;
+    let mut walk_max_depth: Option<usize> = None;
+    let mut walk_max_filesize: Option<u64> = None;
+    let mut walk_globs: Vec<String> = vec![];
+    // Context flags (ContextLines): three Options so an explicit -A/-B beats
+    // -C regardless of order (probed on rg 15.1.0: `-C1 -A3` and `-A3 -C1`
+    // both yield after=3). Resolved to before/after after the loop.
+    let mut ctx_a: Option<usize> = None;
+    let mut ctx_b: Option<usize> = None;
+    let mut ctx_c: Option<usize> = None;
+    // MatchFlags (-m/-e/-f/-F/-v/-w): patterns accumulate from `-e` repeats
+    // and `-f` files; any of them makes every positional a path.
+    // `-x`/`-P`/`-E`/`-G` are parked (loud exit 2, never positional).
+    let mut max_count: Option<usize> = None;
+    let mut patterns_e: Vec<String> = vec![];
+    let mut pattern_files: Vec<String> = vec![];
+    let mut explicit_patterns = false;
+    let mut fixed_strings = false;
+    let mut invert_match = false;
+    let mut word_regexp = false;
+    // Group separator between disjoint in-file context groups (nkgrep
+    // extension — rg 15.1.0 has no such flag but prints `--`); empty means
+    // no separator lines.
+    let mut group_sep = String::from("--");
     let mut pos: Vec<String> = vec![];
     let mut i = 0;
     while i < raw.len() {
@@ -2254,6 +3089,81 @@ fn main() {
             if port.is_none() {
                 usage();
             }
+        } else if raw[i] == "-m" || raw[i] == "--max-count" {
+            // Per-file match cap (rg: matching lines per file; -c prints the
+            // capped counts). 0 is legal (matches nothing, exit 1).
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            match raw[i].parse::<usize>() {
+                Ok(n) => max_count = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad --max-count {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("--max-count=") {
+            match raw[i]["--max-count=".len()..].parse::<usize>() {
+                Ok(n) => max_count = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad --max-count {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("-m") && !raw[i].starts_with("--") && raw[i].len() > 2 {
+            // Attached short (`-m2`).
+            match raw[i][2..].parse::<usize>() {
+                Ok(n) => max_count = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad -m {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i] == "-e" || raw[i] == "--regexp" {
+            // Repeatable search pattern (OR); values take the next arg
+            // verbatim. Any -e/-f makes every positional a path.
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            explicit_patterns = true;
+            patterns_e.push(raw[i].clone());
+        } else if raw[i].starts_with("--regexp=") {
+            explicit_patterns = true;
+            patterns_e.push(raw[i]["--regexp=".len()..].to_string());
+        } else if raw[i] == "-f" || raw[i] == "--file" {
+            // Repeatable pattern file (one pattern per line, `-` = stdin).
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            explicit_patterns = true;
+            pattern_files.push(raw[i].clone());
+        } else if raw[i].starts_with("--file=") {
+            explicit_patterns = true;
+            pattern_files.push(raw[i]["--file=".len()..].to_string());
+        } else if raw[i] == "-F" || raw[i] == "--fixed-strings" {
+            fixed_strings = true;
+        } else if raw[i] == "-v" || raw[i] == "--invert-match" {
+            invert_match = true;
+        } else if raw[i] == "-w" || raw[i] == "--word-regexp" {
+            word_regexp = true;
+        } else if raw[i] == "-x"
+            || raw[i] == "--line-regexp"
+            || raw[i] == "-P"
+            || raw[i] == "--pcre2"
+            || raw[i] == "-E"
+            || raw[i] == "--encoding"
+            || raw[i] == "-G"
+        {
+            // Parked matcher flags: loud exit 2, never a positional pattern.
+            // (`--no-pcre2`/`--no-encoding` below are silent no-ops: the
+            // default engine already satisfies them.)
+            eprintln!("nkgrep: {} is not supported", raw[i]);
+            usage();
+        } else if raw[i] == "--no-pcre2" || raw[i] == "--no-encoding" {
+            // No-op: requests the default engine/byte behavior we already do.
         } else if raw[i] == "-i" || raw[i] == "--ignore-case" {
             ignore_case = true;
         } else if raw[i] == "-q" || raw[i] == "--quiet" || raw[i] == "--silent" {
@@ -2262,36 +3172,204 @@ fn main() {
             count_mode = true;
         } else if raw[i] == "-l" || raw[i] == "--files-with-matches" {
             files_only = true;
-        } else if raw[i].len() > 1
-            && raw[i].starts_with('-')
-            && !raw[i].starts_with("--")
-            && raw[i][1..].chars().all(|c| c == 'c' || c == 'l')
-        {
-            // Combined shorts (-cl, -lc, -cc): claimed only when EVERY char
-            // is in {c,l}, mirroring the {i,q} arm below. Mixed clusters
-            // (e.g. -ci) stay positional — the shared short-cluster protocol.
-            for c in raw[i][1..].chars() {
-                if c == 'c' {
-                    count_mode = true;
-                } else {
-                    files_only = true;
+        } else if raw[i] == "--hidden" || raw[i] == "-." {
+            walk_hidden = true;
+        } else if raw[i] == "--no-hidden" {
+            walk_hidden = false;
+        } else if raw[i] == "--no-ignore" {
+            walk_no_ignore = true;
+        } else if raw[i] == "-L" || raw[i] == "--follow" {
+            walk_follow = true;
+        } else if raw[i] == "--no-follow" {
+            walk_follow = false;
+        } else if raw[i] == "-g" || raw[i] == "--glob" {
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            walk_globs.push(raw[i].clone());
+        } else if raw[i].starts_with("--glob=") {
+            walk_globs.push(raw[i]["--glob=".len()..].to_string());
+        } else if raw[i].starts_with("-g") && !raw[i].starts_with("--") && raw[i].len() > 2 {
+            // Attached short (`-g*.rs`), mirroring clap's short-value join.
+            walk_globs.push(raw[i][2..].to_string());
+        } else if raw[i] == "-d" || raw[i] == "--max-depth" {
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            match raw[i].parse::<usize>() {
+                Ok(d) => walk_max_depth = Some(d),
+                Err(_) => {
+                    eprintln!("nkgrep: bad --max-depth {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("--max-depth=") {
+            match raw[i]["--max-depth=".len()..].parse::<usize>() {
+                Ok(d) => walk_max_depth = Some(d),
+                Err(_) => {
+                    eprintln!("nkgrep: bad --max-depth {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("-d") && !raw[i].starts_with("--") && raw[i].len() > 2 {
+            // Attached short (`-d2`).
+            match raw[i][2..].parse::<usize>() {
+                Ok(d) => walk_max_depth = Some(d),
+                Err(_) => {
+                    eprintln!("nkgrep: bad -d {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i] == "--max-filesize" {
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            match parse_filesize(&raw[i]) {
+                Some(n) => walk_max_filesize = Some(n),
+                None => {
+                    eprintln!("nkgrep: bad --max-filesize {:?}: expected bytes with optional K/M/G suffix", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("--max-filesize=") {
+            match parse_filesize(&raw[i]["--max-filesize=".len()..]) {
+                Some(n) => walk_max_filesize = Some(n),
+                None => {
+                    eprintln!("nkgrep: bad --max-filesize {:?}: expected bytes with optional K/M/G suffix", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i] == "-A" || raw[i] == "--after-context" {
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            match raw[i].parse::<usize>() {
+                Ok(n) => ctx_a = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad -A {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i] == "-B" || raw[i] == "--before-context" {
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            match raw[i].parse::<usize>() {
+                Ok(n) => ctx_b = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad -B {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i] == "-C" || raw[i] == "--context" {
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            match raw[i].parse::<usize>() {
+                Ok(n) => ctx_c = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad -C {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("--after-context=") {
+            match raw[i]["--after-context=".len()..].parse::<usize>() {
+                Ok(n) => ctx_a = Some(n),
+                Err(_) => {
+                    eprintln!(
+                        "nkgrep: bad --after-context {:?}: expected a number",
+                        raw[i]
+                    );
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("--before-context=") {
+            match raw[i]["--before-context=".len()..].parse::<usize>() {
+                Ok(n) => ctx_b = Some(n),
+                Err(_) => {
+                    eprintln!(
+                        "nkgrep: bad --before-context {:?}: expected a number",
+                        raw[i]
+                    );
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("--context=") {
+            match raw[i]["--context=".len()..].parse::<usize>() {
+                Ok(n) => ctx_c = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad --context {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i] == "--group-separator" {
+            i += 1;
+            if i >= raw.len() {
+                usage();
+            }
+            group_sep = raw[i].clone();
+        } else if raw[i].starts_with("--group-separator=") {
+            group_sep = raw[i]["--group-separator=".len()..].to_string();
+        } else if raw[i].starts_with("-A") && !raw[i].starts_with("--") && raw[i].len() > 2 {
+            // Attached short (`-A2`), mirroring the `-d2`/`-g` convention.
+            // A non-numeric tail (e.g. a `-Apple` pattern) is a usage error,
+            // matching rg (`-A` consumes the next arg as its number).
+            match raw[i][2..].parse::<usize>() {
+                Ok(n) => ctx_a = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad -A {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("-B") && !raw[i].starts_with("--") && raw[i].len() > 2 {
+            // Attached short (`-B2`).
+            match raw[i][2..].parse::<usize>() {
+                Ok(n) => ctx_b = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad -B {:?}: expected a number", raw[i]);
+                    usage();
+                }
+            }
+        } else if raw[i].starts_with("-C") && !raw[i].starts_with("--") && raw[i].len() > 2 {
+            // Attached short (`-C1`).
+            match raw[i][2..].parse::<usize>() {
+                Ok(n) => ctx_c = Some(n),
+                Err(_) => {
+                    eprintln!("nkgrep: bad -C {:?}: expected a number", raw[i]);
+                    usage();
                 }
             }
         } else if raw[i].len() > 1
             && raw[i].starts_with('-')
             && !raw[i].starts_with("--")
-            && raw[i][1..].chars().all(|c| c == 'i' || c == 'q')
+            && raw[i][1..]
+                .chars()
+                .all(|c| matches!(c, 'i' | 'q' | 'c' | 'l' | 'F' | 'v' | 'w'))
         {
-            // Combined shorts (-iq, -qi): claimed only when EVERY char is in
-            // {i,q}. Anything with other letters falls through to positional
-            // (FlagsCLS owns all-{c,l} clusters; mixed clusters stay
-            // positional) — the shared short-cluster protocol. Bare `-`
-            // (stdin) never reaches here via the len>1 guard.
+            // Combined no-arg shorts (-cl, -iq, -iv, -vw, ...): claimed only
+            // when EVERY char is a known no-arg short. Anything with other
+            // letters falls through to positional — the shared short-cluster
+            // protocol (FlagsCLS/FlagsAQ consented to this unified arm;
+            // behavior for -c/-l/-cl/-lc/-cc and -i/-q/-iq/-qi is unchanged).
+            // Bare `-` (stdin) never reaches here via the len>1 guard.
             for c in raw[i][1..].chars() {
-                if c == 'i' {
-                    ignore_case = true;
-                } else {
-                    quiet = true;
+                match c {
+                    'i' => ignore_case = true,
+                    'q' => quiet = true,
+                    'c' => count_mode = true,
+                    'l' => files_only = true,
+                    'F' => fixed_strings = true,
+                    'v' => invert_match = true,
+                    'w' => word_regexp = true,
+                    // Unreachable by the guard above; empty keeps the match
+                    // exhaustive without a behavior claim.
+                    _ => {}
                 }
             }
         } else {
@@ -2299,30 +3377,133 @@ fn main() {
         }
         i += 1;
     }
-    if pos.is_empty() || pos.len() > 2 {
+    // MatchFlags patterns: with any -e/-f every positional is a path (rg
+    // shape; more than one path stays a usage error — single-root index).
+    // Without -e/-f the first positional is the pattern, as before.
+    if explicit_patterns {
+        if pos.len() > 1 {
+            usage();
+        }
+    } else if pos.is_empty() || pos.len() > 2 {
         usage();
+    }
+    // `-f` files load here (after usage checks, before dispatch): each line
+    // a pattern, interior empties kept (match-all, probed on rg 15.1.0),
+    // `-` reads piped stdin once. A missing file exits 2 with `nkgrep: msg`.
+    let mut patterns: Vec<String> = patterns_e;
+    if !pattern_files.is_empty() {
+        let mut stdin_pats: Option<Vec<u8>> = None;
+        for f in &pattern_files {
+            let data: Vec<u8> = if f == "-" {
+                if stdin_pats.is_none() {
+                    let mut b = Vec::new();
+                    use std::io::Read;
+                    if std::io::stdin().read_to_end(&mut b).is_err() {
+                        eprintln!("nkgrep: stdin: read error");
+                        std::process::exit(2);
+                    }
+                    stdin_pats = Some(b);
+                }
+                stdin_pats.as_ref().unwrap().clone()
+            } else {
+                match std::fs::read(f) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("nkgrep: {f}: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            };
+            patterns.extend(split_pattern_lines(&data));
+        }
+    }
+    if explicit_patterns && patterns.is_empty() {
+        // `-f` with zero patterns (e.g. an empty file): rg matches nothing.
+        // A never-matching regex keeps the whole pipeline (and exit 1)
+        // uniform: `\b\B` is contradictory at one position (verified empty
+        // against rg 15.1.0 semantics), compiles without look-around, and
+        // holds no trigrams (full scan, like any gram-less pattern). Fixed
+        // is cleared since this is a regex by construction.
+        patterns.push("\\b\\B".to_string());
+        fixed_strings = false;
+    }
+    if !explicit_patterns {
+        patterns.push(pos[0].clone());
     }
     // Stdin search unit (FlagsCLS): an explicit `-` operand, or piped stdin
     // with no path operand, searches stdin as one unit labeled
     // `(standard input)` instead of walking the tree. A terminal with no
-    // path stays a usage error (exit 2), as before.
-    let stdin_explicit = pos.get(1).map(|s| s.as_str()) == Some("-");
-    let stdin_piped = pos.len() == 1 && !std::io::stdin().is_terminal();
+    // path stays a usage error (exit 2), as before. With -e/-f there is no
+    // pattern positional, so the path shifts to pos[0] (or none when piped).
+    let stdin_explicit = if explicit_patterns {
+        pos.first().map(|s| s.as_str()) == Some("-")
+    } else {
+        pos.get(1).map(|s| s.as_str()) == Some("-")
+    };
+    let stdin_piped = if explicit_patterns {
+        pos.is_empty() && !std::io::stdin().is_terminal()
+    } else {
+        pos.len() == 1 && !std::io::stdin().is_terminal()
+    };
     if stdin_explicit && port.is_some() {
         eprintln!("nkgrep: stdin search cannot use --port");
         usage();
     }
-    if port.is_none() && pos.len() != 2 && !stdin_explicit && !stdin_piped {
+    if port.is_none() && explicit_patterns && pos.len() != 1 && !stdin_explicit && !stdin_piped {
+        usage();
+    }
+    if port.is_none() && !explicit_patterns && pos.len() != 2 && !stdin_explicit && !stdin_piped {
         usage();
     }
     let stdin_mode = port.is_none() && (stdin_explicit || stdin_piped);
-    let pattern = pos[0].clone();
-    let root = PathBuf::from(pos.get(1).map(|s| s.as_str()).unwrap_or("."));
+    let pattern = combine_patterns(&patterns, fixed_strings);
+    let fixed_single = fixed_strings && patterns.len() == 1;
+    let root = if explicit_patterns {
+        PathBuf::from(pos.first().map(|s| s.as_str()).unwrap_or("."))
+    } else {
+        PathBuf::from(pos.get(1).map(|s| s.as_str()).unwrap_or("."))
+    };
+    // Traversal filters thread into every cold walk below; the index build
+    // keeps defaults (full corpus) so gate A holds by construction.
+    let walk_opts = WalkOptions {
+        hidden: walk_hidden,
+        no_ignore: walk_no_ignore,
+        follow: walk_follow,
+        max_depth: walk_max_depth,
+        max_filesize: walk_max_filesize,
+        globs: walk_globs,
+    };
+    // Color resolves once: text render only (JSON/-c/-l/-q never consult it).
+    // Short-circuit keeps the default path off the is_terminal syscall.
+    let color_on = format_text && color_enabled(color_when);
+    // Context resolves once: an explicit -A/-B beats -C per side (rg 15.1.0
+    // probe); `ctx_on` gates every context path below — when false the JSON,
+    // text, and wire paths are byte-identical to before.
+    let ctx_after = ctx_a.or(ctx_c).unwrap_or(0);
+    let ctx_before = ctx_b.or(ctx_c).unwrap_or(0);
+    let ctx_on = ctx_after > 0 || ctx_before > 0;
+    // MatchFlags spec: the serve wire and the cold path share it (patterns
+    // for grams/bonus, flags for matcher/verify/cap).
+    let mspec = MatchSpec {
+        patterns: &patterns,
+        fixed: fixed_strings,
+        word: word_regexp,
+        invert: invert_match,
+        max_count,
+    };
 
     let t0 = Instant::now();
     if port.is_none() {
         if let Some(idx_path) = &use_index {
-            if let Some((raw, matches)) = try_serve_query(idx_path, &pattern, top, ignore_case) {
+            if let Some((raw, matches)) = try_serve_query(
+                idx_path,
+                &pattern,
+                top,
+                ignore_case,
+                ctx_before,
+                ctx_after,
+                &mspec,
+            ) {
                 // `-q` over serve suppresses stdout client-side; the daemon
                 // has no quiet protocol (short-circuit lives on the cold
                 // path). Exit codes keep the 0/1 contract.
@@ -2381,10 +3562,17 @@ fn main() {
         }
     }
     if let Some(p) = port {
-        let (raw, matches, bad_regex) = client_query(p, &pattern, top, ignore_case);
+        let (raw, matches, bad_regex, ctx_echo) =
+            client_query(p, &pattern, top, ignore_case, ctx_before, ctx_after, &mspec);
         if let Some(msg) = bad_regex {
             eprintln!("nkgrep: bad regex: {msg}");
             std::process::exit(2);
+        }
+        if ctx_on && !ctx_echo {
+            // Old daemon ignored the context fields: matches render without
+            // carried context (the serve-first path fails over to cold
+            // instead — no cold tree exists for an explicit --port).
+            eprintln!("nkgrep: server ignored context flags (old daemon?)");
         }
         if count_mode || files_only {
             // `-c` / `-l` over --port: same client-side aggregation as the
@@ -2423,7 +3611,7 @@ fn main() {
         return;
     }
 
-    let matcher = match build_matcher(&pattern, ignore_case) {
+    let matcher = match build_matcher_opts(&pattern, ignore_case, word_regexp, fixed_single) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("nkgrep: bad regex: {e}");
@@ -2465,76 +3653,65 @@ fn main() {
                 std::process::exit(2);
             }
         }
+        // Frozen-wrapper default (same contract as the daemon): plain stdin
+        // queries run the frozen entry; invert goes direct. Zero behavior
+        // change — the wrapper is exactly _inv(false).
+        let stdin_hit = if invert_match {
+            search_stdin_raw_inv(&input, &matcher, true)
+        } else {
+            search_stdin_raw(&input, &matcher)
+        };
         if quiet {
             // Existence only, mirroring the file branches: no stdout, 0/1 exit.
-            quiet_exit(
-                search_stdin_raw(&input, &matcher).is_some(),
-                files,
-                load_ms,
-                t0,
-            );
+            quiet_exit(stdin_hit.is_some(), files, load_ms, t0);
         }
-        hits = search_stdin_raw(&input, &matcher)
-            .map(|h| vec![h])
-            .unwrap_or_default();
+        hits = stdin_hit.map(|h| vec![h]).unwrap_or_default();
+        // `-m` caps the unit before rank/top/count/emit, like files below.
+        apply_max_count(&mut hits, max_count);
+        if ctx_on {
+            // The stdin buffer outlives verify (FlagsCLS coupling): attach
+            // line tables over it so stdin renders context like files.
+            for fh in hits.iter_mut() {
+                attach_context(fh, &input);
+            }
+        }
     } else if let Some(idx) = &idx_opt {
-        let n = idx.files.len() as f64;
         let mut scores = vec![0.0f64; idx.files.len()];
         let mut order: Vec<u32> = vec![];
         // `-i` forces the scan fallback: trigram postings are raw bytes, so
         // case-sensitive grams would false-negative on case variants
         // (`hello` grams miss `HELLO` files). Scanning makes indexed==scan
-        // hold by construction; the matcher itself folds case.
-        let mut fallback = ignore_case;
+        // hold by construction; the matcher itself folds case. `-v` forces
+        // it too: inverted matches live outside the gram files.
+        // `--hidden`/`--no-ignore`/`-L` force it as well: the index is built
+        // with walk defaults (hidden skipped, ignores respected, links
+        // unfollowed), so those files are absent from postings — no candidate
+        // filter could recover them. The fallback walks with live walk_opts,
+        // so indexed==scan holds by construction there too. Shrink-only
+        // filters (-d/-g/--max-filesize) stay on the fast path: candidates
+        // are intersected pre-verify below.
+        let mut fallback =
+            ignore_case || invert_match || walk_hidden || walk_no_ignore || walk_follow;
         match if fallback {
             None
         } else {
-            query_grams(&pattern)
+            query_grams_multi(&patterns, fixed_strings)
         } {
             None => fallback = true,
             Some(ors) => {
-                let mut occ: Vec<(&[u32], f64)> = vec![];
-                let mut cand: Vec<u32> = vec![];
-                let mut tmp: Vec<u32> = vec![];
-                for ands in &ors {
-                    let mut lists: Vec<&[u32]> = Vec::with_capacity(ands.len());
-                    let mut empty = false;
-                    for g in ands {
-                        match idx.postings.get(g) {
-                            None => {
-                                empty = true;
-                                break;
-                            }
-                            Some(list) => {
-                                occ.push((list.as_slice(), (n / list.len() as f64).ln()));
-                                lists.push(list.as_slice());
-                            }
-                        }
-                    }
-                    if empty || lists.is_empty() {
-                        continue;
-                    }
-                    let branch = prefilter::intersect_all(&mut lists);
-                    prefilter::union_sorted_into(&cand, &branch, &mut tmp);
-                    std::mem::swap(&mut cand, &mut tmp);
-                }
-                let mut is_cand = vec![false; idx.files.len()];
-                for &id in &cand {
-                    is_cand[id as usize] = true;
-                }
-                for &(list, w) in &occ {
-                    for &id in list {
-                        if is_cand[id as usize] {
-                            scores[id as usize] += w;
-                        }
-                    }
-                }
-                order = cand;
+                // Shared rank core: intersect/union/idf, any-pattern path
+                // bonus (single-pattern = contains(pattern), as before),
+                // depth penalty, descending order + per-file scores.
+                let (o, s) = rank_ors(idx, &ors, &|p| {
+                    patterns.iter().any(|pat| p.contains(pat.as_str()))
+                });
+                order = o;
+                scores = s;
             }
         }
         if fallback {
             eprintln!("nkgrep: no usable literal, falling back to scan");
-            let paths = walk_files(&root);
+            let paths = walk_files(&root, &walk_opts);
             files = paths.len();
             ptab = paths
                 .iter()
@@ -2546,31 +3723,63 @@ fn main() {
                 let found = (0u32..ptab.len() as u32)
                     .into_par_iter()
                     .find_any(|pid| {
-                        verify_one_raw(*pid, &ptab[*pid as usize], &matcher, 0.0).is_some()
+                        verify_one_raw_ctx(
+                            *pid,
+                            &ptab[*pid as usize],
+                            &matcher,
+                            0.0,
+                            ctx_before,
+                            ctx_after,
+                            invert_match,
+                        )
+                        .is_some()
                     })
                     .is_some();
                 quiet_exit(found, files, load_ms, t0);
             }
             hits = (0u32..ptab.len() as u32)
                 .into_par_iter()
-                .filter_map(|pid| verify_one_raw(pid, &ptab[pid as usize], &matcher, 0.0))
+                .filter_map(|pid| {
+                    // Same per-file score as the scan branch below (path bonus
+                    // minus depth): the fallback is a scan, so its rows must
+                    // be byte-identical to one, not just set-equal.
+                    let ps = &ptab[pid as usize];
+                    let depth = PathBuf::from(ps).components().count() as f64;
+                    let bonus = if patterns.iter().any(|pat| ps.contains(pat.as_str())) {
+                        100.0
+                    } else {
+                        0.0
+                    };
+                    verify_one_raw_ctx(
+                        pid,
+                        ps,
+                        &matcher,
+                        bonus - depth,
+                        ctx_before,
+                        ctx_after,
+                        invert_match,
+                    )
+                })
                 .collect();
         } else {
-            for id in order.iter() {
-                let p = &idx.files[*id as usize];
-                let depth = PathBuf::from(p).components().count() as f64;
-                let bonus = if p.contains(pattern.as_str()) {
-                    100.0
-                } else {
-                    0.0
-                };
-                scores[*id as usize] += bonus - depth;
+            // Shrink-only traversal filters apply to candidates pre-verify,
+            // not to the index itself (the build keeps full-corpus defaults
+            // so gate A holds). The rank candidates are intersected with a
+            // live `walk_files` set — the same walker the scan branches use,
+            // so depth/size/glob semantics match by construction. Defaults
+            // skip the walk entirely: zero behavior or output change on the
+            // hot path. (Expand filters never reach here: --hidden,
+            // --no-ignore, and -L take the scan fallback above.)
+            if walk_opts.max_depth.is_some()
+                || walk_opts.max_filesize.is_some()
+                || !walk_opts.globs.is_empty()
+            {
+                let allowed: HashSet<String> = walk_files(&root, &walk_opts)
+                    .into_iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                order.retain(|id| allowed.contains(&idx.files[*id as usize]));
             }
-            order.sort_by(|a, b| {
-                scores[*b as usize]
-                    .partial_cmp(&scores[*a as usize])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
             files = order.len();
             if quiet {
                 // Existence only over the pruned candidate set: same
@@ -2591,11 +3800,13 @@ fn main() {
             }
             // Rank-ordered parallel verify, kth early exit between batches
             // (spec §6: match score ≤ file score, exit moves only with proof).
-            hits = parallel_verify_batched_raw(idx, &matcher, &order, &scores, top);
+            hits = parallel_verify_batched_raw(
+                idx, &matcher, &order, &scores, top, ctx_before, ctx_after,
+            );
             hits_indexed = true;
         }
     } else {
-        let paths = walk_files(&root);
+        let paths = walk_files(&root, &walk_opts);
         files = paths.len();
         ptab = paths
             .iter()
@@ -2606,7 +3817,18 @@ fn main() {
             // first banked hit instead of verifying every file.
             let found = (0u32..ptab.len() as u32)
                 .into_par_iter()
-                .find_any(|pid| verify_one_raw(*pid, &ptab[*pid as usize], &matcher, 0.0).is_some())
+                .find_any(|pid| {
+                    verify_one_raw_ctx(
+                        *pid,
+                        &ptab[*pid as usize],
+                        &matcher,
+                        0.0,
+                        ctx_before,
+                        ctx_after,
+                        invert_match,
+                    )
+                    .is_some()
+                })
                 .is_some();
             quiet_exit(found, files, load_ms, t0);
         }
@@ -2619,15 +3841,27 @@ fn main() {
                 // with its per-file Searcher + per-file matcher clone.
                 let ps = &ptab[pid as usize];
                 let depth = PathBuf::from(ps).components().count() as f64;
-                let bonus = if ps.contains(pattern.as_str()) {
+                let bonus = if patterns.iter().any(|pat| ps.contains(pat.as_str())) {
                     100.0
                 } else {
                     0.0
                 };
-                verify_one_raw(pid, ps, &matcher, bonus - depth)
+                verify_one_raw_ctx(
+                    pid,
+                    ps,
+                    &matcher,
+                    bonus - depth,
+                    ctx_before,
+                    ctx_after,
+                    invert_match,
+                )
             })
             .collect();
     }
+    // `-m`: per-file cap before rank/top/count/emit. Truncation precedes
+    // context derivation (agreed with ContextLines): context renders from
+    // surviving metas. No `-m` = no-op.
+    apply_max_count(&mut hits, max_count);
     // Columnar sort: flattened side scores vec drives index order; comparator
     // verbatim the fat-Hit one, so rank (ties included) is unchanged.
     // `loc` maps each flat position to (file, meta) for banked decode.
@@ -2659,6 +3893,71 @@ fn main() {
         let stdout = std::io::stdout();
         let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
         write_aggregates(&mut writer, &rows, files_only);
+        stdout_flush(&mut writer);
+        eprintln!(
+            "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
+            t0.elapsed().as_millis()
+        );
+        if matches == 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if ctx_on {
+        // Context render: rank by hit, context attached. The ranked `ord`
+        // (post---top, so context never consumes rank budget) folds into
+        // per-file groups in first-seen rank order; lines ascend within a
+        // file; windows expand by before/after, merge on overlap/adjacency;
+        // `--` (or `--group-separator`) parts disjoint in-file groups, never
+        // across files — the rg 15.1.0 shape probe. A line with several hits
+        // renders once; `matches` (hits, multiplicity intact) drives the
+        // diagnostics and the 0/1 exit, like `-c`.
+        let path_of = |pid: usize| -> &str {
+            match &idx_opt {
+                Some(idx) if hits_indexed => &idx.files[pid],
+                _ => &ptab[pid],
+            }
+        };
+        let mut buf = Vec::with_capacity(ord.len() * 128);
+        for (fi, mis) in ctx_file_groups(&hits, &loc, &ord) {
+            let fh = &hits[fi];
+            let ps = path_of(fh.pid as usize);
+            let nlines = fh.line_starts.len() as u64;
+            let mlines = ctx_group_lines(&hits, fi, &mis);
+            let mut k = 0usize;
+            let mut first_group = true;
+            for (lo, hi) in compute_groups(&mlines, ctx_before, ctx_after) {
+                if !first_group && !group_sep.is_empty() {
+                    buf.extend_from_slice(group_sep.as_bytes());
+                    buf.push(b'\n');
+                }
+                first_group = false;
+                let hi = hi.min(nlines);
+                let mut ln = lo;
+                while ln <= hi {
+                    if k < mis.len() && fh.metas[mis[k]].line == ln {
+                        let m = &fh.metas[mis[k]];
+                        let text = banked_text(fh, m);
+                        if color_on {
+                            emit_text_row_colored(&mut buf, ps, ln, &text, &matcher);
+                        } else {
+                            emit_text_row(&mut buf, ps, ln, &text);
+                        }
+                        k += 1;
+                        while k < mis.len() && fh.metas[mis[k]].line == ln {
+                            k += 1;
+                        }
+                    } else {
+                        let text = ctx_line_text(fh, ln);
+                        emit_ctx_row(&mut buf, ps, ln, &text);
+                    }
+                    ln += 1;
+                }
+            }
+        }
+        let stdout = std::io::stdout();
+        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+        stdout_write_all(&mut writer, &buf);
         stdout_flush(&mut writer);
         eprintln!(
             "nkgrep: {matches} matches in {files} files, {} ms (index load {load_ms} ms)",
@@ -2930,7 +4229,7 @@ mod literal_tests {
         let matcher = RegexMatcher::new("needle_haystack_content").unwrap();
         let order = vec![0u32, 1u32];
         let scores = vec![10.0f64, 5.0f64];
-        let batched = parallel_verify_batched_raw(&idx, &matcher, &order, &scores, Some(0));
+        let batched = parallel_verify_batched_raw(&idx, &matcher, &order, &scores, Some(0), 0, 0);
         // Columnar flat scan (serve semantics): full verify, rank over side
         // scores, top-0 truncate.
         let scanned_all: Vec<FileHits> = [(0u32, 10.0f64), (1u32, 5.0f64)]
@@ -2945,6 +4244,134 @@ mod literal_tests {
         assert!(batched.is_empty(), "top=0 batched must return 0 hits");
         assert!(scanned_ord.is_empty(), "top=0 scan must return 0 hits");
         assert!(!scanned_all.is_empty(), "fixture must match without top");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn matchflags_combine_scopes_groups() {
+        let one = |s: &str| s.to_string();
+        // Single non-fixed passes through verbatim (default path identical).
+        assert_eq!(combine_patterns(&[one("a|b")], false), "a|b");
+        // Wrapping keeps (?i) scoped and inner | from merging branches.
+        assert_eq!(
+            combine_patterns(&[one("(?i)foo"), one("BAR")], false),
+            "(?:(?i)foo)|(?:BAR)"
+        );
+        assert_eq!(
+            combine_patterns(&[one("(a|b)"), one("c")], false),
+            "(?:(a|b))|(?:c)"
+        );
+        // Fixed pre-escapes so separators stay regex alternation.
+        assert_eq!(
+            combine_patterns(&[one("a.c"), one("x|y")], true),
+            "(?:a\\.c)|(?:x\\|y)"
+        );
+        assert_eq!(combine_patterns(&[one("a.c")], true), "a.c");
+    }
+
+    #[test]
+    fn matchflags_grams_multi() {
+        let one = |s: &str| s.to_string();
+        // Single non-fixed delegates exactly.
+        assert_eq!(
+            query_grams_multi(&[one("NEEDLE_ALPHA")], false),
+            query_grams("NEEDLE_ALPHA")
+        );
+        // Fixed uses literal windows, even where regex parse would bail.
+        let g = query_grams_multi(&[one("foo*bar")], true).unwrap();
+        assert_eq!(g.len(), 1);
+        assert!(g[0].contains(&gram_pack(b"foo")));
+        assert!(g[0].contains(&gram_pack(b"bar")));
+        // Multi unions branches; any gram-less pattern forces a full scan.
+        let u = query_grams_multi(&[one("NEEDLE_ALPHA"), one("needle_1")], false).unwrap();
+        assert_eq!(u.len(), 2);
+        assert!(query_grams_multi(&[one("NEEDLE_ALPHA"), one("a|b")], false).is_none());
+        // Empty/short fixed patterns hold no trigram: full scan (an empty
+        // pattern matches every line, so pruning would false-negative).
+        assert!(query_grams_multi(&[one("")], true).is_none());
+        assert!(query_grams_multi(&[one("ab")], true).is_none());
+    }
+
+    #[test]
+    fn matchflags_pattern_lines() {
+        let v = |b: &[u8]| split_pattern_lines(b);
+        assert!(v(b"").is_empty());
+        assert_eq!(v(b"a\n"), vec!["a"]);
+        // Interior empties kept (match-all); trailing artifact dropped.
+        assert_eq!(v(b"a\n\nb\n"), vec!["a", "", "b"]);
+        assert_eq!(v(b"\n"), vec![""]);
+        assert_eq!(v(b"a\r\nb\r\n"), vec!["a", "b"]);
+        assert_eq!(v(b"a\rb"), vec!["a\rb"]);
+    }
+
+    #[test]
+    fn matchflags_matcher_word_fixed() {
+        // Word bounds via the searcher core (rg 15.1.0 shapes: foo-bar yes,
+        // foobar/foo_bar no).
+        let w = build_matcher_opts("foo", false, true, false).unwrap();
+        for (line, want) in [
+            ("a foo b", 1),
+            ("foobar", 0),
+            ("foo_bar", 0),
+            ("foo-bar", 1),
+            ("foo", 1),
+        ] {
+            let mut s = grep_searcher::SearcherBuilder::new().build();
+            let mut sink = ColCollector {
+                arena: vec![],
+                metas: vec![],
+                path_bonus: 0.0,
+                depth_penalty: 0.0,
+            };
+            s.search_slice(&w, line.as_bytes(), &mut sink).unwrap();
+            assert_eq!(sink.metas.len(), want, "word line {line:?}");
+        }
+        // Fixed treats metachars literally.
+        let f = build_matcher_opts("a.c", false, false, true).unwrap();
+        let mut s = grep_searcher::SearcherBuilder::new().build();
+        let mut sink = ColCollector {
+            arena: vec![],
+            metas: vec![],
+            path_bonus: 0.0,
+            depth_penalty: 0.0,
+        };
+        s.search_slice(&f, b"a.c axc", &mut sink).unwrap();
+        assert_eq!(sink.metas.len(), 1);
+        assert_eq!(sink.arena, b"a.c axc");
+    }
+
+    #[test]
+    fn matchflags_invert_and_max_count() {
+        let dir = std::env::temp_dir().join(format!("nkgrep_matchflags_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "foo one\nbar two\nfoo three\nbaz four\n").unwrap();
+        let ap = a.to_string_lossy().into_owned();
+        let m = RegexMatcher::new("foo").unwrap();
+        let norm = verify_one_raw_ctx(0, &ap, &m, 0.0, 0, 0, false).expect("plain must hit");
+        assert_eq!(norm.metas.len(), 2);
+        let inv = verify_one_raw_ctx(0, &ap, &m, 0.0, 0, 0, true).expect("invert must hit");
+        assert_eq!(inv.metas.len(), 2);
+        assert_eq!((inv.metas[0].line, inv.metas[1].line), (2, 4));
+        assert_eq!(banked_text(&inv, &inv.metas[0]), "bar two");
+        // Same through the cached twin (serve path).
+        let inv_c = verify_one_raw_cached_ctx(CachedVerify {
+            pid: 0,
+            path: &ap,
+            matcher: &m,
+            file_score: 0.0,
+            before: 0,
+            after: 0,
+            fdc: None,
+            invert: true,
+        })
+        .expect("cached invert");
+        assert_eq!(inv_c.metas.len(), 2);
+        assert_eq!(inv_c.metas[0].line, 2);
+        // -m keeps file order (first m).
+        let mut capped = verify_one_raw_ctx(0, &ap, &m, 0.0, 0, 0, false).unwrap();
+        apply_max_count(std::slice::from_mut(&mut capped), Some(1));
+        assert_eq!(capped.metas.len(), 1);
+        assert_eq!(capped.metas[0].line, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
@@ -3201,3 +4628,74 @@ mod color_tests {
     }
 }
 
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn groups_merge_overlap_and_adjacency() {
+        // Overlap: [1,3]+[3,5] -> one group. Adjacency ([2,4]+[5,7]) merges
+        // with no separator — probed on rg 15.1.0.
+        assert_eq!(compute_groups(&[2, 4], 1, 1), vec![(1, 5)]);
+        assert_eq!(compute_groups(&[3, 7], 1, 1), vec![(2, 4), (6, 8)]);
+    }
+    #[test]
+    fn groups_clamp_top_and_split() {
+        // Line 1 with before=2 clamps at 1; far-apart windows stay split.
+        assert_eq!(compute_groups(&[1], 2, 1), vec![(1, 2)]);
+        assert_eq!(compute_groups(&[1, 8], 1, 1), vec![(1, 2), (7, 9)]);
+        // Empty input, empty output; zero context is the line itself.
+        assert!(compute_groups(&[], 2, 2).is_empty());
+        assert_eq!(compute_groups(&[5], 0, 0), vec![(5, 5)]);
+    }
+
+    #[test]
+    fn attach_remap_is_byte_identical() {
+        // attach_context must not change decoded hit text: metas remapped
+        // into the full-file arena decode exactly what the match-banked
+        // arena decoded (CRLF + missing-trailing-newline included).
+        let dir = std::env::temp_dir().join(format!("nkgrep_ctx_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "first\r\nneedle one\nmiddle\nneedle two").unwrap();
+        let fp = f.to_string_lossy().into_owned();
+        let matcher = RegexMatcher::new("needle").unwrap();
+        let plain = verify_one_raw(0, &fp, &matcher, 10.0).expect("must hit");
+        let before: Vec<String> = plain
+            .metas
+            .iter()
+            .map(|m| banked_text(&plain, m).into_owned())
+            .collect();
+        let attached = verify_one_raw_ctx(0, &fp, &matcher, 10.0, 1, 1, false).expect("must hit");
+        assert_eq!(attached.line_starts.len(), 4);
+        for (m, b) in attached.metas.iter().zip(before.iter()) {
+            assert_eq!(&banked_text(&attached, m).into_owned(), b);
+        }
+        // Context lines decode through the same table.
+        assert_eq!(ctx_line_text(&attached, 1), "first");
+        assert_eq!(ctx_line_text(&attached, 3), "middle");
+        assert_eq!(ctx_line_text(&attached, 4), "needle two");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn served_context_renders_rg_shape() {
+        // Hits + carried ctx lines regroup into rg-shaped rows with `--`
+        // only between disjoint in-file groups, never across files.
+        let raw = b"{\"path\":\"b.txt\",\"line\":2,\"text\":\"hit B\",\"score\":1.0}\n\
+                    {\"path\":\"b.txt\",\"line\":1,\"text\":\"ctx B\",\"score\":1.0,\"ctx\":true}\n\
+                    {\"path\":\"a.txt\",\"line\":1,\"text\":\"hit A1\",\"score\":0.0}\n\
+                    {\"path\":\"a.txt\",\"line\":9,\"text\":\"hit A2\",\"score\":0.0}\n";
+        let out = render_served_context(raw, 1, 1, "--");
+        assert_eq!(
+            &out,
+            b"b.txt:1-ctx B\nb.txt:2:hit B\na.txt:1:hit A1\n--\na.txt:9:hit A2\n"
+        );
+        // Empty separator prints no separator lines.
+        let out = render_served_context(raw, 1, 1, "");
+        assert_eq!(
+            &out,
+            b"b.txt:1-ctx B\nb.txt:2:hit B\na.txt:1:hit A1\na.txt:9:hit A2\n"
+        );
+    }
+}
