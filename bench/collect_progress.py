@@ -22,7 +22,7 @@ bench harness on this machine (slow, needs the full tool set);
 those rows upsert under --date/--live and overlay the frozen table.
 
 Pass --public-simple to also write bench/benchmark.png: a minimal chart with
-plain labels (scan / indexed / serve + tgrep / rg / ugrep) and no footnotes.
+plain labels (nkgrep scan / nkgrep indexed / nkgrep serve + tgrep / rg / ugrep) and no footnotes.
 Deterministic from the same frozen table.
 
 Matplotlib only (no seaborn).
@@ -313,10 +313,10 @@ def plot(table):
 
 
 SIMPLE_LABELS = {
-    "nk-scan": "scan",
-    "nk-cold-bin": "indexed",
-    "nk-cold-json": "indexed",
-    "nk-hot": "serve",
+    "nk-scan": "nkgrep scan",
+    "nk-cold-bin": "nkgrep indexed",
+    "nk-cold-json": "nkgrep indexed",
+    "nk-hot": "nkgrep serve",
     "tgrep": "tgrep",
     "rg": "rg",
     "rg-full": "rg",
