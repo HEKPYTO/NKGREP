@@ -636,3 +636,89 @@ fn daemon_verify_latch_is_request_scoped() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
     let _ = std::fs::remove_dir_all(&*dir_a);
 }
+
+/// Daemon subtree oracle: `nkg --port P -- NEEDLE subdir` set-equals cold scan.
+#[test]
+fn daemon_subtree_equals_scan() {
+    use std::net::TcpListener;
+    let dir = fixture_in("daemon-sub");
+    let idx = dir.join("t.idx.json");
+    assert!(Command::new(bin())
+        .args(["index", ".", "--index"])
+        .arg(&idx)
+        .current_dir(&dir)
+        .status()
+        .unwrap()
+        .success());
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let want = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut srv = Command::new(bin())
+        .args(["serve", "--index"])
+        .arg(&idx)
+        .args(["--port", &want.to_string()])
+        .current_dir(&dir)
+        .spawn()
+        .unwrap();
+    // Wait for listener.
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", want)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Cold scan of subtree pkg_1 (absolute root: the live-repro'd shape).
+    let sub_abs = dir.join("pkg_1").to_string_lossy().into_owned();
+    let scan = run(&["--", "NEEDLE_ALPHA", &sub_abs], &dir);
+    assert!(!scan.is_empty());
+    // Daemon query over the absolute subtree, plus the relative form.
+    let out = Command::new(bin())
+        .args(["--port", &want.to_string(), "--", "NEEDLE_ALPHA", &sub_abs])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!([0, 1].contains(&out.status.code().unwrap()));
+    let mut rows = std::collections::HashSet::new();
+    for line in out.stdout.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let o: serde_json::Value = serde_json::from_slice(line).unwrap();
+        rows.insert((
+            o["path"].as_str().unwrap().to_string(),
+            o["line"].as_u64().unwrap(),
+            o["text"].as_str().unwrap().to_string(),
+        ));
+    }
+    let mut rows: Vec<_> = rows.into_iter().collect();
+    rows.sort();
+    assert_eq!(scan, rows, "daemon subtree must set-equal cold scan");
+    // Relative subtree form must agree as well.
+    let out = Command::new(bin())
+        .args(["--port", &want.to_string(), "--", "NEEDLE_ALPHA", "pkg_1"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let mut rel = std::collections::HashSet::new();
+    for line in out.stdout.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let o: serde_json::Value = serde_json::from_slice(line).unwrap();
+        rel.insert((
+            o["path"].as_str().unwrap().to_string(),
+            o["line"].as_u64().unwrap(),
+            o["text"].as_str().unwrap().to_string(),
+        ));
+    }
+    let mut rel: Vec<_> = rel.into_iter().collect();
+    rel.sort();
+    let scan_rel = run(&["--", "NEEDLE_ALPHA", "pkg_1"], &dir);
+    assert_eq!(
+        scan_rel, rel,
+        "daemon relative subtree must set-equal cold scan"
+    );
+    srv.kill().ok();
+    srv.wait().ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}

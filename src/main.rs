@@ -2018,29 +2018,64 @@ struct Query {
     patterns: Vec<String>,
     #[serde(default)]
     fixed: bool,
-}
-
-/// Ranked candidate file ids with scores. None = no usable literal.
-fn ranked_candidates(idx: &Index, pattern: &str) -> Option<Vec<(u32, f64)>> {
-    let ors = query_grams(pattern)?;
-    let (order, scores) = rank_ors(idx, &ors, &|p| p.contains(pattern));
-    Some(
-        order
-            .into_iter()
-            .map(|id| (id, scores[id as usize]))
-            .collect(),
-    )
+    /// Subtree roots over serve (both serde-defaulted: old clients omit them
+    /// and get whole-tree behavior from a new daemon; old daemons ignore
+    /// them and serve whole-tree to a new client, which then over-returns —
+    /// mixed-version skew, same as other new fields). `qroot` is the
+    /// client-canonicalized absolute query root ("" = legacy whole tree);
+    /// the daemon serves only files under it. `display_root` is the raw
+    /// root operand for cold-shape display paths ("" = legacy rel paths).
+    #[serde(default)]
+    qroot: String,
+    #[serde(default)]
+    display_root: String,
 }
 
 /// Shared rank core (intersect/union/idf scoring, path bonus, depth penalty,
-/// descending file-score order). `ranked_candidates` and the cold indexed
-/// path both run it; the comparator and scoring are verbatim the old bodies.
+/// descending file-score order). The cold indexed path runs it; the
+/// comparator and scoring are verbatim the old bodies.
 /// Returns ordered candidate ids plus per-file scores with bonus/depth
 /// folded (the cold early-exit proof reads `scores` by file id).
+/// `qrel`/`display_root` re-base depth and bonus onto the cold-equivalent
+/// path (`display_root.join(suffix)`, one `./` stripped); `None` scores
+/// stored paths verbatim.
 fn rank_ors(
     idx: &Index,
     ors: &[Vec<u32>],
     path_bonus: &dyn Fn(&str) -> bool,
+) -> (Vec<u32>, Vec<f64>) {
+    rank_ors_rooted(idx, ors, path_bonus, None, "")
+}
+fn daemon_rank_path<'a>(
+    abs: &'a str,
+    idx_root: &str,
+    qrel: Option<&std::path::Path>,
+    display_root: &str,
+) -> std::borrow::Cow<'a, str> {
+    let qr = match qrel {
+        Some(q) if !q.as_os_str().is_empty() => q,
+        _ => return std::borrow::Cow::Borrowed(abs),
+    };
+    let rel = serve_display_path(abs, idx_root);
+    let suffix = match std::path::Path::new(rel).strip_prefix(qr) {
+        Ok(s) => s,
+        Err(_) => return std::borrow::Cow::Borrowed(abs),
+    };
+    if display_root.is_empty() {
+        return std::borrow::Cow::Owned(suffix.to_string_lossy().into_owned());
+    }
+    let joined = std::path::PathBuf::from(display_root)
+        .join(suffix)
+        .to_string_lossy()
+        .into_owned();
+    std::borrow::Cow::Owned(strip_dot_slash(&joined).to_owned())
+}
+fn rank_ors_rooted(
+    idx: &Index,
+    ors: &[Vec<u32>],
+    path_bonus: &dyn Fn(&str) -> bool,
+    qrel: Option<&std::path::Path>,
+    display_root: &str,
 ) -> (Vec<u32>, Vec<f64>) {
     let n = idx.files.len() as f64;
     // (postings, idf weight) per gram occurrence, in query order, for
@@ -2084,8 +2119,9 @@ fn rank_ors(
     }
     for &id in &cand {
         let p = &idx.files[id as usize];
-        let depth = PathBuf::from(p).components().count() as f64;
-        let bonus = if path_bonus(p) { 100.0 } else { 0.0 };
+        let rp = daemon_rank_path(p, &idx.root, qrel, display_root);
+        let depth = PathBuf::from(rp.as_ref()).components().count() as f64;
+        let bonus = if path_bonus(rp.as_ref()) { 100.0 } else { 0.0 };
         scores[id as usize] += bonus - depth;
     }
     let mut order = cand;
@@ -2456,6 +2492,19 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                         }
                     }
                     Ok(matcher) => {
+                        // Subtree queries (--port with a path operand): the
+                        // client sends its canonicalized absolute root plus
+                        // the raw operand for display. Relativize against the
+                        // index root; outside-index roots serve zero hits.
+                        let qrel: Option<std::path::PathBuf> = if q.qroot.is_empty() {
+                            None
+                        } else {
+                            std::path::Path::new(&q.qroot)
+                                .strip_prefix(&idx.root)
+                                .ok()
+                                .map(|r| r.to_owned())
+                        };
+                        let q_outside = !q.qroot.is_empty() && qrel.is_none();
                         // `-i` skips trigram pruning: the postings are raw bytes,
                         // so case-sensitive grams would false-negative
                         // (`hello` grams miss `HELLO` files). Full-file verify
@@ -2467,17 +2516,56 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                         let order: Vec<(u32, f64)> = if q.ignore_case || q.invert {
                             all_files()
                         } else if q.patterns.is_empty() && !q.fixed {
-                            ranked_candidates(&idx, &q.pattern).unwrap_or_else(all_files)
+                            match query_grams(&q.pattern) {
+                                None => all_files(),
+                                Some(ors) => {
+                                    let (o, s) = rank_ors_rooted(
+                                        &idx,
+                                        &ors,
+                                        &|p| p.contains(q.pattern.as_str()),
+                                        qrel.as_deref(),
+                                        &q.display_root,
+                                    );
+                                    o.into_iter().map(|id| (id, s[id as usize])).collect()
+                                }
+                            }
                         } else {
                             match query_grams_multi(&q_pats, q.fixed) {
                                 None => all_files(),
                                 Some(ors) => {
-                                    let (o, s) = rank_ors(&idx, &ors, &|p| {
-                                        q_pats.iter().any(|pat| p.contains(pat.as_str()))
-                                    });
+                                    let (o, s) = rank_ors_rooted(
+                                        &idx,
+                                        &ors,
+                                        &|p| q_pats.iter().any(|pat| p.contains(pat.as_str())),
+                                        qrel.as_deref(),
+                                        &q.display_root,
+                                    );
                                     o.into_iter().map(|id| (id, s[id as usize])).collect()
                                 }
                             }
+                        };
+                        // Narrow candidates to the subtree (whole tree when
+                        // qroot is legacy-empty; zero files when outside).
+                        let order: Vec<(u32, f64)> = if q_outside {
+                            vec![]
+                        } else if let Some(qr) = &qrel {
+                            if qr.as_os_str().is_empty() {
+                                order
+                            } else {
+                                order
+                                    .into_iter()
+                                    .filter(|(id, _)| {
+                                        std::path::Path::new(serve_display_path(
+                                            &idx.files[*id as usize],
+                                            &idx.root,
+                                        ))
+                                        .strip_prefix(qr)
+                                        .is_ok()
+                                    })
+                                    .collect()
+                            }
+                        } else {
+                            order
                         };
                         let mut files: Vec<FileHits> = order
                             .par_iter()
@@ -2526,16 +2614,36 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                             let (fi, _) = loc[i as usize];
                             let pid = files[fi as usize].pid as usize;
                             if esc[pid].is_none() {
-                                // Serve wire is index-root-relative (cold parity):
-                                // the daemon reads via the absolute `idx.files`
-                                // entry but emits the `root/`-stripped display
-                                // form, so serve JSON/text prints `src/a.txt`
-                                // like a normalized cold query, not an absolute
-                                // path. SHAPE CHANGE (audit #5): serve paths
-                                // were absolute before this fix.
-                                let ps = serve_display_path(&idx.files[pid], &idx.root);
-                                let mut v = Vec::with_capacity(ps.len() + 2);
-                                push_escaped_json(&mut v, ps);
+                                // Display matches cold: legacy whole-tree
+                                // queries emit index-root-relative paths;
+                                // subtree queries re-root under the raw
+                                // operand (absolute stays absolute, relative
+                                // stays relative), mirroring walk output.
+                                let rel = serve_display_path(&idx.files[pid], &idx.root);
+                                let disp: std::borrow::Cow<str> = if q.display_root.is_empty() {
+                                    std::borrow::Cow::Borrowed(rel)
+                                } else if let Some(qr) = &qrel {
+                                    match std::path::Path::new(rel).strip_prefix(qr) {
+                                        Ok(sub) => match sub.as_os_str().is_empty() {
+                                            true => std::borrow::Cow::Borrowed(strip_dot_slash(
+                                                &q.display_root,
+                                            )),
+                                            false => std::borrow::Cow::Owned(
+                                                strip_dot_slash(
+                                                    &std::path::PathBuf::from(&q.display_root)
+                                                        .join(sub)
+                                                        .to_string_lossy(),
+                                                )
+                                                .to_owned(),
+                                            ),
+                                        },
+                                        Err(_) => std::borrow::Cow::Borrowed(rel),
+                                    }
+                                } else {
+                                    std::borrow::Cow::Borrowed(rel)
+                                };
+                                let mut v = Vec::with_capacity(disp.len() + 2);
+                                push_escaped_json(&mut v, &disp);
                                 esc[pid] = Some(v);
                             }
                         }
@@ -2816,6 +2924,8 @@ struct MatchSpec<'a> {
     word: bool,
     invert: bool,
     max_count: Option<usize>,
+    qroot: &'a str,
+    display_root: &'a str,
 }
 /// Hot client fetch: returns the server's hit lines verbatim plus the hit
 fn client_query(
@@ -2845,6 +2955,8 @@ fn client_query(
         max_count: mspec.max_count,
         patterns: mspec.patterns.to_vec(),
         fixed: mspec.fixed,
+        qroot: mspec.qroot.to_string(),
+        display_root: mspec.display_root.to_string(),
     })
     .unwrap();
     if let Err(e) = stream
@@ -2965,6 +3077,8 @@ fn try_serve_query(
         max_count: mspec.max_count,
         patterns: mspec.patterns.to_vec(),
         fixed: mspec.fixed,
+        qroot: mspec.qroot.to_string(),
+        display_root: mspec.display_root.to_string(),
     }) {
         Ok(r) => r,
         Err(_) => return ServeProbe::MissWarn(UNREACHABLE.to_string()),
@@ -3229,7 +3343,13 @@ fn json_hits_to_text(raw: &[u8]) -> Vec<u8> {
 /// renderer prints from the same hit set; unparseable lines are skipped,
 /// mirroring `served_path_counts`. A line that is both hit and context
 /// renders as a hit.
-fn render_served_context(raw: &[u8], before: usize, after: usize, sep: &str) -> Vec<u8> {
+fn render_served_context(
+    raw: &[u8],
+    before: usize,
+    after: usize,
+    sep: &str,
+    matcher: Option<&RegexMatcher>,
+) -> Vec<u8> {
     // path -> (line -> (text, is_hit)), first-seen file order.
     type ServedFileLines = (String, std::collections::BTreeMap<u64, (String, bool)>);
     let mut files: Vec<ServedFileLines> = vec![];
@@ -3280,7 +3400,11 @@ fn render_served_context(raw: &[u8], before: usize, after: usize, sep: &str) -> 
             while ln <= hi {
                 if let Some((text, hit)) = lines.get(&ln) {
                     if *hit {
-                        emit_text_row(&mut out, path, ln, text);
+                        if let Some(m) = matcher {
+                            emit_text_row_colored(&mut out, path, ln, text, m);
+                        } else {
+                            emit_text_row(&mut out, path, ln, text);
+                        }
                     } else {
                         emit_ctx_row(&mut out, path, ln, text);
                     }
@@ -3398,9 +3522,16 @@ fn json_hits_to_text_colored(raw: &[u8], matcher: &RegexMatcher) -> Vec<u8> {
 /// converted from the JSON wire; plain fallback when the matcher won't build
 /// (unreachable in practice — a bad regex exits 2 before render — so a good
 /// render never fails for a highlight miss).
-fn serve_text_out(raw: &[u8], pattern: &str, ignore_case: bool, color_on: bool) -> Vec<u8> {
+fn serve_text_out(
+    raw: &[u8],
+    pattern: &str,
+    ignore_case: bool,
+    word: bool,
+    fixed: bool,
+    color_on: bool,
+) -> Vec<u8> {
     if color_on {
-        if let Ok(m) = build_matcher(pattern, ignore_case) {
+        if let Ok(m) = build_matcher_opts(pattern, ignore_case, word, fixed) {
             return json_hits_to_text_colored(raw, &m);
         }
     }
@@ -4159,12 +4290,21 @@ fn main() {
     let ctx_on = ctx_after > 0 || ctx_before > 0;
     // MatchFlags spec: the serve wire and the cold path share it (patterns
     // for grams/bonus, flags for matcher/verify/cap).
+    // Subtree roots for serve: canonicalized absolute (daemon cwd may
+    // differ) plus the raw operand for cold-shape display. Unresolvable
+    // roots send a sentinel matching nothing (exit 1, not whole-tree).
+    let root_raw = root.to_string_lossy().into_owned();
+    let qroot_canon = std::fs::canonicalize(&root)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "\u{0}unresolvable".to_string());
     let mspec = MatchSpec {
         patterns: &patterns,
         fixed: fixed_strings,
         word: word_regexp,
         invert: invert_match,
         max_count,
+        qroot: &qroot_canon,
+        display_root: &root_raw,
     };
 
     let t0 = Instant::now();
@@ -4238,13 +4378,32 @@ fn main() {
                     if ctx_on {
                         // Context owns the output: regrouped rg-shaped rows
                         // from the carried hit+ctx wire (rank groups kept).
-                        let text = render_served_context(&raw, ctx_before, ctx_after, &group_sep);
+                        let ctx_m = color_on
+                            .then(|| {
+                                build_matcher_opts(&pattern, ignore_case, word_regexp, fixed_single)
+                                    .ok()
+                            })
+                            .flatten();
+                        let text = render_served_context(
+                            &raw,
+                            ctx_before,
+                            ctx_after,
+                            &group_sep,
+                            ctx_m.as_ref(),
+                        );
                         stdout_write_all(&mut writer, &text);
                     } else if format_text {
                         // Text renders client-side from the JSON wire (rank
                         // order kept); the daemon wire is untouched. Color
                         // highlights client-side via serve_text_out.
-                        let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
+                        let text = serve_text_out(
+                            &raw,
+                            &pattern,
+                            ignore_case,
+                            word_regexp,
+                            fixed_single,
+                            color_on,
+                        );
                         stdout_write_all(&mut writer, &text);
                     } else {
                         stdout_write_all(&mut writer, &raw);
@@ -4308,11 +4467,30 @@ fn main() {
                 let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
                 if ctx_on && ctx_echo {
                     // Same regrouped render as the serve-first branch.
-                    let text = render_served_context(&raw, ctx_before, ctx_after, &group_sep);
+                    let ctx_m = color_on
+                        .then(|| {
+                            build_matcher_opts(&pattern, ignore_case, word_regexp, fixed_single)
+                                .ok()
+                        })
+                        .flatten();
+                    let text = render_served_context(
+                        &raw,
+                        ctx_before,
+                        ctx_after,
+                        &group_sep,
+                        ctx_m.as_ref(),
+                    );
                     stdout_write_all(&mut writer, &text);
                 } else if format_text {
                     // Same client-side text render as the serve-first branch.
-                    let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
+                    let text = serve_text_out(
+                        &raw,
+                        &pattern,
+                        ignore_case,
+                        word_regexp,
+                        fixed_single,
+                        color_on,
+                    );
                     stdout_write_all(&mut writer, &text);
                 } else {
                     stdout_write_all(&mut writer, &raw);
@@ -5446,8 +5624,14 @@ mod color_tests {
             b"a.txt:1:hi \x1b[0m\x1b[1m\x1b[31mneedle\x1b[0m\nb.txt:2:no hit here\n"
         );
         // serve_text_out gates on color_on: off == plain bytes.
-        assert_eq!(serve_text_out(raw, "needle", false, false), plain);
-        assert_eq!(serve_text_out(raw, "needle", false, true), colored);
+        assert_eq!(
+            serve_text_out(raw, "needle", false, false, false, false),
+            plain
+        );
+        assert_eq!(
+            serve_text_out(raw, "needle", false, false, false, true),
+            colored
+        );
     }
 }
 
@@ -5521,13 +5705,13 @@ mod context_tests {
                     {\"path\":\"b.txt\",\"line\":1,\"text\":\"ctx B\",\"score\":1.0,\"ctx\":true}\n\
                     {\"path\":\"a.txt\",\"line\":1,\"text\":\"hit A1\",\"score\":0.0}\n\
                     {\"path\":\"a.txt\",\"line\":9,\"text\":\"hit A2\",\"score\":0.0}\n";
-        let out = render_served_context(raw, 1, 1, "--");
+        let out = render_served_context(raw, 1, 1, "--", None);
         assert_eq!(
             &out,
             b"b.txt:1-ctx B\nb.txt:2:hit B\na.txt:1:hit A1\n--\na.txt:9:hit A2\n"
         );
         // Empty separator prints no separator lines.
-        let out = render_served_context(raw, 1, 1, "");
+        let out = render_served_context(raw, 1, 1, "", None);
         assert_eq!(
             &out,
             b"b.txt:1-ctx B\nb.txt:2:hit B\na.txt:1:hit A1\na.txt:9:hit A2\n"
