@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 mod prefilter;
@@ -78,6 +79,35 @@ struct VerifyInput<'a> {
     after: usize,
     invert: bool,
     follow: bool,
+}
+
+/// Loud-verify latch (I/O-error exit-2 contract): verify runs on rayon
+/// workers and returns `Option`, so a per-file open/read failure records
+/// itself here instead of vanishing into a `None`. Callers fold
+/// `take_verify_io_error()` into `walk_error` before every emission, so an
+/// unreadable file exits 2 instead of silently matching nothing. A symlink
+/// refused under no-follow open (swapped in after the walk) still skips
+/// silently — the same outcome as a walk-filtered file.
+static VERIFY_IO_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// Report one unreadable corpus file from a verify worker; the caller turns
+/// the latch into exit 2. Returns false so call sites keep their shape.
+fn note_verify_io_error(path: &str, e: &std::io::Error, follow: bool) -> bool {
+    let raced_link = !follow
+        && std::fs::symlink_metadata(std::path::Path::new(path))
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+    if !raced_link {
+        eprintln!("nkg: cannot read {path}: {e}");
+        VERIFY_IO_ERROR.store(true, Ordering::Relaxed);
+    }
+    false
+}
+
+/// Drain the loud-verify latch (false when no worker failed since the last
+/// drain); folded into `walk_error` before every emission.
+fn take_verify_io_error() -> bool {
+    VERIFY_IO_ERROR.swap(false, Ordering::Relaxed)
 }
 
 /// No-context wrapper over `verify_one_raw_ctx` (before=after=0, invert=false).
@@ -162,7 +192,7 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
                 }
                 Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
             })()
-            .unwrap_or(false)
+            .unwrap_or_else(|e| note_verify_io_error(path, &e, follow))
         })
     });
     if ok && !sink.metas.is_empty() {
@@ -274,7 +304,7 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
                 }
                 Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
             })()
-            .unwrap_or(false)
+            .unwrap_or_else(|e| note_verify_io_error(path, &e, follow))
         })
     });
     if ok && !sink.metas.is_empty() {
@@ -1520,12 +1550,31 @@ fn split_pattern_lines(data: &[u8]) -> Vec<String> {
     out
 }
 
+/// Loud per-file build failure (exit 2, no index written): a corpus file the
+/// build cannot read fails exactly like the scan side, never silently drops
+/// from the index (a dropped file would return fewer indexed hits with exit
+/// 0 where scan exits 2). Symlink-escape skips stay silent at the call site.
+fn refuse_build_file(p: &std::path::Path, e: &dyn std::fmt::Display) -> ! {
+    eprintln!("nkg: cannot read {}: {e}", p.display());
+    std::process::exit(2);
+}
+
 fn cmd_index(root: &PathBuf, idx_path: &str) {
     let t0 = Instant::now();
     let root_canon = canon_root(root);
     let (root_dev, root_ino) = root_cookie(&root_canon);
     let root_fp = root_canon.to_string_lossy().into_owned();
-    let (paths, _) = walk_files(root, &WalkOptions::default());
+    let (paths, had_walk_error) = walk_files(root, &WalkOptions::default());
+    if had_walk_error {
+        eprintln!("nkg: walk error: refusing to write a partial index to {idx_path}");
+        std::process::exit(2);
+    }
+    // Self-exclusion: an index rebuilt inside its own corpus must not index
+    // itself (scan never sees it as a match source either — JSON has no
+    // planted text, but its bytes would still perturb the trigram table and
+    // break indexed==scan). Canonicalize both sides; a not-yet-existing
+    // output trivially matches nothing, so no absolutized fallback is needed.
+    let idx_canon = std::fs::canonicalize(idx_path).ok();
     let entries: Vec<(String, HashSet<[u8; 3]>)> = paths
         .par_iter()
         .filter_map(|p| {
@@ -1535,9 +1584,16 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
             // in after the walk either resolves inside (read as-is) or
             // outside (prefix check drops it) or races the open itself
             // (O_NOFOLLOW refuses it) — never outside bytes stored under
-            // an inside name. Every failure here skips the file
-            // (fail-closed); stable files read byte-identically.
-            let canon = std::fs::canonicalize(p).ok()?;
+            // an inside name. Unreadable files fail loudly (exit 2, no index
+            // written) exactly like the scan side; only symlink-escape skips
+            // silent — the same outcome as a walk-filtered file.
+            let canon = match std::fs::canonicalize(p) {
+                Ok(c) => c,
+                Err(e) => refuse_build_file(p, &e),
+            };
+            if Some(&canon) == idx_canon.as_ref() {
+                return None;
+            }
             // Root-relative entry: canonicalize both sides so symlinked
             // roots (e.g. /tmp on macOS) fingerprint stably. Files escaping
             // the root via symlink are skipped, never stored absolute.
@@ -1549,10 +1605,22 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
             let mut bytes = Vec::new();
             {
                 use std::io::Read;
-                open_verify_file(&canon, false)
-                    .ok()?
-                    .read_to_end(&mut bytes)
-                    .ok()?;
+                let mut f = match open_verify_file(&canon, false) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let raced_link = canon
+                            .symlink_metadata()
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false);
+                        if raced_link {
+                            return None;
+                        }
+                        refuse_build_file(p, &e);
+                    }
+                };
+                if let Err(e) = f.read_to_end(&mut bytes) {
+                    refuse_build_file(p, &e);
+                }
             }
             if is_binary(&bytes) {
                 return None;
@@ -3370,7 +3438,7 @@ fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant, walk_error:
         if found { "1+ matches" } else { "0 matches" },
         t0.elapsed().as_millis()
     );
-    std::process::exit(if walk_error {
+    std::process::exit(if walk_error | take_verify_io_error() {
         2
     } else if found {
         0
@@ -3576,9 +3644,16 @@ fn main() {
     // no separator lines.
     let mut group_sep = String::from("--");
     let mut pos: Vec<String> = vec![];
+    let mut end_opts = false;
     let mut i = 0;
     while i < raw.len() {
-        if raw[i] == "--" {
+        if !end_opts && raw[i] == "--" {
+            end_opts = true;
+            i += 1;
+            continue;
+        }
+        if end_opts {
+            pos.push(raw[i].clone());
             i += 1;
             continue;
         }
@@ -4541,6 +4616,7 @@ fn main() {
             "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
+        walk_error |= take_verify_io_error();
         if walk_error {
             std::process::exit(2);
         }
@@ -4603,6 +4679,7 @@ fn main() {
             "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
+        walk_error |= take_verify_io_error();
         if walk_error {
             std::process::exit(2);
         }
@@ -4638,6 +4715,7 @@ fn main() {
             "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
+        walk_error |= take_verify_io_error();
         if walk_error {
             std::process::exit(2);
         }
@@ -4725,6 +4803,7 @@ fn main() {
         "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
         t0.elapsed().as_millis()
     );
+    walk_error |= take_verify_io_error();
     if walk_error {
         std::process::exit(2);
     }
