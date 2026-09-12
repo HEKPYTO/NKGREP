@@ -257,6 +257,90 @@ fn flag_matrix_equals_scan() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn run_raw(args: &[&str], cwd: &PathBuf) -> Vec<u8> {
+    let out = Command::new(bin())
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!([0, 1].contains(&out.status.code().unwrap()));
+    out.stdout
+}
+
+/// --top oracle: indexed top-k must equal scan top-k as sets, over small k
+/// (early exit), a k past the tie boundary, and a k larger than the hit
+/// count. `config` hits every line so ties dominate; NEEDLE_ALPHA is sparse.
+#[test]
+fn top_k_equals_scan() {
+    let dir = fixture_in("topk");
+    let idx = dir.join("t.idx.json");
+    let st = Command::new(bin())
+        .args(["index", ".", "--index"])
+        .arg(&idx)
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let idx_s = idx.to_string_lossy().into_owned();
+    // (name, extra args, query); --top truncates rank order, sets stay equal
+    // on both sides even across score ties.
+    let cases: Vec<(&str, &[&str], &str)> = vec![
+        ("top1-dense", &["--top", "1"], "config"),
+        ("top5-dense", &["--top", "5"], "config"),
+        ("top7-sparse", &["--top", "7"], "NEEDLE_ALPHA"),
+        ("top-huge", &["--top", "100000"], "needle_1"),
+        ("top1-word", &["--top", "1", "-w"], "needle_1"),
+    ];
+    for (name, extra, q) in &cases {
+        let mut scan_args: Vec<&str> = extra.to_vec();
+        scan_args.extend(["--", q, "."]);
+        let scan = run(&scan_args, &dir);
+        let mut idx_args: Vec<String> = vec!["--use-index".to_string(), idx_s.clone()];
+        idx_args.extend(extra.iter().map(|s| s.to_string()));
+        idx_args.extend(["--".to_string(), q.to_string(), ".".to_string()]);
+        let got = run(
+            &idx_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &dir,
+        );
+        assert!(!scan.is_empty(), "scan found nothing for {name}");
+        assert_eq!(scan, got, "indexed/scan --top divergence on {name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Output-shaping oracle: -c and -l render byte-identical stdout indexed vs
+/// scan (same rows, same path-sorted order).
+#[test]
+fn aggregates_equal_scan() {
+    let dir = fixture_in("aggs");
+    let idx = dir.join("t.idx.json");
+    let st = Command::new(bin())
+        .args(["index", ".", "--index"])
+        .arg(&idx)
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let idx_s = idx.to_string_lossy().into_owned();
+    let cases: Vec<(&str, &[&str])> = vec![
+        ("count", &["-c", "--", "NEEDLE_ALPHA", "."]),
+        ("files", &["-l", "--", "needle_1", "."]),
+        ("count-top", &["-c", "--top", "5", "--", "config", "."]),
+    ];
+    for (name, rest) in &cases {
+        let scan = run_raw(rest, &dir);
+        let mut idx_args: Vec<String> = vec!["--use-index".to_string(), idx_s.clone()];
+        idx_args.extend(rest.iter().map(|s| s.to_string()));
+        let got = run_raw(
+            &idx_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &dir,
+        );
+        assert!(!scan.is_empty(), "scan rendered nothing for {name}");
+        assert_eq!(scan, got, "indexed/scan output divergence on {name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn svec<const N: usize>(a: [&str; N]) -> Vec<String> {
     a.into_iter().map(|s| s.to_string()).collect()
 }

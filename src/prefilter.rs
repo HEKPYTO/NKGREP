@@ -5,8 +5,8 @@
 //! codec round-trips lists verbatim (LoopB contract). All set ops below are
 //! therefore linear two-pointer merges over sparse id arrays — no hashing,
 //! no per-posting allocation. Scoring is deferred until after pruning so
-//! pruned files cost no float work. Sort order is verified with
-//! `debug_assert!`; a violated invariant is a bug, never silently absorbed.
+//! pruned files cost no float work. Sort order is validated at load
+//! (`intersect_all` exits 2); a violated invariant is a bug, never silently absorbed.
 
 /// Intersect two sorted id slices into `out` (cleared first).
 pub fn intersect_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
@@ -50,15 +50,19 @@ pub fn union_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 }
 
 /// Intersect N sorted posting lists, smallest first; returns sorted unique
-/// ids. Empty input or any empty list yields empty output.
+/// ids. Empty input or any empty list yields empty output. Unsorted input
+/// is refused loudly (exit 2): the index contract guarantees sorted
+/// postings, so unsorted means a corrupt index, never silently absorbed.
 pub fn intersect_all(lists: &mut Vec<&[u32]>) -> Vec<u32> {
     if lists.is_empty() {
         return vec![];
     }
     lists.sort_by_key(|l| l.len());
-    #[cfg(debug_assertions)]
     for l in lists.iter() {
-        debug_assert!(l.windows(2).all(|w| w[0] < w[1]));
+        if !l.windows(2).all(|w| w[0] < w[1]) {
+            eprintln!("corrupt index: unsorted postings");
+            std::process::exit(2);
+        }
     }
     let mut acc: Vec<u32> = lists[0].to_vec();
     let mut tmp: Vec<u32> = Vec::new();

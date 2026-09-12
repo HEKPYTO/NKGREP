@@ -51,7 +51,7 @@ impl Sink for ColCollector {
     type Error = Box<dyn std::error::Error>;
 
     fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> Result<bool, Self::Error> {
-        let line_no = m.line_number().unwrap_or(0);
+        let line_no = m.line_number().unwrap_or(1).max(1);
         let bytes = m.bytes();
         let score = self.path_bonus - (line_no as f64) / 1e6;
         let start = self.arena.len() as u32;
@@ -2066,7 +2066,11 @@ fn flat_scores(files: &[FileHits]) -> (Vec<f64>, Vec<(u32, u32)>) {
 /// then char-trim of `\n`/`\r`): valid UTF-8 borrows the arena, only
 /// invalid-UTF8 hits allocate — the same hits as before.
 fn banked_slice<'a>(arena: &'a [u8], start: u32, end: u32) -> std::borrow::Cow<'a, str> {
-    let raw = &arena[start as usize..end as usize];
+    let (s, e) = (start as usize, end as usize);
+    let raw = arena.get(s..e).unwrap_or_else(|| {
+        eprintln!("corrupt hit offsets ({s}..{e} of {})", arena.len());
+        std::process::exit(2);
+    });
     let cow = String::from_utf8_lossy(raw);
     match cow {
         std::borrow::Cow::Borrowed(b) => {
@@ -2098,8 +2102,15 @@ fn attach_context(fh: &mut FileHits, buf: &[u8]) {
         }
     }
     for m in fh.metas.iter_mut() {
+        if m.line == 0 {
+            eprintln!("corrupt hit line 0");
+            std::process::exit(2);
+        }
         let k = m.line as usize - 1;
-        let s = starts[k] as usize;
+        let s = *starts.get(k).unwrap_or_else(|| {
+            eprintln!("corrupt hit line {} of {} lines", m.line, starts.len());
+            std::process::exit(2);
+        }) as usize;
         let e = if k + 1 < starts.len() {
             starts[k + 1] as usize
         } else {
@@ -2139,8 +2150,18 @@ fn compute_groups(lines: &[u64], before: usize, after: usize) -> Vec<(u64, u64)>
 /// Context line text over an attached file: the `line_no`-th line decoded
 /// with the same expression as `banked_text`.
 fn ctx_line_text<'a>(fh: &'a FileHits, line_no: u64) -> std::borrow::Cow<'a, str> {
+    if line_no == 0 {
+        eprintln!("corrupt context line 0");
+        std::process::exit(2);
+    }
     let k = line_no as usize - 1;
-    let s = fh.line_starts[k];
+    let s = *fh.line_starts.get(k).unwrap_or_else(|| {
+        eprintln!(
+            "corrupt context line {line_no} of {} lines",
+            fh.line_starts.len()
+        );
+        std::process::exit(2);
+    });
     let e = if k + 1 < fh.line_starts.len() {
         fh.line_starts[k + 1]
     } else {
@@ -2305,10 +2326,16 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
         line.clear();
         // Bounded line: `take` caps bytes copied into `line` so a gigabyte
         // line allocates at most MAX+1, then this connection drops.
-        let n = (&mut reader)
+        let n = match (&mut reader)
             .take(MAX_SERVE_LINE_BYTES + 1)
             .read_line(&mut line)
-            .unwrap_or(0);
+        {
+            Err(e) => {
+                eprintln!("nkg: serve read: {e}");
+                break;
+            }
+            Ok(n) => n,
+        };
         if n == 0 {
             break;
         }
@@ -2761,8 +2788,13 @@ fn client_query(
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
+        match reader.read_line(&mut line) {
+            Err(e) => {
+                eprintln!("nkg: serve read 127.0.0.1:{port}: {e}");
+                std::process::exit(2);
+            }
+            Ok(0) => break,
+            Ok(_) => {}
         }
         let t = line.trim();
         if t.contains("\"done\"") {
@@ -3380,6 +3412,8 @@ fn print_help() {
         "  -v, --invert-match select non-matching lines (forces full scan\n",
         "                     under --use-index)\n",
         "  -w, --word-regexp  word-boundary match (Unicode word chars)\n",
+        "                     (short no-arg flags combine: any cluster of only\n",
+        "                     i q c l F v w letters sums its letters)\n",
         "  --format json|text output rendering (default json; text emits\n",
         "                     path:line:text in rank order — same hits, same\n",
         "                     order as json, no score; ignored under -c/-l/-q)\n",
@@ -4051,7 +4085,13 @@ fn main() {
     // Root check runs before the serve-first probe so both paths agree on
     // exit status; subtree queries skip serve (the daemon covers the whole
     // index root) and go cold, where candidates are narrowed to the subtree.
-    let serve_ok = if port.is_none() {
+    let walk_default = !walk_opts.hidden
+        && !walk_opts.no_ignore
+        && !walk_opts.follow
+        && walk_opts.max_depth.is_none()
+        && walk_opts.max_filesize.is_none()
+        && walk_opts.globs.is_empty();
+    let serve_ok = if port.is_none() && !stdin_mode && walk_default {
         if let Some(idx_path) = &use_index {
             serve_eligible_root(idx_path, &root)
         } else {
@@ -4138,7 +4178,10 @@ fn main() {
             ServeProbe::MissSilent => {}
         }
     }
-    if let Some(p) = port {
+    if port.is_some() && !walk_default {
+        eprintln!("nkg: walk filters set; bypassing server, searching locally");
+    }
+    if let Some(p) = port.filter(|_| walk_default) {
         let (raw, matches, bad_regex, ctx_echo) =
             client_query(p, &pattern, top, ignore_case, ctx_before, ctx_after, &mspec);
         if let Some(msg) = bad_regex {
