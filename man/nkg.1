@@ -112,28 +112,26 @@ diagnostics line. Exits 0 on the first match, 1 on none.
 is an alias for
 .BR \-\-quiet .
 .PP
-Short flags combine within their group:
-.B \-iq
-(and any cluster using only
-.B i
-and
-.B q
-letters) behaves as
-.B \-i
-plus
-.B \-q ;
-.B \-cl
-(and any cluster using only
-.B c
-and
-.B l
-letters) behaves as
+Short no-arg flags combine: any cluster using only
+.B i q c l F v w
+letters behaves as the sum of its letters, so
+.B \-ci
+means
 .B \-c
 plus
-.B \-l .
-Mixed clusters (for example
-.B \-ci
-) stay positional.
+.B \-i ,
+.B \-Fv
+means
+.B \-F
+plus
+.B \-v ,
+and
+.B \-iw
+means
+.B \-i
+plus
+.BR \-w .
+A cluster containing any other letter stays positional.
 .TP
 .B \-
 Read standard input instead of
