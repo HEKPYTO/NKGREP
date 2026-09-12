@@ -8,5 +8,5 @@ change, update both together.
 Render without installing:
 
 ```bash
-man -l man/nkg.1
+man ./man/nkg.1
 ```

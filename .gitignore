@@ -35,3 +35,11 @@ serve.json
 
 # macOS
 .DS_Store
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets/
