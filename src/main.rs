@@ -621,22 +621,60 @@ fn parse_index_auto(idx_path: &str, data: &[u8]) -> Index {
         Err(e) => refuse_index(idx_path, "old format", &e),
     }
 }
-/// Load an index for a query rooted at `query_root`: refuse (exit 2) on
-/// fingerprint mismatch, then materialize root-relative entries to
-/// query-root-joined paths so rank/verify see scan-identical strings.
-fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
+/// Check a query root against an index root before the serve-first probe:
+/// exit 2 when the query root lies outside the index tree, else report
+/// whether it equals the index root (only exact-root queries are serve
+/// eligible; subtree queries go cold so both paths agree by construction).
+fn serve_eligible_root(idx_path: &str, query_root: &std::path::Path) -> bool {
     let data = read_index_bytes(idx_path);
-    let mut idx = parse_index_auto(idx_path, &data);
+    let idx = parse_index_auto(idx_path, &data);
     let q_canon = canon_root(query_root);
-    if q_canon.to_string_lossy() != idx.root {
+    let idx_canon = canon_root(&PathBuf::from(&idx.root));
+    let rel = match q_canon.strip_prefix(&idx_canon) {
+        Ok(r) => r.to_owned(),
+        Err(_) => {
+            eprintln!(
+                "nkg: index root mismatch (built at {}, queried at {})",
+                idx.root,
+                q_canon.display()
+            );
+            std::process::exit(2);
+        }
+    };
+    let (dev, ino) = root_cookie(&idx_canon);
+    if (dev, ino) != (idx.root_dev, idx.root_ino) {
         eprintln!(
-            "nkg: index root mismatch (built at {}, queried at {})",
+            "nkg: index root mismatch (built at {}, queried at {}: root replaced)",
             idx.root,
             q_canon.display()
         );
         std::process::exit(2);
     }
-    let (dev, ino) = root_cookie(&q_canon);
+    rel.as_os_str().is_empty()
+}
+
+/// Load an index for a query rooted at `query_root`: refuse (exit 2) when
+/// the query root lies outside the index root, then keep only entries under
+/// the query root and materialize them to query-root-joined paths so
+/// rank/verify see scan-identical strings.
+fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
+    let data = read_index_bytes(idx_path);
+    let mut idx = parse_index_auto(idx_path, &data);
+    let q_canon = canon_root(query_root);
+    let idx_base = PathBuf::from(&idx.root);
+    let idx_canon = canon_root(&idx_base);
+    let rel = match q_canon.strip_prefix(&idx_canon) {
+        Ok(r) => r.to_owned(),
+        Err(_) => {
+            eprintln!(
+                "nkg: index root mismatch (built at {}, queried at {})",
+                idx.root,
+                q_canon.display()
+            );
+            std::process::exit(2);
+        }
+    };
+    let (dev, ino) = root_cookie(&idx_canon);
     if (dev, ino) != (idx.root_dev, idx.root_ino) {
         eprintln!(
             "nkg: index root mismatch (built at {}, queried at {}: root replaced)",
@@ -646,14 +684,44 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
         std::process::exit(2);
     }
     validate_stored_files(idx_path, &idx.files);
-    for f in idx.files.iter_mut() {
+    // Narrow to the queried subtree: stored paths are index-root-relative,
+    // so drop entries outside the query root and re-base the survivors onto
+    // it (`query_root.join(suffix)` echoes the argv prefix like a scan).
+    // Postings hold file ids, so remap them alongside the filter.
+    let mut remap: Vec<Option<u32>> = vec![None; idx.files.len()];
+    let mut kept = Vec::with_capacity(idx.files.len());
+    for (id, f) in idx.files.iter().enumerate() {
+        let suffix = if rel.as_os_str().is_empty() {
+            f.clone()
+        } else {
+            match std::path::Path::new(f).strip_prefix(&rel) {
+                Ok(s) => s.to_string_lossy().into_owned(),
+                Err(_) => continue,
+            }
+        };
         // rg parity (audit #10): `query_root.join(rel)` echoes the argv
         // prefix (`.` -> `./src/a.txt`); strip one leading `./` so cold
         // indexed prints `src/a.txt` like rg and like the serve wire.
         // SHAPE CHANGE: indexed JSON/text paths with a `.` root lose `./`.
-        let joined = query_root.join(&*f).to_string_lossy().into_owned();
-        *f = strip_dot_slash(&joined).to_owned();
+        let joined = if suffix.is_empty() {
+            query_root.to_string_lossy().into_owned()
+        } else {
+            query_root.join(&suffix).to_string_lossy().into_owned()
+        };
+        remap[id] = Some(kept.len() as u32);
+        kept.push(strip_dot_slash(&joined).to_owned());
     }
+    idx.files = kept;
+    for ids in idx.postings.values_mut() {
+        ids.retain_mut(|id| match remap[*id as usize] {
+            Some(n) => {
+                *id = n;
+                true
+            }
+            None => false,
+        });
+    }
+    idx.postings.retain(|_, ids| !ids.is_empty());
     idx
 }
 
@@ -3980,85 +4048,94 @@ fn main() {
     };
 
     let t0 = Instant::now();
-    if port.is_none() {
+    // Root check runs before the serve-first probe so both paths agree on
+    // exit status; subtree queries skip serve (the daemon covers the whole
+    // index root) and go cold, where candidates are narrowed to the subtree.
+    let serve_ok = if port.is_none() {
         if let Some(idx_path) = &use_index {
-            match try_serve_query(
-                idx_path,
-                &pattern,
-                top,
-                ignore_case,
-                ctx_before,
-                ctx_after,
-                &mspec,
-            ) {
-                ServeProbe::Hit(raw, matches) => {
-                    // `-q` over serve suppresses stdout client-side; the daemon
-                    // has no quiet protocol (short-circuit lives on the cold
-                    // path). Exit codes keep the 0/1 contract.
-                    if count_mode || files_only {
-                        // `-c` / `-l` over serve-first: aggregate the served JSON
-                        // lines client-side (--top already applied server-side;
-                        // `-l` wins over `-c`, `-q` still suppresses stdout).
-                        // `matched` counts distinct hit files (cold parity);
-                        // diagnostics keep the cold `matches in files` + `index
-                        // load` shape so stderr needs one grammar (`via serve`
-                        // rides inside the parens, load is 0 with no cold read).
-                        let rows = served_path_counts(&raw);
-                        if !quiet {
-                            let refs: Vec<(&str, usize)> =
-                                rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
-                            let stdout = std::io::stdout();
-                            let mut writer =
-                                std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-                            write_aggregates(&mut writer, &refs, files_only);
-                            stdout_flush(&mut writer);
-                        }
-                        let matched = rows.len();
-                        eprintln!(
-                            "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
-                            t0.elapsed().as_millis()
-                        );
-                        if matches == 0 {
-                            std::process::exit(1);
-                        }
-                        return;
-                    }
+            serve_eligible_root(idx_path, &root)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if port.is_none() && serve_ok {
+        let idx_path = use_index.as_ref().expect("guarded by serve_ok");
+        match try_serve_query(
+            idx_path,
+            &pattern,
+            top,
+            ignore_case,
+            ctx_before,
+            ctx_after,
+            &mspec,
+        ) {
+            ServeProbe::Hit(raw, matches) => {
+                // `-q` over serve suppresses stdout client-side; the daemon
+                // has no quiet protocol (short-circuit lives on the cold
+                // path). Exit codes keep the 0/1 contract.
+                if count_mode || files_only {
+                    // `-c` / `-l` over serve-first: aggregate the served JSON
+                    // lines client-side (--top already applied server-side;
+                    // `-l` wins over `-c`, `-q` still suppresses stdout).
+                    // `matched` counts distinct hit files (cold parity);
+                    // diagnostics keep the cold `matches in files` + `index
+                    // load` shape so stderr needs one grammar (`via serve`
+                    // rides inside the parens, load is 0 with no cold read).
+                    let rows = served_path_counts(&raw);
                     if !quiet {
+                        let refs: Vec<(&str, usize)> =
+                            rows.iter().map(|(p, n)| (p.as_str(), *n)).collect();
                         let stdout = std::io::stdout();
                         let mut writer =
                             std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
-                        if ctx_on {
-                            // Context owns the output: regrouped rg-shaped rows
-                            // from the carried hit+ctx wire (rank groups kept).
-                            let text =
-                                render_served_context(&raw, ctx_before, ctx_after, &group_sep);
-                            stdout_write_all(&mut writer, &text);
-                        } else if format_text {
-                            // Text renders client-side from the JSON wire (rank
-                            // order kept); the daemon wire is untouched. Color
-                            // highlights client-side via serve_text_out.
-                            let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
-                            stdout_write_all(&mut writer, &text);
-                        } else {
-                            stdout_write_all(&mut writer, &raw);
-                        }
+                        write_aggregates(&mut writer, &refs, files_only);
                         stdout_flush(&mut writer);
                     }
-                    let matched = served_file_count(&raw);
+                    let matched = rows.len();
                     eprintln!(
-                        "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
-                        t0.elapsed().as_millis()
-                    );
+                            "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
+                            t0.elapsed().as_millis()
+                        );
                     if matches == 0 {
                         std::process::exit(1);
                     }
                     return;
                 }
-                ServeProbe::MissWarn(msg) => {
-                    eprintln!("{msg}");
+                if !quiet {
+                    let stdout = std::io::stdout();
+                    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+                    if ctx_on {
+                        // Context owns the output: regrouped rg-shaped rows
+                        // from the carried hit+ctx wire (rank groups kept).
+                        let text = render_served_context(&raw, ctx_before, ctx_after, &group_sep);
+                        stdout_write_all(&mut writer, &text);
+                    } else if format_text {
+                        // Text renders client-side from the JSON wire (rank
+                        // order kept); the daemon wire is untouched. Color
+                        // highlights client-side via serve_text_out.
+                        let text = serve_text_out(&raw, &pattern, ignore_case, color_on);
+                        stdout_write_all(&mut writer, &text);
+                    } else {
+                        stdout_write_all(&mut writer, &raw);
+                    }
+                    stdout_flush(&mut writer);
                 }
-                ServeProbe::MissSilent => {}
+                let matched = served_file_count(&raw);
+                eprintln!(
+                    "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
+                    t0.elapsed().as_millis()
+                );
+                if matches == 0 {
+                    std::process::exit(1);
+                }
+                return;
             }
+            ServeProbe::MissWarn(msg) => {
+                eprintln!("{msg}");
+            }
+            ServeProbe::MissSilent => {}
         }
     }
     if let Some(p) = port {
