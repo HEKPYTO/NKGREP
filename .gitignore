@@ -3,6 +3,7 @@
 
 # PRIVATE device-only surface — never commit
 HANDOFF.md
+CHANGELOG.md
 AGENTS.md
 docs/
 plans/
