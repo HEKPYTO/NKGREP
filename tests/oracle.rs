@@ -341,6 +341,34 @@ fn aggregates_equal_scan() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--` ends the flag scan: everything after it is a positional, even when it
+/// looks like a flag (`--top`, `-l`).
+#[test]
+fn dashdash_ends_flag_scan() {
+    let dir = fixture_in("dashdash");
+    std::fs::write(dir.join("a.txt"), "--top\n-l\nother\n").unwrap();
+    for pat in ["--top", "-l"] {
+        let out = Command::new(bin())
+            .args(["--", pat, "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "exit for {pat}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let got: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(got["text"].as_str().unwrap(), pat);
+    }
+    // Flags before `--` still apply: -l lists the file, not the flag letter.
+    let out = Command::new(bin())
+        .args(["-l", "--", "-l", "."])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8(out.stdout).unwrap().contains("a.txt"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn svec<const N: usize>(a: [&str; N]) -> Vec<String> {
     a.into_iter().map(|s| s.to_string()).collect()
 }
@@ -349,4 +377,104 @@ fn idxv<const N: usize>(idx: &str, rest: [&str; N]) -> Vec<String> {
     let mut v = vec!["--use-index".to_string(), idx.to_string()];
     v.extend(rest.into_iter().map(|s| s.to_string()));
     v
+}
+
+/// Rebuild-self-exclusion: an index file living inside its own corpus must
+/// not index itself — a rebuild must list the same files as the first build
+/// and indexed queries must equal scan queries on both generations.
+#[test]
+fn rebuild_in_corpus_excludes_itself() {
+    let dir = fixture_in("rebuild-self");
+    let idx = dir.join("nkg.idx.json");
+    let idx_s = idx.to_string_lossy().into_owned();
+    for _ in 0..2 {
+        let st = Command::new(bin())
+            .args(["index", ".", "--index"])
+            .arg(&idx)
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+    let data = std::fs::read_to_string(&idx).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&data).unwrap();
+    let files: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert!(
+        !files.iter().any(|f| f.ends_with("nkg.idx.json")),
+        "index contains itself: {files:?}"
+    );
+    for q in ["NEEDLE_ALPHA", "config"] {
+        let scan = run(&["--", q, "."], &dir);
+        let got = run(&["--use-index", &idx_s, "--", q, "."], &dir);
+        assert!(!scan.is_empty(), "scan found nothing for {q}");
+        assert_eq!(scan, got, "rebuild divergence on {q}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Loud I/O errors (unix): a permission-denied directory fails the index
+/// build with exit 2 and no index written; an unreadable file fails both the
+/// index build and a query with exit 2 instead of silently dropping from one
+/// side (a build that skipped it would return fewer indexed hits with exit 0
+/// where scan exits 2). Permissions are restored before cleanup so the temp
+/// dir always removes.
+#[cfg(unix)]
+#[test]
+fn loud_io_errors() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = fixture_in("loud-io");
+    // Denied directory: index build must exit 2 with no index written.
+    let denied = dir.join("denied");
+    std::fs::create_dir(&denied).unwrap();
+    std::fs::write(denied.join("s.txt"), "secret NEEDLE_ALPHA\n").unwrap();
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let idx = dir.join("o.idx.json");
+    let st = Command::new(bin())
+        .args(["index", ".", "--index"])
+        .arg(&idx)
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert_eq!(st.code(), Some(2), "denied-dir build must exit 2");
+    assert!(!idx.exists(), "partial index must not be written");
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Unreadable file: scan query must exit 2. Root bypasses permission
+    // bits, so skip when the file stays readable (e.g. CI as root).
+    let locked = dir.join("locked.txt");
+    std::fs::write(&locked, "locked NEEDLE_ALPHA\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let out = Command::new(bin())
+        .args(["index", ".", "--index"])
+        .arg(&idx)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unreadable-file build must exit 2"
+    );
+    assert!(!idx.exists(), "partial index must not be written");
+    let out = Command::new(bin())
+        .args(["--", "NEEDLE_ALPHA", "."])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unreadable-file query must exit 2"
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
