@@ -13,8 +13,9 @@ fn fixture() -> PathBuf {
 }
 
 fn fixture_in(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nkg-oracle-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("nkg-oracle-{}-{name}-{n}", std::process::id()));
     for pkg in 0..4 {
         let d = dir.join(format!("pkg_{pkg}"));
         std::fs::create_dir_all(&d).unwrap();
@@ -720,5 +721,49 @@ fn daemon_subtree_equals_scan() {
     );
     srv.kill().ok();
     srv.wait().ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Piped stdin with --port is a usage error (exit 2); without --port it
+/// searches stdin (exit 0). Guards silent daemon-corpus search on pipes.
+#[test]
+fn piped_stdin_with_port_is_usage_error() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = fixture();
+    // Without --port: stdin search, exit 0.
+    let mut kid = Command::new(bin())
+        .args(["--", "marker"])
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    kid.stdin
+        .take()
+        .unwrap()
+        .write_all(b"marker here\n")
+        .unwrap();
+    let out = kid.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    // With --port: usage error, exit 2.
+    let mut kid = Command::new(bin())
+        .args(["--port", "1", "--", "marker"])
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    kid.stdin
+        .take()
+        .unwrap()
+        .write_all(b"marker here\n")
+        .unwrap();
+    let out = kid.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("stdin search cannot use --port"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }

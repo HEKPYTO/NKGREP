@@ -4239,7 +4239,7 @@ fn main() {
         } else {
             pos.len() == 1
         });
-    if stdin_explicit && port.is_some() {
+    if (stdin_explicit || stdin_piped) && port.is_some() {
         eprintln!("nkg: stdin search cannot use --port");
         usage();
     }
