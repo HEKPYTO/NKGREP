@@ -21,10 +21,8 @@ cases (`flag_matrix_equals_scan`, 18 shapes and counting).
 - **B**: selective indexed vs scan — indexed must win.
 - **C**: top-k indexed vs ripgrep full — top-k must win.
 
-Run:
-
 ```sh
 cargo test
-cd bench && ../target/release/nkg index corpus --index nk.idx.json
-python3 bench_index.py     # run from bench/
+(cd bench && ../target/release/nkg index corpus --index nk.idx.json)
+python3 bench/bench_index.py     # run from repo root
 ```

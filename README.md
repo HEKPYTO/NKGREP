@@ -58,7 +58,7 @@ full run).
 ## Learn More
 
 - Bench (`bench/README.md`) — full numbers, corpora, and how to re-run everything.
-- Man (`man/nkg.1`) — every flag, exit code, and example (`man -l man/nkg.1`).
+- Man (`man/nkg.1`) — every flag, exit code, and example (`man ./man/nkg.1`).
 - Completions (`completions/`) — shell setup for bash, zsh, and fish.
 - Src (`src/README.md`) — architecture and extension points.
 - Tests (`tests/README.md`) — match-set equality contract and fixtures.
