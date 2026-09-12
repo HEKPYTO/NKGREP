@@ -478,3 +478,65 @@ fn loud_io_errors() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Daemon verify I/O errors (unix): an unreadable corpus file must surface
+/// as client exit 2 with readable hits still printed, not a silent empty
+/// response.
+#[cfg(unix)]
+#[test]
+fn daemon_verify_io_error_exits_2() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = fixture_in("daemon-io-err");
+    let idx = dir.join("d.idx.json");
+    let st = Command::new(bin())
+        .args(["index", ".", "--index"])
+        .arg(&idx)
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert_eq!(st.code(), Some(0));
+    let locked = dir.join("pkg_0").join("m_0.txt");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    use std::process::Stdio;
+    let mut srv = Command::new(bin())
+        .args(["serve", "--index"])
+        .arg(&idx)
+        .args(["--port"])
+        .arg(port.to_string())
+        .current_dir(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready, "daemon did not bind");
+    let out = Command::new(bin())
+        .args(["--port", &port.to_string(), "--", "NEEDLE_ALPHA", "."])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "daemon client must exit 2");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("NEEDLE_ALPHA"),
+        "readable hits still printed"
+    );
+    srv.kill().ok();
+    srv.wait().ok();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

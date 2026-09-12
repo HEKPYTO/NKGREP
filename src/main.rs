@@ -2418,9 +2418,8 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
         // no per-hit serde struct setup, no Arc path clones, no per-hit
         // path escaping.
         let mut broken = false;
-        // Echoed on the done line when the query asked for context, so new
-        // clients can tell an old (context-ignoring) daemon from a new one.
         let mut ctx_asked = false;
+        let mut verify_err = false;
         match serde_json::from_str::<Query>(line.trim()) {
             Err(_) => {}
             Ok(q) => {
@@ -2500,6 +2499,7 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                         // `-m` caps each file before rank/top, mirroring the cold
                         // path (capped `-c` shapes come out of the wire for free).
                         apply_max_count(&mut files, q.max_count);
+                        verify_err |= take_verify_io_error();
                         let (hit_scores, loc) = flat_scores(&files);
                         let mut ord = raw_order(&hit_scores);
                         if let Some(n) = q.top {
@@ -2594,26 +2594,17 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                 }
             }
         }
-        // Context echo (ContextLines): `,"ctx":true` only when the query
-        // asked for context, so new clients detect old daemons (fail over
-        // to cold). The default done line is byte-identical to before.
-        if ctx_asked {
-            if writeln!(
-                writer,
-                "{{\"done\":true,\"ms\":{},\"ctx\":true}}",
-                t0.elapsed().as_millis()
-            )
-            .is_err()
-            {
-                broken = true;
-            }
-        } else if writeln!(
-            writer,
-            "{{\"done\":true,\"ms\":{}}}",
-            t0.elapsed().as_millis()
-        )
-        .is_err()
-        {
+        let ms = t0.elapsed().as_millis();
+        let done = if ctx_asked && verify_err {
+            format!("{{\"done\":true,\"ms\":{ms},\"ctx\":true,\"verify_error\":true}}")
+        } else if ctx_asked {
+            format!("{{\"done\":true,\"ms\":{ms},\"ctx\":true}}")
+        } else if verify_err {
+            format!("{{\"done\":true,\"ms\":{ms},\"verify_error\":true}}")
+        } else {
+            format!("{{\"done\":true,\"ms\":{ms}}}")
+        };
+        if writeln!(writer, "{done}").is_err() {
             broken = true;
         }
         if writer.flush().is_err() {
@@ -2719,7 +2710,7 @@ fn save_serve_info(idx_path: &str, port: u16) {
 /// a single warned fallback (stale pid/reuse, or a live registration whose
 /// listener/reply failed). At most one line is ever printed by the caller.
 enum ServeProbe {
-    Hit(Vec<u8>, usize),
+    Hit(Vec<u8>, usize, bool),
     MissSilent,
     MissWarn(String),
 }
@@ -2819,7 +2810,7 @@ fn client_query(
     before: usize,
     after: usize,
     mspec: &MatchSpec,
-) -> (Vec<u8>, usize, Option<String>, bool) {
+) -> (Vec<u8>, usize, Option<String>, bool, bool) {
     let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
         Ok(s) => s,
         Err(e) => {
@@ -2852,6 +2843,7 @@ fn client_query(
     let mut matches = 0usize;
     let mut bad_regex: Option<String> = None;
     let mut ctx_echo = false;
+    let mut verify_err = false;
     let ctx_on = before > 0 || after > 0;
     let mut line = String::new();
     loop {
@@ -2866,10 +2858,11 @@ fn client_query(
         }
         let t = line.trim();
         if t.contains("\"done\"") {
-            // New daemons echo `"ctx":true` when the query asked for
-            // context; without it an old daemon silently served plain hits.
             if t.contains("\"ctx\":true") {
                 ctx_echo = true;
+            }
+            if t.contains("\"verify_error\"") {
+                verify_err = true;
             }
             break;
         }
@@ -2902,7 +2895,7 @@ fn client_query(
         matches += 1;
         raw.extend_from_slice(line.as_bytes());
     }
-    (raw, matches, bad_regex, ctx_echo)
+    (raw, matches, bad_regex, ctx_echo, verify_err)
 }
 /// Serve-first probe for `--use-index`: connect to the daemon registered in
 /// `<index>.serve.json`, if any. No sidecar (or an unparseable one) is a
@@ -2970,6 +2963,7 @@ fn try_serve_query(
     // to the cold path, matching the old fallible-parse behavior.
     let ctx_on = before > 0 || after > 0;
     let mut ctx_echo = false;
+    let mut verify_err = false;
     let mut raw = vec![];
     let mut matches = 0usize;
     let mut line = String::new();
@@ -2980,10 +2974,11 @@ fn try_serve_query(
         }
         let t = line.trim();
         if t.contains("\"done\"") {
-            // New daemons echo `"ctx":true` when the query asked for
-            // context (daemon-generated line: substring match is sound).
             if t.contains("\"ctx\":true") {
                 ctx_echo = true;
+            }
+            if t.contains("\"verify_error\"") {
+                verify_err = true;
             }
             break;
         }
@@ -3011,7 +3006,7 @@ fn try_serve_query(
         // over to the cold path, which attaches context locally.
         return ServeProbe::MissWarn(UNREACHABLE.to_string());
     }
-    ServeProbe::Hit(raw, matches)
+    ServeProbe::Hit(raw, matches, verify_err)
 }
 /// Cold-emission JSON string escaper (Escaper region): byte-identical to
 /// serde_json for `&str` input. Only `"`, `\` and bytes < 0x20 escape;
@@ -4186,7 +4181,7 @@ fn main() {
             ctx_after,
             &mspec,
         ) {
-            ServeProbe::Hit(raw, matches) => {
+            ServeProbe::Hit(raw, matches, verify_err) => {
                 // `-q` over serve suppresses stdout client-side; the daemon
                 // has no quiet protocol (short-circuit lives on the cold
                 // path). Exit codes keep the 0/1 contract.
@@ -4213,6 +4208,9 @@ fn main() {
                             "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
                             t0.elapsed().as_millis()
                         );
+                    if verify_err {
+                        std::process::exit(2);
+                    }
                     if matches == 0 {
                         std::process::exit(1);
                     }
@@ -4242,6 +4240,9 @@ fn main() {
                     "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
                     t0.elapsed().as_millis()
                 );
+                if verify_err {
+                    std::process::exit(2);
+                }
                 if matches == 0 {
                     std::process::exit(1);
                 }
@@ -4257,7 +4258,7 @@ fn main() {
         eprintln!("nkg: walk filters set; bypassing server, searching locally");
     }
     if let Some(p) = port.filter(|_| walk_default) {
-        let (raw, matches, bad_regex, ctx_echo) =
+        let (raw, matches, bad_regex, ctx_echo, verify_err) =
             client_query(p, &pattern, top, ignore_case, ctx_before, ctx_after, &mspec);
         if let Some(msg) = bad_regex {
             eprintln!("nkg: bad regex: {msg}");
@@ -4307,6 +4308,9 @@ fn main() {
                 "nkg: {matches} matches in {matched} files, {} ms (index load 0 ms via serve)",
                 t0.elapsed().as_millis()
             );
+        }
+        if verify_err {
+            std::process::exit(2);
         }
         if matches == 0 {
             std::process::exit(1);
