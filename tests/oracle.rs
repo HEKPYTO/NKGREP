@@ -540,3 +540,99 @@ fn daemon_verify_io_error_exits_2() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Request-scoped verify latch (unix): two concurrent daemon clients must not
+/// cross-attribute I/O errors. The error client's drain must not steal the
+/// clean client's flag (false exit 2) nor vice versa (false clean done).
+/// The locked file holds a unique marker so only the error query verifies it;
+/// a barrier (no sleeps) forces the two requests to overlap inside the
+/// daemon, repeated in a tight loop so a global latch flakes reliably.
+#[cfg(unix)]
+#[test]
+fn daemon_verify_latch_is_request_scoped() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use std::sync::{Arc, Barrier};
+    let dir = fixture_in("daemon-latch-scope");
+    // Unique marker lives only in the locked file: NEEDLE_ALPHA queries never
+    // verify it, ZZZ queries always do.
+    let locked = dir.join("pkg_0").join("m_0.txt");
+    std::fs::write(&locked, "ZZZ_BAD_FILE marker line\n").unwrap();
+    let idx = dir.join("d.idx.json");
+    let st = Command::new(bin())
+        .args(["index", ".", "--index"])
+        .arg(&idx)
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert_eq!(st.code(), Some(0));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let mut srv = Command::new(bin())
+        .args(["serve", "--index"])
+        .arg(&idx)
+        .args(["--port"])
+        .arg(port.to_string())
+        .current_dir(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready, "daemon did not bind");
+    // Baseline clean rows while the bad file is locked: single client, exit 0.
+    let base = Command::new(bin())
+        .args(["--port", &port.to_string(), "--", "NEEDLE_ALPHA", "."])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(base.status.code(), Some(0), "clean query must exit 0");
+    assert!(
+        String::from_utf8_lossy(&base.stdout).contains("NEEDLE_ALPHA"),
+        "clean query must print rows"
+    );
+    let port_s = port.to_string();
+    let dir_a = Arc::new(dir);
+    for _ in 0..20 {
+        let barrier = Arc::new(Barrier::new(2));
+        let run_one = |b: Arc<Barrier>, pat: &'static str| {
+            let d = Arc::clone(&dir_a);
+            let p = port_s.clone();
+            std::thread::spawn(move || {
+                b.wait();
+                Command::new(bin())
+                    .args(["--port", &p, "--", pat, "."])
+                    .current_dir(&*d)
+                    .output()
+                    .unwrap()
+            })
+        };
+        let eb = Arc::clone(&barrier);
+        let cb = Arc::clone(&barrier);
+        let eh = run_one(eb, "ZZZ_BAD_FILE");
+        let ch = run_one(cb, "NEEDLE_ALPHA");
+        let eout = eh.join().unwrap();
+        let cout = ch.join().unwrap();
+        assert_eq!(eout.status.code(), Some(2), "error client must exit 2");
+        assert_eq!(cout.status.code(), Some(0), "clean client must exit 0");
+        assert_eq!(cout.stdout, base.stdout, "clean rows must be unaffected");
+    }
+    srv.kill().ok();
+    srv.wait().ok();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = std::fs::remove_dir_all(&*dir_a);
+}

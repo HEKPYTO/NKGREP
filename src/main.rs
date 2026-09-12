@@ -71,6 +71,7 @@ impl Sink for ColCollector {
 /// Cold columnar verify arguments, bundled so the entry stays under
 /// clippy's argument-count limit (same contract as `CachedVerify`).
 struct VerifyInput<'a> {
+    err: &'a AtomicBool,
     pid: u32,
     path: &'a str,
     matcher: &'a RegexMatcher,
@@ -81,37 +82,37 @@ struct VerifyInput<'a> {
     follow: bool,
 }
 
-/// Loud-verify latch (I/O-error exit-2 contract): verify runs on rayon
-/// workers and returns `Option`, so a per-file open/read failure records
-/// itself here instead of vanishing into a `None`. Callers fold
-/// `take_verify_io_error()` into `walk_error` before every emission, so an
+/// Request-scoped loud-verify latch (I/O-error exit-2 contract): verify runs
+/// on rayon workers and returns `Option`, so a per-file open/read failure
+/// records itself here instead of vanishing into a `None`. Each request owns
+/// its latch (`&AtomicBool` threaded through the verify inputs); callers fold
+/// `take_verify_io_error(err)` into `walk_error` before every emission, so an
 /// unreadable file exits 2 instead of silently matching nothing. A symlink
 /// refused under no-follow open (swapped in after the walk) still skips
 /// silently — the same outcome as a walk-filtered file.
-static VERIFY_IO_ERROR: AtomicBool = AtomicBool::new(false);
-
-/// Report one unreadable corpus file from a verify worker; the caller turns
-/// the latch into exit 2. Returns false so call sites keep their shape.
-fn note_verify_io_error(path: &str, e: &std::io::Error, follow: bool) -> bool {
+/// Report one unreadable corpus file from a verify worker into the
+/// request-scoped latch; the caller turns it into exit 2. Returns false so
+/// call sites keep their shape.
+fn note_verify_io_error(err: &AtomicBool, path: &str, e: &std::io::Error, follow: bool) -> bool {
     let raced_link = !follow
         && std::fs::symlink_metadata(std::path::Path::new(path))
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
     if !raced_link {
         eprintln!("nkg: cannot read {path}: {e}");
-        VERIFY_IO_ERROR.store(true, Ordering::Relaxed);
+        err.store(true, Ordering::Relaxed);
     }
     false
 }
-
-/// Drain the loud-verify latch (false when no worker failed since the last
-/// drain); folded into `walk_error` before every emission.
-fn take_verify_io_error() -> bool {
-    VERIFY_IO_ERROR.swap(false, Ordering::Relaxed)
+/// Drain a request-scoped loud-verify latch (false when no worker failed
+/// since the last drain); folded into `walk_error` before every emission.
+fn take_verify_io_error(err: &AtomicBool) -> bool {
+    err.swap(false, Ordering::Relaxed)
 }
 
 /// No-context wrapper over `verify_one_raw_ctx` (before=after=0, invert=false).
 fn verify_one_raw(
+    err: &AtomicBool,
     pid: u32,
     path: &str,
     matcher: &RegexMatcher,
@@ -119,6 +120,7 @@ fn verify_one_raw(
     follow: bool,
 ) -> Option<FileHits> {
     verify_one_raw_ctx(VerifyInput {
+        err,
         pid,
         path,
         matcher,
@@ -134,6 +136,7 @@ fn verify_one_raw(
 /// scores, and rank order identical with or without context/invert.
 fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
     let VerifyInput {
+        err,
         pid,
         path,
         matcher,
@@ -192,7 +195,7 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
                 }
                 Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
             })()
-            .unwrap_or_else(|e| note_verify_io_error(path, &e, follow))
+            .unwrap_or_else(|e| note_verify_io_error(err, path, &e, follow))
         })
     });
     if ok && !sink.metas.is_empty() {
@@ -214,6 +217,7 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
     }
 }
 fn verify_one_raw_cached(
+    err: &AtomicBool,
     pid: u32,
     path: &str,
     matcher: &RegexMatcher,
@@ -222,6 +226,7 @@ fn verify_one_raw_cached(
     follow: bool,
 ) -> Option<FileHits> {
     verify_one_raw_cached_ctx(CachedVerify {
+        err,
         pid,
         path,
         matcher,
@@ -235,6 +240,7 @@ fn verify_one_raw_cached(
 }
 
 struct CachedVerify<'a> {
+    err: &'a AtomicBool,
     pid: u32,
     path: &'a str,
     matcher: &'a RegexMatcher,
@@ -253,6 +259,7 @@ struct CachedVerify<'a> {
 /// the surviving hits; the hit set is identical either way.
 fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
     let CachedVerify {
+        err,
         pid,
         path,
         matcher,
@@ -304,7 +311,7 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
                 }
                 Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
             })()
-            .unwrap_or_else(|e| note_verify_io_error(path, &e, follow))
+            .unwrap_or_else(|e| note_verify_io_error(err, path, &e, follow))
         })
     });
     if ok && !sink.metas.is_empty() {
@@ -2283,6 +2290,7 @@ fn ctx_group_lines(files: &[FileHits], fi: usize, mis: &[usize]) -> Vec<u64> {
 /// Batched parallel verify arguments, bundled so the entry stays under
 /// clippy's argument-count limit (same contract as `CachedVerify`).
 struct BatchVerify<'a> {
+    err: &'a AtomicBool,
     idx: &'a Index,
     matcher: &'a RegexMatcher,
     order: &'a [u32],
@@ -2295,6 +2303,7 @@ struct BatchVerify<'a> {
 
 fn parallel_verify_batched_raw(args: BatchVerify<'_>) -> Vec<FileHits> {
     let BatchVerify {
+        err,
         idx,
         matcher,
         order,
@@ -2316,6 +2325,7 @@ fn parallel_verify_batched_raw(args: BatchVerify<'_>) -> Vec<FileHits> {
             .par_iter()
             .filter_map(|id| {
                 verify_one_raw_ctx(VerifyInput {
+                    err,
                     pid: *id,
                     path: &idx.files[*id as usize],
                     matcher,
@@ -2350,6 +2360,7 @@ fn parallel_verify_batched_raw(args: BatchVerify<'_>) -> Vec<FileHits> {
             .filter(|id| !armed || scores[**id as usize] > kth_now)
             .filter_map(|id| {
                 verify_one_raw_ctx(VerifyInput {
+                    err,
                     pid: *id,
                     path: &idx.files[*id as usize],
                     matcher,
@@ -2419,6 +2430,9 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
         // path escaping.
         let mut broken = false;
         let mut ctx_asked = false;
+        // Request-scoped I/O-error latch: concurrent clients must never
+        // cross-attribute (one client's drain cannot steal another's flag).
+        let latch = AtomicBool::new(false);
         let mut verify_err = false;
         match serde_json::from_str::<Query>(line.trim()) {
             Err(_) => {}
@@ -2474,6 +2488,7 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                                 // context/invert go direct. Zero behavior change.
                                 if q.before == 0 && q.after == 0 && !q.invert {
                                     verify_one_raw_cached(
+                                        &latch,
                                         *id,
                                         &idx.files[*id as usize],
                                         &matcher,
@@ -2483,6 +2498,7 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                                     )
                                 } else {
                                     verify_one_raw_cached_ctx(CachedVerify {
+                                        err: &latch,
                                         pid: *id,
                                         path: &idx.files[*id as usize],
                                         matcher: &matcher,
@@ -2499,7 +2515,7 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                         // `-m` caps each file before rank/top, mirroring the cold
                         // path (capped `-c` shapes come out of the wire for free).
                         apply_max_count(&mut files, q.max_count);
-                        verify_err |= take_verify_io_error();
+                        verify_err |= take_verify_io_error(&latch);
                         let (hit_scores, loc) = flat_scores(&files);
                         let mut ord = raw_order(&hit_scores);
                         if let Some(n) = q.top {
@@ -3433,7 +3449,7 @@ fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant, walk_error:
         if found { "1+ matches" } else { "0 matches" },
         t0.elapsed().as_millis()
     );
-    std::process::exit(if walk_error | take_verify_io_error() {
+    std::process::exit(if walk_error {
         2
     } else if found {
         0
@@ -4331,6 +4347,8 @@ fn main() {
     // byte-identical.
     let mut hits: Vec<FileHits> = vec![];
     let mut walk_error = false;
+    // Request-scoped I/O-error latch for this query (see handle_client).
+    let verify_latch = AtomicBool::new(false);
     let mut ptab: Vec<String> = vec![];
     let mut hits_indexed = false;
     let files: usize;
@@ -4433,6 +4451,7 @@ fn main() {
                     .into_par_iter()
                     .find_any(|pid| {
                         verify_one_raw_ctx(VerifyInput {
+                            err: &verify_latch,
                             pid: *pid,
                             path: &ptab[*pid as usize],
                             matcher: &matcher,
@@ -4445,7 +4464,13 @@ fn main() {
                         .is_some()
                     })
                     .is_some();
-                quiet_exit(found, files, load_ms, t0, walk_error);
+                quiet_exit(
+                    found,
+                    files,
+                    load_ms,
+                    t0,
+                    walk_error | take_verify_io_error(&verify_latch),
+                );
             }
             hits = (0u32..ptab.len() as u32)
                 .into_par_iter()
@@ -4461,6 +4486,7 @@ fn main() {
                         0.0
                     };
                     verify_one_raw_ctx(VerifyInput {
+                        err: &verify_latch,
                         pid,
                         path: ps,
                         matcher: &matcher,
@@ -4501,6 +4527,7 @@ fn main() {
                     .par_iter()
                     .find_any(|id| {
                         verify_one_raw(
+                            &verify_latch,
                             **id,
                             &idx.files[**id as usize],
                             &matcher,
@@ -4510,11 +4537,18 @@ fn main() {
                         .is_some()
                     })
                     .is_some();
-                quiet_exit(found, files, load_ms, t0, walk_error);
+                quiet_exit(
+                    found,
+                    files,
+                    load_ms,
+                    t0,
+                    walk_error | take_verify_io_error(&verify_latch),
+                );
             }
             // Rank-ordered parallel verify, kth early exit between batches
             // (spec §6: match score ≤ file score, exit moves only with proof).
             hits = parallel_verify_batched_raw(BatchVerify {
+                err: &verify_latch,
                 idx,
                 matcher: &matcher,
                 order: &order,
@@ -4541,6 +4575,7 @@ fn main() {
                 .into_par_iter()
                 .find_any(|pid| {
                     verify_one_raw_ctx(VerifyInput {
+                        err: &verify_latch,
                         pid: *pid,
                         path: &ptab[*pid as usize],
                         matcher: &matcher,
@@ -4553,7 +4588,13 @@ fn main() {
                     .is_some()
                 })
                 .is_some();
-            quiet_exit(found, files, load_ms, t0, walk_error);
+            quiet_exit(
+                found,
+                files,
+                load_ms,
+                t0,
+                walk_error | take_verify_io_error(&verify_latch),
+            );
         }
         hits = (0u32..ptab.len() as u32)
             .into_par_iter()
@@ -4568,6 +4609,7 @@ fn main() {
                     0.0
                 };
                 verify_one_raw_ctx(VerifyInput {
+                    err: &verify_latch,
                     pid,
                     path: ps,
                     matcher: &matcher,
@@ -4620,7 +4662,7 @@ fn main() {
             "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
-        walk_error |= take_verify_io_error();
+        walk_error |= take_verify_io_error(&verify_latch);
         if walk_error {
             std::process::exit(2);
         }
@@ -4683,7 +4725,7 @@ fn main() {
             "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
-        walk_error |= take_verify_io_error();
+        walk_error |= take_verify_io_error(&verify_latch);
         if walk_error {
             std::process::exit(2);
         }
@@ -4719,7 +4761,7 @@ fn main() {
             "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
             t0.elapsed().as_millis()
         );
-        walk_error |= take_verify_io_error();
+        walk_error |= take_verify_io_error(&verify_latch);
         if walk_error {
             std::process::exit(2);
         }
@@ -4807,7 +4849,7 @@ fn main() {
         "nkg: {matches} matches in {matched} files, {} ms (index load {load_ms} ms)",
         t0.elapsed().as_millis()
     );
-    walk_error |= take_verify_io_error();
+    walk_error |= take_verify_io_error(&verify_latch);
     if walk_error {
         std::process::exit(2);
     }
@@ -4870,8 +4912,9 @@ mod literal_tests {
         let ap = a.to_string_lossy().into_owned();
         let matcher = RegexMatcher::new("needle").unwrap();
         let fdc = FdCache::new(1);
-        let plain = verify_one_raw(0, &ap, &matcher, 10.0, false).expect("plain must hit");
-        let cached = verify_one_raw_cached(0, &ap, &matcher, 10.0, Some((&fdc, 0)), false)
+        let latch = AtomicBool::new(false);
+        let plain = verify_one_raw(&latch, 0, &ap, &matcher, 10.0, false).expect("plain must hit");
+        let cached = verify_one_raw_cached(&latch, 0, &ap, &matcher, 10.0, Some((&fdc, 0)), false)
             .expect("cached must hit");
         assert_eq!(cached.metas.len(), plain.metas.len());
         for (c, p) in cached.metas.iter().zip(plain.metas.iter()) {
@@ -4955,7 +4998,9 @@ mod literal_tests {
         let matcher = RegexMatcher::new("needle_haystack_content").unwrap();
         let order = vec![0u32, 1u32];
         let scores = vec![10.0f64, 5.0f64];
+        let latch = AtomicBool::new(false);
         let batched = parallel_verify_batched_raw(BatchVerify {
+            err: &latch,
             idx: &idx,
             matcher: &matcher,
             order: &order,
@@ -4970,7 +5015,15 @@ mod literal_tests {
         let scanned_all: Vec<FileHits> = [(0u32, 10.0f64), (1u32, 5.0f64)]
             .into_iter()
             .filter_map(|(id, s)| {
-                verify_one_raw_cached(id, &idx.files[id as usize], &matcher, s, None, false)
+                verify_one_raw_cached(
+                    &latch,
+                    id,
+                    &idx.files[id as usize],
+                    &matcher,
+                    s,
+                    None,
+                    false,
+                )
             })
             .collect();
         let (scanned_scores, _) = flat_scores(&scanned_all);
@@ -5080,7 +5133,9 @@ mod literal_tests {
         std::fs::write(&a, "foo one\nbar two\nfoo three\nbaz four\n").unwrap();
         let ap = a.to_string_lossy().into_owned();
         let m = RegexMatcher::new("foo").unwrap();
+        let latch = AtomicBool::new(false);
         let norm = verify_one_raw_ctx(VerifyInput {
+            err: &latch,
             pid: 0,
             path: &ap,
             matcher: &m,
@@ -5093,6 +5148,7 @@ mod literal_tests {
         .expect("plain must hit");
         assert_eq!(norm.metas.len(), 2);
         let inv = verify_one_raw_ctx(VerifyInput {
+            err: &latch,
             pid: 0,
             path: &ap,
             matcher: &m,
@@ -5108,6 +5164,7 @@ mod literal_tests {
         assert_eq!(banked_text(&inv, &inv.metas[0]), "bar two");
         // Same through the cached twin (serve path).
         let inv_c = verify_one_raw_cached_ctx(CachedVerify {
+            err: &latch,
             pid: 0,
             path: &ap,
             matcher: &m,
@@ -5123,6 +5180,7 @@ mod literal_tests {
         assert_eq!(inv_c.metas[0].line, 2);
         // -m keeps file order (first m).
         let mut capped = verify_one_raw_ctx(VerifyInput {
+            err: &latch,
             pid: 0,
             path: &ap,
             matcher: &m,
@@ -5425,13 +5483,15 @@ mod context_tests {
         std::fs::write(&f, "first\r\nneedle one\nmiddle\nneedle two").unwrap();
         let fp = f.to_string_lossy().into_owned();
         let matcher = RegexMatcher::new("needle").unwrap();
-        let plain = verify_one_raw(0, &fp, &matcher, 10.0, false).expect("must hit");
+        let latch = AtomicBool::new(false);
+        let plain = verify_one_raw(&latch, 0, &fp, &matcher, 10.0, false).expect("must hit");
         let before: Vec<String> = plain
             .metas
             .iter()
             .map(|m| banked_text(&plain, m).into_owned())
             .collect();
         let attached = verify_one_raw_ctx(VerifyInput {
+            err: &latch,
             pid: 0,
             path: &fp,
             matcher: &matcher,
