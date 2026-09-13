@@ -756,11 +756,8 @@ fn piped_stdin_with_port_is_usage_error() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    kid.stdin
-        .take()
-        .unwrap()
-        .write_all(b"marker here\n")
-        .unwrap();
+    // The child may exit before reading: ignore EPIPE, exit code is the assert.
+    let _ = kid.stdin.take().unwrap().write_all(b"marker here\n");
     let out = kid.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
