@@ -3,8 +3,9 @@
 
 # PRIVATE device-only surface — never commit
 HANDOFF.md
-CHANGELOG.md
 AGENTS.md
+ISSUE.md
+ISSUES.md
 docs/
 plans/
 outputs/
@@ -32,6 +33,9 @@ corpus*/
 # Serve configs
 *.serve.json
 serve.json
+
+# Private experiment log (stays on disk, never committed)
+decision.tsv
 
 # macOS
 .DS_Store

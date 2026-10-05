@@ -36,6 +36,7 @@ _nkg() {
         '--use-index+[index file]:index file:_files' \
         '--port+[daemon port]:port:' \
         '--index+[index file]:index file:_files' \
+        '--stats[print query plan to stderr]' \
         '--[end of flags]' \
         '-:stdin operand:( - )' \
         '1:subcommand:(index serve)' \

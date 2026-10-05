@@ -23,6 +23,6 @@ cases (`flag_matrix_equals_scan`, 18 shapes and counting).
 
 ```sh
 cargo test
-(cd bench && ../target/release/nkg index corpus --index nk.idx.json)
+(cd bench && ../target/release/nkg index corpus --index nk.idx.bin)
 python3 bench/bench_index.py     # run from repo root
 ```

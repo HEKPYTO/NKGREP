@@ -187,12 +187,22 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
             // for exactly this and is checked per match, so the file stops
             // being scanned the moment it hits. The TLS searcher is
             // fixed-config, so the capped one is built per file instead.
+            // `invert` and `match_limit` are independent: `-l -v` wants the
+            // files WITHOUT the match, which is the capped searcher on top of
+            // the inverted one. Setting them in sequence (rather than
+            // `else if`) is what keeps `-l -v` from silently degrading to a
+            // plain capped search, which returns the complement.
             let mut local: Option<Searcher> = None;
             let mut normal = s.borrow_mut();
-            if let Some(limit) = match_limit {
-                local = Some(SearcherBuilder::new().max_matches(Some(limit)).build());
-            } else if invert {
-                local = Some(SearcherBuilder::new().invert_match(true).build());
+            if invert || match_limit.is_some() {
+                let mut b = SearcherBuilder::new();
+                if invert {
+                    b.invert_match(true);
+                }
+                if let Some(limit) = match_limit {
+                    b.max_matches(Some(limit));
+                }
+                local = Some(b.build());
             }
             let searcher: &mut Searcher = match local.as_mut() {
                 Some(inv) => inv,
@@ -3619,8 +3629,34 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                         // keeps serve==cold on every `-i` query. `-v` skips it
                         // too: inverted matches live outside the gram files, so
                         // pruning would false-negative by construction.
-                        let all_files =
-                            || (0..idx.files.len() as u32).map(|id| (id, 0.0)).collect();
+                        // Every file gets cold's score: path bonus minus depth.
+                        // A flat 0.0 here made serve disagree with cold on `-v`
+                        // and on gram-less queries, because cold's scan paths
+                        // score `bonus - depth` and the daemon must match them
+                        // byte for byte.
+                        let all_files = || {
+                            (0..idx.files.len() as u32)
+                                .map(|id| {
+                                    let stored = &idx.files[id as usize];
+                                    let rp = daemon_rank_path(
+                                        stored,
+                                        &idx.root,
+                                        qrel.as_deref(),
+                                        &q.display_root,
+                                    );
+                                    let depth =
+                                        std::path::Path::new(rp.as_ref()).components().count()
+                                            as f64;
+                                    let bonus =
+                                        if q_pats.iter().any(|pat| rp.contains(pat.as_str())) {
+                                            100.0
+                                        } else {
+                                            0.0
+                                        };
+                                    (id, bonus - depth)
+                                })
+                                .collect()
+                        };
                         let t_rank = Instant::now();
                         let order: Vec<(u32, f64)> = if q.ignore_case || q.invert {
                             all_files()
@@ -5184,7 +5220,7 @@ fn emit_text_row_colored(
 // Real emission fns (`emit_raw_with_path` + `push_escaped_json`) are exercised
 // directly by the escape check below; no test-only wrappers.
 
-const USAGE: &str = "usage: nkg index <path> [--index FILE]\n       nkg serve --index FILE --port PORT\n       nkg [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-./--hidden] [--no-ignore] [-L/--follow] [-g/--glob GLOB] [-d/--max-depth N] [--max-filesize N] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
+const USAGE: &str = "usage: nkg index <path> [--index FILE]\n       nkg serve --index FILE --port PORT\n       nkg [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-./--hidden] [--no-ignore] [-L/--follow] [-g/--glob GLOB] [-d/--max-depth N] [--max-filesize N] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--stats] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
 
 fn usage() -> ! {
     eprint!("{USAGE}");
@@ -5255,7 +5291,7 @@ fn print_help() {
         "                     stderr (indexed searches only)\n",
         "  -m, --max-count N  cap matching lines per file at N (0 matches\n",
         "                     nothing; -c prints capped counts; applies\n",
-        "                     per-file before --top)\n",
+        "                     per-file before --top; -m2 attached also works)\n",
         "  -e, --regexp PAT   search pattern, OR (repeatable; an inline flag\n",
         "                     like (?i) stays scoped to its pattern; any -e/-f\n",
         "                     makes every positional a path)\n",
@@ -5269,19 +5305,24 @@ fn print_help() {
         "  -w, --word-regexp  word-boundary match (Unicode word chars)\n",
         "                     (short no-arg flags combine: any cluster of only\n",
         "                     i q c l F v w letters sums its letters)\n",
+        "  --no-pcre2, --no-encoding  no-ops: the default engine already satisfies them\n",
         "  --format json|text output rendering (default json; text emits\n",
         "                     path:line:text in rank order — same hits, same\n",
         "                     order as json, no score; ignored under -c/-l/-q)\n",
         "  --color[=WHEN]     highlight match spans in --format text (default auto:\n",
         "                     colorize only when stdout is a tty; always/never force\n",
         "                     or suppress; ansi aliases always; json stays clean;\n",
-        "                     GREP_COLORS not honored)\n",
+        "                     GREP_COLORS not honored; --color WHEN consumes WHEN\n",
+        "                     when valid, else WHEN is searched as the pattern)\n",
         "  -., --hidden       search hidden files and directories\n",
+        "  --no-hidden        cancel --hidden (hidden files skipped by default)\n",
         "  --no-ignore        skip .gitignore/.ignore/.rgignore/exclude files\n",
         "  -L, --follow       follow symbolic links\n",
+        "  --no-follow        cancel --follow (symlinks unfollowed by default)\n",
         "  -g, --glob GLOB    include/exclude paths, gitignore-style (repeatable;\n",
-        "                     leading ! excludes, neg-only keeps the rest)\n",
-        "  -d, --max-depth N  limit directory traversal depth\n",
+        "                     leading ! excludes, neg-only keeps the rest;\n",
+        "                     -gGLOB attached also works)\n",
+        "  -d, --max-depth N  limit directory traversal depth (-d2 attached also works)\n",
         "  --max-filesize N   skip files larger than N bytes (K/M/G suffixes)\n",
         "  -A, --after-context N\n",
         "                     print N lines after each match (`-A2` also works)\n",
@@ -5888,6 +5929,14 @@ fn main() {
         });
     if (stdin_explicit || stdin_piped) && port.is_some() {
         eprintln!("nkg: stdin search cannot use --port");
+        usage();
+    }
+    // `--use-index` names an index to search, `--port` names a daemon that
+    // already holds one. Taking `--port` and dropping `--use-index` in
+    // silence makes a stale path look indexed, which is how a benchmark
+    // ends up measuring something other than what it names.
+    if port.is_some() && use_index.is_some() {
+        eprintln!("nkg: --use-index cannot be combined with --port");
         usage();
     }
     if port.is_none()

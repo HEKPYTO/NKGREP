@@ -7,7 +7,7 @@ _nkg() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]:-}"
 
-    local opts="-i --ignore-case -q --quiet --silent -v --invert-match -w --word-regexp -F --fixed-strings -m --max-count -e --regexp -f --file -c --count -l --files-with-matches --format --color -. --hidden --no-ignore -L --follow -g --glob -d --max-depth --max-filesize -A --after-context -B --before-context -C --context --group-separator --top --use-index --port --index --help -h --version -V -- -"
+    local opts="-i --ignore-case -q --quiet --silent -v --invert-match -w --word-regexp -F --fixed-strings -m --max-count -e --regexp -f --file -c --count -l --files-with-matches --format --color -. --hidden --no-ignore -L --follow -g --glob -d --max-depth --max-filesize -A --after-context -B --before-context -C --context --group-separator --top --use-index --port --index --stats --help -h --version -V -- -"
 
     case "$prev" in
         --top|--port|-m|--max-count|-d|--max-depth|--max-filesize)

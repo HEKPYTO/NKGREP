@@ -1,6 +1,6 @@
 # src
 
-Two files. `main.rs` is the whole binary (~5k lines); `prefilter.rs`
+Two files. `main.rs` is the whole binary (~8k lines); `prefilter.rs`
 is the trigram set logic shared by rank paths.
 
 ## Pipeline
@@ -13,8 +13,8 @@ walk -> index -> rank -> verify -> emit
   `--hidden`, follows symlinks only with `-L`. Never descends `.git/`
   without `--no-ignore`.
 - **index** (`nkg index`): per-file trigram sets merged into sorted
-  posting lists. Two formats: JSON (default `.nkg.json`, debuggable)
-  and binary `.bin` (smaller, faster load). Root fingerprint embedded;
+  posting lists. Two formats: binary `.bin` (the default `.nkg.bin`;
+  smaller, faster load) and JSON (any other suffix, debuggable). Root fingerprint embedded;
   a moved tree is refused loudly, never silently empty.
 - **rank**: idf-weighted trigram overlap plus path bonus minus depth.
   Match score = file score − line/1e6, which is what makes top-k

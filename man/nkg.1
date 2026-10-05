@@ -1,4 +1,4 @@
-.TH NKG 1 "September 2026" "nkg 0.1.0" "User Commands"
+.TH NKG 1 "2026-10-05" "nkg 0.1.0" "User Commands"
 .SH NAME
 nkg \- ranked trigram code search
 .SH SYNOPSIS
@@ -174,6 +174,9 @@ the trigram index is not consulted.
 Match whole words only: patterns are wrapped in Unicode word
 boundaries.
 .TP
+.BR \-\-no-pcre2 ", " \-\-no-encoding
+Accepted no-ops: the default engine already satisfies them.
+.TP
 .BR \-m " NUM" ", " \-\-max-count " NUM" ", " \-\-max-count=NUM
 Stop collecting after
 .I NUM
@@ -238,6 +241,11 @@ exits 2.
 .BR "\-." ", " \-\-hidden
 Search hidden files and directories (skipped by default).
 .TP
+.B \-\-no-hidden
+Cancel
+.BR \-\-hidden
+(hidden files skipped by default).
+.TP
 .B \-\-no-ignore
 Skip
 .BR .gitignore ", " .ignore ", " .rgignore ,
@@ -250,6 +258,11 @@ and
 .TP
 .BR \-L ", " \-\-follow
 Follow symbolic links during traversal (unfollowed by default).
+.TP
+.B \-\-no-follow
+Cancel
+.BR \-\-follow
+(symlinks unfollowed by default).
 .TP
 .BR \-g " GLOB" ", " \-\-glob " GLOB" ", " \-\-glob=GLOB
 Include or exclude paths with a gitignore-style glob. Repeatable;
@@ -341,8 +354,16 @@ and
 .BR serve ,
 use
 .I FILE
-as the index file (default:
-.BR .nkg.json ).
+as the index file (default
+.BR .nkg.bin ).
+A
+.B .bin
+suffix writes the fast binary format; any other suffix writes JSON,
+which is debuggable but roughly four times slower to query.
+.TP
+.B \-\-stats
+Print the query plan and candidate counts to stderr, in addition to the
+matches on stdout. Indexed searches only; a scan prints no plan lines.
 .TP
 .BR \-h ", " \-\-help
 Print help to stdout and exit 0.
@@ -400,10 +421,9 @@ bind/connect failure, or other I/O error. Usage errors print the
 usage text to stderr; bad patterns and values report as
 .BR "nkg: " msg .
 .SH EXAMPLES
-.PP
 .RS
 .nf
-nkg index . \-\-index nkg.idx.json
+nkg index . \-\-index nkg.idx.bin
 nkg \-\- 'pattern' src
 nkg \-i \-\- 'hello.*world' .
 nkg \-\-top 20 \-\- 'TODO|FIXME' .
@@ -428,9 +448,9 @@ nkg \-F \-\- 'literal (parens)' src
 nkg \-v \-\- 'pattern' src
 nkg \-m 5 \-\- 'pattern' src
 nkg \-\- 'pattern' \- < input.txt
-nkg serve \-\-index nkg.idx.json \-\-port 17632 &
+nkg serve \-\-index nkg.idx.bin \-\-port 17632 &
 nkg \-\-port 17632 \-\-top 20 \-\- 'pattern'
-nkg \-\-use-index nkg.idx.json \-\- 'pattern' .
+nkg \-\-use-index nkg.idx.bin \-\- 'pattern' .
 .fi
 .RE
 .SH SEE ALSO

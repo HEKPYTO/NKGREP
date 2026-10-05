@@ -2151,6 +2151,12 @@ fn serve_file_count_matches_cold_across_the_flag_matrix() {
             ("a.txt", "needle a\nneedle a2\n"),
             ("sub/b.txt", "needle b\n"),
             ("q\"c.txt", "needle c\nneedle c2\nneedle c3\n"),
+            // Without a file that never matches, `-v` and `-l -v` return
+            // nothing on both sides and the rows below would pass vacuously.
+            // With it the sets are disjoint: `-l` is the three needle files,
+            // `-l -v` is this one. A daemon that dropped the invert filter
+            // would answer `-l -v` with all three and fail against cold.
+            ("nomatch.txt", "nothing here\nfiller line\n"),
         ],
     );
     let idx = score_index(&dir);
@@ -2161,6 +2167,15 @@ fn serve_file_count_matches_cold_across_the_flag_matrix() {
         ("files", vec!["-l", "--", "needle", "corpus"]),
         ("context", vec!["-B", "1", "--", "needle", "corpus"]),
         ("top", vec!["--top", "2", "--", "needle", "corpus"]),
+        // `-v` forces a scan fallback on the indexed side and the daemon
+        // aggregates client-side, so neither of these is covered by the rows
+        // above. Both shapes were open parity gaps.
+        ("invert", vec!["-v", "--", "needle", "corpus"]),
+        ("invert-files", vec!["-l", "-v", "--", "needle", "corpus"]),
+        (
+            "top-max",
+            vec!["--top", "2", "-m", "1", "--", "needle", "corpus"],
+        ),
     ] {
         let (cold, served, cold_err, served_err) = cold_and_served_with(&idx, &dir, &args);
         assert_eq!(cold, served, "{label}: stdout bytes must be identical");
@@ -2404,4 +2419,94 @@ fn daemon_done_line_is_last_and_midstream_disconnect_is_survivable() {
     srv.wait().ok();
     let _ = std::fs::remove_file(serve_sidecar(&idx));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-l -v` must list every file that has at least one NON-matching line.
+///
+/// The verify path caps the searcher at one match per file when `-l` is
+/// set, and the cap used to win an `else if` against `invert_match`, so
+/// `-l -v` silently became `-l`. Scan and indexed share that core, so
+/// `indexed_equals_scan` cannot see it - both sides were wrong together,
+/// which is why this pins the shape against the fixture instead.
+///
+/// `-l -v` is NOT the complement of `-l`: a file holding both a matching
+/// and a non-matching line belongs to both sets, so the sets overlap by
+/// design. What the bug destroyed is `-l -v` collapsing onto `-l`.
+///
+/// The superset assertions below are FIXTURE-SCOPED, not a general law.
+/// They hold only because every file this fixture plants carries filler
+/// lines, so each one has a non-matching line to qualify `-l -v`. A
+/// one-line file holding nothing but the needle is in `-l` and NOT in
+/// `-l -v`, which breaks `-l` subset `-l -v`. Do not copy these
+/// assertions to another fixture without re-deriving that precondition.
+#[test]
+fn invert_files_lists_files_the_capped_searcher_never_reached() {
+    for ext in ["json", "bin"] {
+        let dir = fixture_in(&format!("invert-l-{ext}"));
+        let idx = dir.join(format!("t.idx.{ext}"));
+        let st = Command::new(bin())
+            .args(["index", ".", "--index"])
+            .arg(&idx)
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "index build failed for {ext}");
+        let idx_s = idx.to_string_lossy().into_owned();
+
+        let listed = |extra: &[&str], indexed: bool| -> HashSet<String> {
+            let mut c = Command::new(bin());
+            if indexed {
+                c.args(["--use-index", &idx_s]);
+            }
+            let out = c
+                .args(extra)
+                .args(["--", "NEEDLE_ALPHA", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                [0, 1].contains(&out.status.code().unwrap()),
+                "exit for {extra:?} ({ext}, indexed={indexed})"
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+
+        for indexed in [false, true] {
+            let with = listed(&["-l"], indexed);
+            let without = listed(&["-l", "-v"], indexed);
+            assert!(
+                !with.is_empty(),
+                "-l found nothing, fixture is vacuous ({ext}, indexed={indexed})"
+            );
+            // The bug made these two identical. They must not be.
+            assert_ne!(
+                with, without,
+                "-l -v collapsed to -l: invert_match was dropped ({ext}, indexed={indexed})"
+            );
+            // Every text file has filler lines, so every one must appear.
+            // Not an exact count: a file the searcher skips (binary) lands on
+            // the "-v" side too, and that skip is its own long-standing rule.
+            for pkg in 0..4 {
+                for f in 0..25 {
+                    let p = format!("pkg_{pkg}/m_{f}.txt");
+                    assert!(
+                        without.contains(&p),
+                        "-l -v missed {p} ({ext}, indexed={indexed})"
+                    );
+                }
+            }
+            assert!(
+                without.len() > with.len(),
+                "-l -v must reach strictly more files than -l ({ext}, indexed={indexed})"
+            );
+            assert!(
+                with.is_subset(&without),
+                "-l must be contained in -l -v ({ext}, indexed={indexed})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

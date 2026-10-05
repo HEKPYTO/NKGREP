@@ -1,5 +1,51 @@
 # Benchmarks
 
+## Headline numbers
+
+Measured on an idle 32-core Linux host (`nproc` 32, load below
+5, `sleep(100ms)` jitter 0.06 ms over 10 samples - tight enough to
+resolve a 4 ms gap), 11 interleaved rounds, every match set identical to
+ripgrep's. `python3 bench/race.py` re-runs the race and prints the
+host conditions and the parity gate alongside it.
+
+Full race against every indexed and scan competitor, all match
+sets identical, medians of 11 interleaved rounds. Each number is one
+whole CLI invocation - process spawn, index load, search and output -
+against a prebuilt index, which is the honest one-shot comparison:
+
+| query | nkg | ripgrep | ugrep | zoekt |
+| --- | --- | --- | --- | --- |
+| `TODO_FIXME_ALPHA` | **3.9 ms** | 8.0 ms | 12.6 ms | 29.3 ms |
+| `needle_1\|needle_2\|needle_3` | **3.5 ms** | 7.7 ms | 10.3 ms | 34.0 ms |
+| `fn parse_config` | **3.3 ms** | 7.7 ms | 10.7 ms | 32.9 ms |
+| ~~`config` (51,410 hits)~~ | withdrawn | — | — | — |
+
+The `config` row is withdrawn, not lost. Hand-timed on the same host it
+put `nkg` at 14 ms and `ugrep` at 7 ms — the reverse of the race's 25.6
+and 30.5. The two disagree and the cause is unresolved, so the row is
+withdrawn rather than published as either. The three selective rows agree
+with every other measurement taken, which is why they stay.
+
+Every indexed contender is measured on its **indexed** path — index
+against index — and every match set is gated equal to ripgrep's before
+it is timed. Ripgrep is the scan baseline; it has no index.
+`nkg` is fastest on all three selective queries.
+The index is **2.3 MB against zoekt's 22.7 MB** and `ugrep`'s
+3.1 MB — smaller than both for the same answers.
+
+`tgrep` has no row yet: this run predated the harness fix for a flag
+`tgrep` rejects, so it was dropped at the parity gate. Run
+`python3 bench/race.py` again for the five-tool table.
+
+Most of `nkg`'s 3.3-3.9 ms is process spawn. `nkg` reports its own
+index load as `index load 0 ms` — under a millisecond, re-read on every
+invocation — so spawn and search split the budget. `nkg serve` holds
+the index resident across queries instead of paying that per query.
+
+These margins hold on an idle host, and they depend on
+host load: on a busy machine the ranking between tools changes from
+round to round, so measure on a quiet box before quoting any of them.
+
 This directory measures one thing: **does `nkg` return exactly the same
 matches as ripgrep, and how fast is it?** Every script below compares
 match sets against ripgrep (`rg`) and reports wall-clock time. A result
@@ -14,6 +60,7 @@ competitive.
 | `bench.py` | Ripgrep vs `nkg` plain scan |
 | `bench_index.py` | Scan vs indexed search, plus gates A / B / C |
 | `bench_universe.py` | Every installed grep-like tool vs ripgrep |
+| `race.py` | Full parity-gated race vs indexed and scan competitors (11 interleaved rounds) |
 | `make_chart.py` | Draws `benchmark.png` from the numbers in `race.py` |
 | `collect_progress.py` | Draws `benchmark.png` from a saved run record |
 
@@ -188,10 +235,10 @@ The convention every script here follows:
    from another.
 2. **One discarded warmup, then medians.** Each script runs the command
    once unmeasured (warming the page cache and any server state), then
-   measures N identical runs — 5 in `bench.py`, 3 in the index and
-   universe scripts — and reports the median, so a single slow outlier
-   cannot swing the result. `--runs` adjusts this for `--live` chart
-   runs.
+   measures N identical runs — 5 in `bench.py`, 3 in `bench_index.py`
+   and `bench_universe.py` — and reports the median, so a single slow outlier
+   cannot swing the result. `race.py` instead runs 11 interleaved rounds by
+   default (`--rounds` adjusts it, as does `--runs` for `--live` chart runs).
 3. **Same corpus, same counts.** The corpus generator is deterministic,
    so match counts are stable across rebuilds; each script prints the
    reference match counts so you can confirm your corpus agrees before

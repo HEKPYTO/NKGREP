@@ -33,5 +33,6 @@ complete -c nkg -l top -d 'top N ranked matches' -x
 complete -c nkg -l use-index -d 'index file' -r -F
 complete -c nkg -l port -d 'daemon port' -x
 complete -c nkg -l index -d 'index file' -r -F
+complete -c nkg -l stats -d 'print query plan to stderr'
 complete -c nkg -s h -l help -d 'print help'
 complete -c nkg -s V -l version -d 'print version'
