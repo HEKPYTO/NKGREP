@@ -20,8 +20,12 @@ complete -c nkg -s f -l file -d 'pattern file (repeatable)' -r -F
 complete -c nkg -l format -d 'output rendering (json|text)' -x -a 'json text'
 complete -c nkg -l color -d 'highlight match spans' -x -a 'auto always never ansi'
 complete -c nkg -s . -l hidden -d 'search hidden files'
+complete -c nkg -l no-hidden -d 'cancel --hidden'
 complete -c nkg -l no-ignore -d 'skip ignore files'
 complete -c nkg -s L -l follow -d 'follow symbolic links'
+complete -c nkg -l no-follow -d 'cancel --follow'
+complete -c nkg -l no-pcre2 -d 'no-op: default engine already satisfies it'
+complete -c nkg -l no-encoding -d 'no-op: default engine already satisfies it'
 complete -c nkg -s g -l glob -d 'include/exclude glob (repeatable)' -x
 complete -c nkg -s d -l max-depth -d 'limit traversal depth' -x
 complete -c nkg -l max-filesize -d 'skip files larger than N bytes' -x

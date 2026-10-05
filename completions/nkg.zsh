@@ -23,8 +23,12 @@ _nkg() {
         '--format=[output rendering]:format:(json text)' \
         '--color=[highlight match spans]:when:(auto always never ansi)' \
         '(-. --hidden)'{-.,--hidden}'[search hidden files]' \
+        '--no-hidden[cancel --hidden]' \
         '--no-ignore[skip ignore files]' \
         '(-L --follow)'{-L,--follow}'[follow symbolic links]' \
+        '--no-follow[cancel --follow]' \
+        '--no-pcre2[no-op: default engine already satisfies it]' \
+        '--no-encoding[no-op: default engine already satisfies it]' \
         '*{-g,--glob=}+[include/exclude glob]:glob:' \
         '*{-d,--max-depth=}+[limit traversal depth]:N:' \
         '--max-filesize=[skip large files]:bytes:' \
