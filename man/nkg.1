@@ -366,6 +366,10 @@ Registers the port in
 for
 .B \-\-use-index
 clients.
+The daemon binds loopback only and takes no authentication, so any
+local process able to open the port can query it. Do not publish
+.I PORT
+to another interface.
 .SH EXIT STATUS
 .TP
 .B 0
