@@ -103,7 +103,7 @@ Build the index first. This step runs from `bench/` so the index
 records `corpus` as its root — the same root the script queries:
 
 ```sh
-cd bench && ../target/release/nkg index corpus --index nk.idx.json
+cd bench && ../target/release/nkg index corpus --index nk.idx.bin
 ```
 
 Then, from the repo root:

@@ -13,7 +13,7 @@ NK = HERE.parent / "target" / "release" / "nkg"
 CORPUS = HERE / "corpus"
 CORPUS_GIT = HERE / "corpus-git"
 CORPUS_TGREP = HERE / "corpus-tgrep"
-IDX = HERE / "nk.idx.json"
+IDX = HERE / "nk.idx.bin"
 RUNS = 3
 ENV = dict(os.environ, PATH=os.path.expanduser("~/.cargo/bin") + ":" + os.environ["PATH"])
 

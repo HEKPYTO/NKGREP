@@ -134,7 +134,7 @@ QUERY_OF = {g: QUERIES[g] for g in GROUPS if g != "heavy-top20"}
 FOOT_INVOC = (
     "nk-scan: `nkg -- <q> .` in bench/corpus | "
     "nk-cold-bin: `nkg --use-index bench/nk.idx.bin -- <q> corpus` in bench/ | "
-    "nk-hot: `serve --index bench/nk.idx.json --port 18981`, query `--use-index <json> -- <q> corpus` | "
+    "nk-hot: `serve --index bench/nk.idx.bin --port 18981`, query `--use-index <bin> -- <q> corpus` | "
     "tgrep: `tgrep -n -- <q> .` via serve in bench/corpus-tgrep | "
     "rg: `rg --json -- <q> .` | ugrep: `ugrep -r -n -- <q> corpus`"
 )

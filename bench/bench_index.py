@@ -11,7 +11,7 @@ from pathlib import Path
 HERE = Path(__file__).parent
 NK = HERE.parent / "target" / "release" / "nkg"
 CORPUS = HERE / "corpus"
-IDX = HERE / "nk.idx.json"
+IDX = HERE / "nk.idx.bin"
 RUNS = 3
 
 FULL_QUERIES = [
@@ -76,7 +76,7 @@ def med(cmd, cwd):
 
 
 def main():
-    assert IDX.exists(), "build index first: nkg index corpus --index nk.idx.json"
+    assert IDX.exists(), "build index first: nkg index corpus --index nk.idx.bin"
     print("== gate A: match sets (indexed full vs rg full) ==")
     a_ok = True
     for q in FULL_QUERIES:
