@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Binary index (`.bin`) is the default everywhere: quickstart, man,
   usage, and every benchmark runs on it (the JSON format stays
@@ -18,3 +18,5 @@
   `--no-follow`, `--no-pcre2`/`--no-encoding`, and the `.nkg.bin` default.
 - Tests: 85 (53 unit + 32 oracle), green; serve covered with `-v`,
   `-l -v`, and `--top -m` against cold.
+- Completions: sync bash/zsh/fish with `--help` (`--no-hidden`,
+  `--no-follow`, `--no-pcre2`/`--no-encoding`).
