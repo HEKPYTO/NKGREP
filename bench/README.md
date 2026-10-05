@@ -61,8 +61,15 @@ competitive.
 | `bench_index.py` | Scan vs indexed search, plus gates A / B / C |
 | `bench_universe.py` | Every installed grep-like tool vs ripgrep |
 | `race.py` | Full parity-gated race vs indexed and scan competitors (11 interleaved rounds) |
-| `make_chart.py` | Draws `benchmark.png` from the numbers in `race.py` |
-| `collect_progress.py` | Draws `benchmark.png` from a saved run record |
+| `make_chart.py` | Draws `benchmark.png` from one `race.py` run, transcribed by hand |
+| `benchmark.png` | The chart the root README shows |
+| `VERSIONS.md` | Exact tool builds and paths the numbers were taken on |
+
+Everything else under `bench/` is generated or per-run and is not in the
+repository: `gen_corpus.py` writes `corpus/`, `corpus-git/` and
+`corpus-tgrep/`, each benchmark builds its own `nk.idx.bin`, and the
+scripts keep their numbers in a local, untracked file. Clone and run
+`gen_corpus.py` first; every other script says so if it finds nothing.
 
 ## Corpora
 
@@ -97,24 +104,21 @@ starts/stops the `tgrep` server on its own each run.
 
 ## Query Set
 
-All four scripts use the same four queries, from highly selective to
+Every script here uses the same four queries, from highly selective to
 match-everything:
 
-| Query | Nickname in plots | Selectivity |
-| --- | --- | --- |
-| `TODO_FIXME_ALPHA` | sel-146 | ~146 matching lines |
-| `needle_1\|needle_2\|needle_3` | sel-86 | ~86 matching lines |
-| `fn parse_config` | sel-60 | ~60 matching lines |
-| `config` | heavy-full | matches all over the corpus |
+| Query | Selectivity |
+| --- | --- |
+| `TODO_FIXME_ALPHA` | ~146 matching lines |
+| `needle_1\|needle_2\|needle_3` | ~86 matching lines |
+| `fn parse_config` | ~60 matching lines |
+| `config` | matches all over the corpus |
 
-A fifth plot group, `heavy-top20`, is the query `config` with `--top 20`:
-return the first 20 matches instead of the full set. The ripgrep and
-ugrep bars shown next to it are their *full* runs, given as latency
-context (they do strictly more work).
+Exact counts for your run are printed by each script, so you can confirm
+the corpus matches the table above.
 
-Exact counts for your run are printed by each script
-(`reference match counts: …`), so you can confirm the corpus matches
-the table above.
+`benchmark.png` plots the first three only. `config` is withheld: two
+measurements of it disagreed (see "How to read" below).
 
 ## Scripts and commands
 
@@ -126,7 +130,7 @@ cargo build --release
 ```
 
 Run every script from the repo root (`bench.py`, `bench_index.py`,
-`bench_universe.py`, `collect_progress.py`) — each one locates the
+`bench_universe.py`, `race.py`) — each one locates the
 corpus and the binary relative to itself, so no `cd` is needed. The
 only step with a working-directory requirement is building the index
 (next section): it runs from `bench/` so the index records `corpus`
@@ -192,37 +196,36 @@ are listed under `N/A (not comparable here)` with a reason instead of
 a number. Missing tools are simply skipped; only ripgrep and `nkg`
 are required.
 
-### `collect_progress.py` — the progress chart
-
-```sh
-python3 bench/collect_progress.py --public-simple
-# redraws bench/benchmark.png from stored past medians
-```
-
-By default this plots a stored table of past medians (no measuring —
-fast and deterministic). To measure fresh numbers on your machine
-and overlay them instead (slow; needs the full tool set and
-`matplotlib`):
-
-```sh
-python3 bench/collect_progress.py --live --runs 3 --date 2026-09-10
-```
 
 ## How to read `bench/benchmark.png`
 
-- **Groups on the horizontal axis are queries**: the three selective
-  queries, then the heavy full query, then the heavy top-20 query.
-- **Bars within a group are tools**: `nkgrep scan`, `nkgrep indexed`
-  (cold index file), `nkgrep serve` (hot already-running server),
-  `tgrep`, `rg`, and `ugrep`. The top-20 group additionally shows
-  full-run bars as latency context.
-- **Bar height is median milliseconds — shorter is faster.** Each bar
-  is labeled with its value.
-- **Every plotted bar passed match-set equality vs ripgrep.** A bar
-  that diverged would not be plotted as a time at all.
+- **Groups on the horizontal axis are queries**: `TODO_FIXME_ALPHA`,
+  `needle_1 | needle_2 | needle_3`, `fn parse_config`.
+- **Bars within a group are tools**: `nkg`, `ripgrep`, `ugrep`, `zoekt`.
+  Every one of them is measured on its indexed path — `ugrep --index`,
+  `zoekt -index_dir`. Ripgrep is the exception: it has no index, so it
+  is the scan baseline and the parity reference.
+- **Bar height is median milliseconds — lower is better.** Each bar is
+  labeled with its value.
+- **Every plotted tool passed match-set equality against ripgrep before
+  it was timed.** A tool that diverged is dropped, never plotted.
 
-Run artifacts (numbers behind each bar) stay local and untracked —
-`bench/benchmark.png` is the chart to share.
+The numbers in the chart are transcribed by hand from one `race.py` run;
+`make_chart.py` does not re-measure. Re-running `race.py` prints fresh
+numbers and writes no chart — race again and you must edit `MS` in
+`make_chart.py` yourself. That is deliberate: a chart regenerated from
+an untracked file is one nobody can reproduce or correct, which is what
+made the previous public chart wrong.
+
+`tgrep` is absent because `race.py` passed it a flag its build rejects.
+The flag is fixed; the race has not been repeated with it.
+
+`config`, which matches all 51,410 lines, is **not plotted**. `race.py`
+reported nkg 25.6 ms and ugrep 30.5 ms; hand timing on the same host
+reported nkg 14 ms and ugrep 7 ms — the reverse. The cause is
+unresolved, so it is named rather than drawn.
+
+The tool versions behind the chart are printed in its footer.
 
 ## Reproducibility method
 

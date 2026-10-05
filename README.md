@@ -46,6 +46,22 @@ Each hit comes back as one JSON object per line:
 
 ## Performance
 
+![nkg is faster than ripgrep, ugrep and zoekt on three selective queries; lower is better](bench/benchmark.png)
+
+**Lower is better.** Each bar is one whole CLI invocation — process
+spawn, index load, search and output — against a prebuilt index, and every
+tool's match set is gated equal to ripgrep's before it is timed. Every
+indexed contender is measured on its indexed path; ripgrep is the scan
+baseline. One run on one 32-core host; reproduce with
+`python3 bench/race.py`.
+
+The index is 2.3 MB, against zoekt's 22.7 MB and ugrep's 3.1 MB.
+
+`tgrep` is absent from that run: the harness passed it a flag it rejects,
+which is fixed but not yet re-run. A fourth query matching all 51,410
+lines is also omitted — two measurements of it disagreed and the cause is
+unresolved.
+
 Index to a `.bin` path. The JSON format exists for debugging; which one is
 faster is not claimed here because no script in this repo measures it.
 
