@@ -5,13 +5,6 @@ use std::collections::HashSet;
 #[cfg(test)]
 use crate::*;
 
-/// Multiply-xorshift finalizer for the build's gram set. A gram key is a
-/// packed byte window that is already close to its own hash, so SipHash-1-3's
-/// key mixing buys nothing here and lands on the index build's hottest loop
-/// (every window of every file hashes once). The xorshift-multiply rounds are
-/// what makes the TOP 7 bits vary: hashbrown derives its bucket from the low
-/// bits and its control byte from the top 7, and a bare multiply leaves the
-/// top bits of a 32-bit input zero.
 #[derive(Default)]
 pub(crate) struct GramHasher(u64);
 
@@ -37,13 +30,6 @@ impl std::hash::Hasher for GramHasher {
 
 pub(crate) type GramSet = HashSet<u32, std::hash::BuildHasherDefault<GramHasher>>;
 
-/// Distinct grams of BOTH widths in one set, packed into the same `u32` key
-/// space. The widths are kept disjoint by construction rather than by a tag
-/// bit: a trigram packs into 24 bits with the top byte always zero, a
-/// four-gram uses all 32, and a four-gram whose first byte is NUL is skipped
-/// (that is a binary file, which is never indexed anyway). So every 3-gram key
-/// is < 2^24 and every 4-gram key is >= 2^24, and one sorted key table holds
-/// both without collisions.
 pub(crate) fn grams_of(bytes: &[u8]) -> GramSet {
     let mut set: GramSet = Default::default();
     let n = bytes.len();
@@ -54,10 +40,6 @@ pub(crate) fn grams_of(bytes: &[u8]) -> GramSet {
         set.insert(((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | bytes[2] as u32);
         return set;
     }
-    // One pass for both widths. Two `windows` walks read the whole buffer
-    // twice and insert about 38 million times over 19 MB of source; deriving
-    // the trigram from the same window as the four-gram halves the memory
-    // traffic without changing which grams are produced.
     for w in bytes.windows(4) {
         let (a, b, c, d) = (w[0], w[1], w[2], w[3]);
         set.insert(((a as u32) << 16) | ((b as u32) << 8) | c as u32);
@@ -66,7 +48,6 @@ pub(crate) fn grams_of(bytes: &[u8]) -> GramSet {
         }
         set.insert(((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | d as u32);
     }
-    // The final three bytes form a trigram no four-byte window can reach.
     set.insert(((bytes[n - 3] as u32) << 16) | ((bytes[n - 2] as u32) << 8) | bytes[n - 1] as u32);
     set
 }
@@ -76,11 +57,6 @@ mod gram_hash_tests {
     use super::GramHasher;
     use std::hash::Hasher;
 
-    /// hashbrown picks the bucket from the low bits and the control byte from
-    /// the TOP 7, and packed 4-grams leave the top half of a plain multiply
-    /// zero. Assert the high bits actually move for a dense run of real gram
-    /// keys, so a retuned constant cannot silently re-bury them (that costs
-    /// correctness nothing and build time ~10x).
     #[test]
     fn gram_hash_spreads_the_top_control_bits() {
         let mut seen = std::collections::HashSet::new();
@@ -96,40 +72,19 @@ mod gram_hash_tests {
         );
     }
 }
-/// Bijective trigram pack: (a<<16)|(b<<8)|c. Numeric order equals
-/// lexicographic byte order, so sorted keys stay byte-stable across the
-/// format rev. Top byte always zero; unpack is (k>>16, k>>8, k) & 0xFF.
 fn gram_pack(g: &[u8; 3]) -> u32 {
     ((g[0] as u32) << 16) | ((g[1] as u32) << 8) | (g[2] as u32)
 }
 
-/// Regex-aware literal extraction: split into alternation branches on `|`
-/// that is neither escaped nor inside a `[...]` class; per branch, runs of
-/// [A-Za-z0-9_] len>=3 give required trigrams. Group depth is ignored on
-/// purpose: `(a|b)` still alternates, so its `|` separates branches, and
-/// each branch's grams remain a subset of its match text, keeping the union
-/// a superset of all matches. Escapes (`\x`) never contribute a literal
-/// (covers `\|`, `\d`, `\n`, `\\`); class contents contribute nothing.
-/// None = no usable literal in some branch, caller must full-scan.
 pub(crate) fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
     let mut ors = vec![];
     for branch in split_branches(pattern) {
-        // Soundness fallback: `(?` changes literal semantics (flags `(?i)`,
-        // groups `(?P<>)`, comments `(?#)`, lookaround) and `{n}`/`*`/`?`
-        // can drop a required trigram (`ABCDEF{0}` matches `ABCDE`, which
-        // lacks `DEF`; `NEEDLE_ALPHA?` matches `NEEDLE_ALPH`, lacking `PHA`).
-        // Any of them forces a full scan; `+` keeps every literal run.
         if branch_needs_fallback(&branch) {
             return None;
         }
         let mut ands = HashSet::new();
         for run in literal_runs(&branch) {
             if run.len() >= 4 {
-                // A run of four or more bytes yields four-grams. Intersecting
-                // them is far more selective than three-grams alone, because
-                // the file must hold the run's bytes adjacently rather than
-                // merely contain each gram somewhere -- which is the whole
-                // gap against an index that enforces adjacency.
                 for w in run.windows(4) {
                     if w[0] == 0 {
                         continue;
@@ -142,7 +97,6 @@ pub(crate) fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
                     );
                 }
             } else if run.len() == 3 {
-                // Too short for a four-gram; the three-gram is still required.
                 ands.insert(gram_pack(&[run[0], run[1], run[2]]));
             }
         }
@@ -156,15 +110,6 @@ pub(crate) fn query_grams(pattern: &str) -> Option<Vec<Vec<u32>>> {
     Some(ors)
 }
 
-/// True when a split branch contains an unescaped `(?` (flags, named groups,
-/// comments, lookaround), an unescaped `{`+digit repetition, or an unescaped
-/// `*`/`?` quantifier outside a `[...]` class. Each can drop a required
-/// trigram (`ABCDEF{0}` matches `ABCDE` which lacks `DEF`; `NEEDLE_ALPHA?`
-/// matches `NEEDLE_ALPH` which lacks `PHA`), so any of them forces a full
-/// scan. `+` stays indexed: it keeps at least one copy of its atom, so every
-/// match still contains the literal run. Escapes and class contents are
-/// skipped exactly as `literal_runs` skips them, so an escaped/literal
-/// `(?`, `{2}`, `*`, or `?` never forces a fallback it does not need.
 fn branch_needs_fallback(branch: &str) -> bool {
     let mut it = branch.chars().peekable();
     while let Some(c) = it.next() {
@@ -208,8 +153,6 @@ fn branch_needs_fallback(branch: &str) -> bool {
     false
 }
 
-/// Split on unescaped `|` outside `[...]` classes. Verbatim copy otherwise
-/// (escapes and classes preserved for `literal_runs` to interpret).
 fn split_branches(pattern: &str) -> Vec<String> {
     let mut out: Vec<String> = vec![String::new()];
     let mut it = pattern.chars().peekable();
@@ -253,9 +196,6 @@ fn split_branches(pattern: &str) -> Vec<String> {
     out
 }
 
-/// Definitely-literal alphanumeric-underscore runs: skips `\x` escapes and
-/// `[...]` class contents (an unclosed `[` swallows the rest, conservatively
-/// yielding fewer grams, never wrong ones).
 fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
     let mut runs = vec![];
     let mut cur: Vec<u8> = vec![];
@@ -294,31 +234,12 @@ fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
                 }
             }
             c if c.is_ascii_alphanumeric() || c == '_' => cur.push(c as u8),
-            // Punctuation is literal in a regex, so it continues the run instead
-            // of breaking it: `Result<T, E>` must yield the cross-boundary
-            // trigrams `lt<`, `t<T`, `<T,`, `T<,`, `T, `, `, E`, ` E>` as
-            // well as `res`..`ult`. Those are far rarer than the alnum-only
-            // grams and cut the verified candidate set sharply.
-            //
-            // EVERY metacharacter must break a run, quantifiers included: a
-            // required trigram has to appear in every match, and `AB+C` matches
-            // `ABC`, so a run of `AB+C` would demand `AB+` and silently skip
-            // the match. `branch_needs_fallback` screens `*`, `?` and `{`,
-            // but it deliberately lets `+` through (`+` preserves the literal
-            // run, which mattered when only alnum bytes formed runs). The list
-            // is therefore complete rather than filtered by what upstream
-            // happens to reject. `[` and `\` are consumed by the arms above;
-            // a bare `]` cannot start a class, so it breaks here. `|` is split
-            // into branches upstream but is listed anyway so the set stays
-            // complete if that ever changes.
             '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | ']' | '{' | '}' | '|' => {
                 if !cur.is_empty() {
                     runs.push(std::mem::take(&mut cur));
                 }
             }
             c if (c as u32) < 128 => cur.push(c as u8),
-            // Non-ASCII: a byte-level trigram over its UTF-8 form is not a
-            // substring the index can be asked for, so keep the old behavior.
             _ => {
                 if !cur.is_empty() {
                     runs.push(std::mem::take(&mut cur));
@@ -332,21 +253,6 @@ fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
     runs
 }
 
-/// Matcher construction: ASCII-gated fast path (V1) plus the `-i` gate.
-/// Default (`case_insensitive=false`) is the exact V1 sequence: ASCII
-/// patterns skip the Unicode tables (`unicode(false)` + `\n` line
-/// terminator, unlocking the fast line-oriented path) and pure literals add
-/// `fixed_strings`; each keeps independently, builder errors retry
-/// less-gated down to plain `RegexMatcher::new`, so construction never
-/// fails where it used to work.
-/// `-i` keeps the Unicode tables on purpose: `case_insensitive(true)` with
-/// Unicode is full simple-fold insensitivity (ripgrep-compatible: `hello`
-/// finds `HELLO`, `café` finds `CAFÉ`), while adding `unicode(false)`
-/// would shrink folding to ASCII only. The cost is the Unicode tables on
-/// `-i` queries alone; the default path is untouched. `fixed_strings` still
-/// applies to pure literals (the engine folds literals itself). The final
-/// fallback keeps `case_insensitive(true)` so `-i` never silently degrades
-/// to case-sensitive; a truly bad pattern still returns Err (exit 2).
 pub(crate) fn build_matcher(
     pattern: &str,
     case_insensitive: bool,
@@ -388,10 +294,6 @@ pub(crate) fn build_matcher(
     }
     RegexMatcher::new(pattern)
 }
-/// Pure-literal probe for the `fixed_strings` gate: one `|`-free branch whose
-/// every byte survives `literal_runs` as a single run. Conservative on
-/// purpose: any metachar, escape, class, or alternation disqualifies (that
-/// query keeps the regex engine, gaining only `unicode(false)` when ASCII).
 fn is_pure_literal(pattern: &str) -> bool {
     if pattern.is_empty() || !pattern.is_ascii() {
         return false;
@@ -403,14 +305,7 @@ fn is_pure_literal(pattern: &str) -> bool {
     let runs = literal_runs(&branches[0]);
     runs.len() == 1 && runs[0].len() == pattern.len()
 }
-/// MatchFlags (-m/-e/-f/-F/-v/-w): multi-pattern + matcher-flag layer.
-/// Shapes probed against rg 15.1.0; deviations noted inline.
-///
-/// Patterns arrive as a list (positional, `-e` repeats, `-f` lines). The
-/// matcher sees one alternation; the prefilter sees per-pattern branches.
 fn regex_escape_into(out: &mut String, s: &str) {
-    // Escape set for regex-syntax: every other byte (incl. multibyte UTF-8)
-    // passes through verbatim.
     for c in s.chars() {
         if matches!(
             c,
@@ -435,17 +330,7 @@ fn regex_escape_into(out: &mut String, s: &str) {
     }
 }
 
-/// Combine CLI patterns into one alternation. Every branch is wrapped in
-/// `(?:...)` so inline flags (`(?i)`) stay scoped to their own pattern —
-/// rg 15.1.0 does not leak flags across `-e` (probed) — and an inner `|`
-/// can never merge branches (a naive join would split `(a|b)|c` into
-/// `(a`, `b)`, `c`, requiring `a` of every match: unsound). Fixed mode
-/// pre-escapes each pattern so the combined string stays a plain regex
-/// alternation (`fixed_strings` would treat the separators literally).
 pub(crate) fn combine_patterns(patterns: &[String], fixed: bool) -> String {
-    // A lone pattern needs no alternation: return it verbatim. (Wrapping a
-    // single fixed pattern in `(?:...)` would make `fixed_strings` search
-    // for the wrappers literally.)
     if patterns.len() == 1 {
         return patterns[0].clone();
     }
@@ -465,14 +350,6 @@ pub(crate) fn combine_patterns(patterns: &[String], fixed: bool) -> String {
     out
 }
 
-/// Extended matcher entry: `word` adds word-boundary matching and keeps the
-/// Unicode tables on (the ASCII `unicode(false)` gate would shrink
-/// boundaries to ASCII, but rg 15.1.0 treats é as a word char — probed:
-/// `-w foo` skips `fooé` yet takes `foo-bar`); `fixed` treats the pattern
-/// literally (callers pass it only for a single pattern; multi-pattern
-/// fixed arrives pre-escaped via `combine_patterns`). With both unset this
-/// delegates to `build_matcher` exactly, so the default path is untouched
-/// by construction.
 pub(crate) fn build_matcher_opts(
     pattern: &str,
     case_insensitive: bool,
@@ -500,9 +377,6 @@ pub(crate) fn build_matcher_opts(
     if let Ok(m) = b.build(pattern) {
         return Ok(m);
     }
-    // Same less-gated retries as `build_matcher`, each keeping word+fixed
-    // so a retry never silently drops them; the final fallback keeps them
-    // too, and a truly bad pattern still returns Err (exit 2).
     if ascii_only {
         let mut bz = RegexMatcherBuilder::new();
         bz.unicode(false);
@@ -539,13 +413,6 @@ pub(crate) fn build_matcher_opts(
     bf.build(pattern)
 }
 
-/// Multi-pattern prefilter branches. Single non-fixed delegates to
-/// `query_grams` exactly (default path identical). Fixed patterns are
-/// literals: every 3-byte window is required (a literal matches only text
-/// containing it whole), so short (<3 B) or empty patterns yield None
-/// (full scan — an empty pattern matches every line). Multi-pattern ORs
-/// every pattern's branches; any pattern without usable grams forces None,
-/// since it can match files lacking the other patterns' grams.
 pub(crate) fn query_grams_multi(patterns: &[String], fixed: bool) -> Option<Vec<Vec<u32>>> {
     if !fixed && patterns.len() == 1 {
         return query_grams(&patterns[0]);
@@ -570,10 +437,6 @@ pub(crate) fn query_grams_multi(patterns: &[String], fixed: bool) -> Option<Vec<
     Some(ors)
 }
 
-/// Per-file cap (`-m`): keep the first m banked hits per file. Bank order is
-/// file order, so this equals early exit with the same survivors; it runs
-/// after verify (no sink change) and before rank/top/count/emit, matching
-/// rg's capped `-c` shape. `None` (no `-m`) is a no-op.
 pub(crate) fn apply_max_count(hits: &mut [FileHits], max_count: Option<usize>) {
     if let Some(m) = max_count {
         for fh in hits.iter_mut() {
@@ -582,11 +445,6 @@ pub(crate) fn apply_max_count(hits: &mut [FileHits], max_count: Option<usize>) {
     }
 }
 
-/// Split `-f` bytes into patterns: one per `\n`, a single trailing `\r`
-/// stripped per line, interior empty lines kept (rg 15.1.0: an empty `-f`
-/// line matches every line — probed), the trailing-newline artifact
-/// dropped, and a fully empty file yielding zero patterns (rg: `-f` with
-/// no patterns matches nothing — probed).
 pub(crate) fn split_pattern_lines(data: &[u8]) -> Vec<String> {
     if data.is_empty() {
         return vec![];
@@ -618,7 +476,6 @@ mod literal_tests {
 
     #[test]
     fn escaped_pipe_stays_one_branch() {
-        // `abc\|def` is a single literal `abc|def`, not an alternation.
         let got = sorted_branches("abc\\|def").unwrap();
         assert_eq!(got.len(), 1, "escaped pipe must not split: {got:?}");
         assert!(got[0].contains(&gram_pack(b"abc")), "{got:?}");
@@ -627,8 +484,6 @@ mod literal_tests {
 
     #[test]
     fn escaped_pipe_branch_still_indexes() {
-        // Naive `split('|')` yields a bare `x` branch -> None (full scan).
-        // Proper parse keeps 2 branches, both with usable literals.
         let got = sorted_branches("needle_1\\|x|NEEDLE_ALPHA").unwrap();
         assert_eq!(got.len(), 2, "{got:?}");
     }
@@ -637,8 +492,6 @@ mod literal_tests {
     fn class_pipe_does_not_split() {
         let got = sorted_branches("[a|b]+needle_1").unwrap();
         assert_eq!(got.len(), 1, "class pipe must not split: {got:?}");
-        // Runs of four or more now yield four-grams, so the proxy for "this
-        // branch kept its literal" is a four-gram of `needle_1`.
         assert!(
             got[0].contains(
                 &(((b'n' as u32) << 24)
@@ -657,8 +510,6 @@ mod literal_tests {
     }
     #[test]
     fn cached_verify_matches_plain() {
-        // The fd-cache read path (`Some`) must bank the same hits as the
-        // plain path (`None`): byte-identical decoded text, line, and score.
         let dir = std::env::temp_dir().join(format!("nkg_cached_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.txt");
@@ -687,14 +538,11 @@ mod literal_tests {
     }
     #[test]
     fn group_and_repeat_falls_back() {
-        // `(?` (flags, named groups, comments, lookaround) and `{n}`
-        // repetition can drop a required trigram: full scan.
         assert!(query_grams("(?i)needle_alpha").is_none());
         assert!(query_grams("(?P<word>NEEDLE_ALPHA)").is_none());
         assert!(query_grams("(?#comment)NEEDLE_ALPHA").is_none());
         assert!(query_grams("NEEDLE_[A-Z]{2,}").is_none());
         assert!(query_grams("confi{1,}g").is_none());
-        // Escaped or class-contained `(?` / `{d` stay literal: indexable.
         assert!(query_grams("[(?]needle_alpha").is_some());
     }
 
@@ -709,7 +557,6 @@ mod literal_tests {
     }
     #[test]
     fn pack_bijective_and_ordered() {
-        // Bijective: distinct triples pack distinctly, top byte stays zero.
         let mut seen = std::collections::HashSet::new();
         for a in [0u8, 1, 65, 95, 122, 200, 255] {
             for b in [0u8, 1, 65, 95, 122, 200, 255] {
@@ -723,7 +570,6 @@ mod literal_tests {
                 }
             }
         }
-        // Numeric order equals lexicographic byte order.
         let mut trips: Vec<[u8; 3]> = vec![
             *b"abc", *b"abd", *b"bac", *b"aaa", *b"zzz", *b"a_c", *b"_aa",
         ];
@@ -768,8 +614,6 @@ mod literal_tests {
                 match_limit: None,
             })
         });
-        // Columnar flat scan (serve semantics): full verify, rank over side
-        // scores, top-0 truncate.
         let scanned_all: Vec<FileHits> = [(0u32, 10.0f64), (1u32, 5.0f64)]
             .into_iter()
             .filter_map(|(id, s)| {
@@ -795,9 +639,7 @@ mod literal_tests {
     #[test]
     fn matchflags_combine_scopes_groups() {
         let one = |s: &str| s.to_string();
-        // Single non-fixed passes through verbatim (default path identical).
         assert_eq!(combine_patterns(&[one("a|b")], false), "a|b");
-        // Wrapping keeps (?i) scoped and inner | from merging branches.
         assert_eq!(
             combine_patterns(&[one("(?i)foo"), one("BAR")], false),
             "(?:(?i)foo)|(?:BAR)"
@@ -806,7 +648,6 @@ mod literal_tests {
             combine_patterns(&[one("(a|b)"), one("c")], false),
             "(?:(a|b))|(?:c)"
         );
-        // Fixed pre-escapes so separators stay regex alternation.
         assert_eq!(
             combine_patterns(&[one("a.c"), one("x|y")], true),
             "(?:a\\.c)|(?:x\\|y)"
@@ -817,22 +658,17 @@ mod literal_tests {
     #[test]
     fn matchflags_grams_multi() {
         let one = |s: &str| s.to_string();
-        // Single non-fixed delegates exactly.
         assert_eq!(
             query_grams_multi(&[one("NEEDLE_ALPHA")], false),
             query_grams("NEEDLE_ALPHA")
         );
-        // Fixed uses literal windows, even where regex parse would bail.
         let g = query_grams_multi(&[one("foo*bar")], true).unwrap();
         assert_eq!(g.len(), 1);
         assert!(g[0].contains(&gram_pack(b"foo")));
         assert!(g[0].contains(&gram_pack(b"bar")));
-        // Multi unions branches; any gram-less pattern forces a full scan.
         let u = query_grams_multi(&[one("NEEDLE_ALPHA"), one("needle_1")], false).unwrap();
         assert_eq!(u.len(), 2);
         assert!(query_grams_multi(&[one("NEEDLE_ALPHA"), one("a|b")], false).is_none());
-        // Empty/short fixed patterns hold no trigram: full scan (an empty
-        // pattern matches every line, so pruning would false-negative).
         assert!(query_grams_multi(&[one("")], true).is_none());
         assert!(query_grams_multi(&[one("ab")], true).is_none());
     }
@@ -842,7 +678,6 @@ mod literal_tests {
         let v = |b: &[u8]| split_pattern_lines(b);
         assert!(v(b"").is_empty());
         assert_eq!(v(b"a\n"), vec!["a"]);
-        // Interior empties kept (match-all); trailing artifact dropped.
         assert_eq!(v(b"a\n\nb\n"), vec!["a", "", "b"]);
         assert_eq!(v(b"\n"), vec![""]);
         assert_eq!(v(b"a\r\nb\r\n"), vec!["a", "b"]);
@@ -851,8 +686,6 @@ mod literal_tests {
 
     #[test]
     fn matchflags_matcher_word_fixed() {
-        // Word bounds via the searcher core (rg 15.1.0 shapes: foo-bar yes,
-        // foobar/foo_bar no).
         let w = build_matcher_opts("foo", false, true, false).unwrap();
         for (line, want) in [
             ("a foo b", 1),
@@ -871,7 +704,6 @@ mod literal_tests {
             s.search_slice(&w, line.as_bytes(), &mut sink).unwrap();
             assert_eq!(sink.metas.len(), want, "word line {line:?}");
         }
-        // Fixed treats metachars literally.
         let f = build_matcher_opts("a.c", false, false, true).unwrap();
         let mut s = grep_searcher::SearcherBuilder::new().build();
         let mut sink = ColCollector {
@@ -924,7 +756,6 @@ mod literal_tests {
         assert_eq!(inv.metas.len(), 2);
         assert_eq!((inv.metas[0].line, inv.metas[1].line), (2, 4));
         assert_eq!(banked_text(&inv, &inv.metas[0]), "bar two");
-        // Same through the cached twin (serve path).
         let inv_c = verify_one_raw_cached_ctx(CachedVerify {
             err: &latch,
             pid: 0,
@@ -940,7 +771,6 @@ mod literal_tests {
         .expect("cached invert");
         assert_eq!(inv_c.metas.len(), 2);
         assert_eq!(inv_c.metas[0].line, 2);
-        // -m keeps file order (first m).
         let mut capped = verify_one_raw_ctx(VerifyInput {
             err: &latch,
             pid: 0,
@@ -996,11 +826,9 @@ mod escape_tests {
 
     #[test]
     fn fuzz_vs_serde_full_matrix() {
-        // Every single byte 0x00-0x7F standalone.
         for b in 0u8..=0x7Fu8 {
             check_str(&char::from_u32(b as u32).unwrap().to_string());
         }
-        // Every control/quote/backslash embedded in text.
         let mut specials: Vec<char> = (0u8..0x20).map(|b| b as char).collect();
         specials.push('"');
         specials.push('\\');
@@ -1009,14 +837,12 @@ mod escape_tests {
             check_str(&format!("{c}lead"));
             check_str(&format!("trail{c}"));
         }
-        // Full pair matrix over specials (byte-identical gate).
         for a in &specials {
             for b in &specials {
                 check_str(&format!("{a}{b}"));
                 check_str(&format!("x{a}y{b}z"));
             }
         }
-        // Must-NOT-escape: DEL, high bytes via multibyte, slashes.
         for s in [
             "\x7f",
             "caf\u{e9}",
@@ -1040,8 +866,6 @@ mod escape_tests {
         ] {
             check_str(s);
         }
-        // Hit-level sweep: lines x scores x tricky strings. Floats stay on
-        // the serde path (ryu); this locks byte-identity including score.
         let texts = [
             "plain",
             "q\"q\\",
@@ -1077,8 +901,6 @@ mod escape_tests {
 
     #[test]
     fn fuzz_vs_serde_corpus_bytes() {
-        // Every line of the real bench corpus as `text`, every file path as
-        // `path`: the differential check over actual emission bytes.
         let root = std::path::Path::new("bench/corpus");
         if !root.exists() {
             return;
@@ -1103,7 +925,6 @@ mod escape_tests {
             for line in data.split(|&b| b == b'\n') {
                 let s = String::from_utf8_lossy(line);
                 check_str(&s);
-                // Spot Hit-level check per file: first line only keeps it fast.
                 if n < 2000 && line.as_ptr() == data.as_ptr() {
                     check_hit(&p.to_string_lossy(), 1, &s, 12.5);
                 }

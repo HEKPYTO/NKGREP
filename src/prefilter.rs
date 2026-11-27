@@ -1,14 +1,3 @@
-//! Candidate prefilter for ranked queries (plan C, LoopC).
-//!
-//! Posting lists are sorted ascending unique file ids: `cmd_index` assigns
-//! ids sequentially and pushes each file once per trigram, and the binary
-//! codec round-trips lists verbatim (LoopB contract). All set ops below are
-//! therefore linear two-pointer merges over sparse id arrays — no hashing,
-//! no per-posting allocation. Scoring is deferred until after pruning so
-//! pruned files cost no float work. Sort order is validated at load
-//! (`intersect_all` exits 2); a violated invariant is a bug, never silently absorbed.
-
-/// Intersect two sorted id slices into `out` (cleared first).
 pub fn intersect_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
     let (mut i, mut j) = (0usize, 0usize);
@@ -26,7 +15,6 @@ pub fn intersect_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     }
 }
 
-/// Union two sorted id slices into `out` (cleared first, deduped).
 pub fn union_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.clear();
     out.reserve(a.len() + b.len());
@@ -49,10 +37,6 @@ pub fn union_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     out.extend_from_slice(&b[j..]);
 }
 
-/// Intersect N sorted posting lists, smallest first; returns sorted unique
-/// ids. Empty input or any empty list yields empty output. Unsorted input
-/// is refused loudly (exit 2): the index contract guarantees sorted
-/// postings, so unsorted means a corrupt index, never silently absorbed.
 pub fn intersect_all(lists: &mut Vec<&[u32]>) -> Vec<u32> {
     if lists.is_empty() {
         return vec![];
@@ -83,7 +67,6 @@ mod tests {
 
     #[test]
     fn merge_matches_hashset_model() {
-        // Fixed adversarial cases: empty, disjoint, overlap, shared prefix.
         let cases: &[(&[u32], &[u32])] = &[
             (&[], &[]),
             (&[], &[1, 2]),
@@ -114,7 +97,6 @@ mod tests {
         let l1 = vec![1u32, 2, 3, 4, 5];
         let l2 = vec![2u32, 4];
         let l3 = vec![2u32, 3, 4, 9];
-        // Deliberately longest-first input; output must still be exact.
         let mut lists: Vec<&[u32]> = vec![&l1, &l3, &l2];
         assert_eq!(intersect_all(&mut lists), vec![2, 4]);
         let mut empty: Vec<&[u32]> = vec![];

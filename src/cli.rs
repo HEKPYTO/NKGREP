@@ -6,11 +6,6 @@ use crate::matcher::build_matcher;
 #[cfg(test)]
 use crate::{emit_text_row, emit_text_row_colored, render_buffered_text};
 
-/// --color target state (ColorOut): auto (default), always, never, plus ansi
-/// as an rg-compatible alias for always. auto colorizes only when stdout is
-/// a TTY. Color applies to `--format text` match spans only; JSON stays
-/// machine-clean. GREP_COLORS is parked (not honored): match style is fixed
-/// bold-red, byte-probed on rg 15.1.0.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ColorWhen {
     Auto,
@@ -18,8 +13,6 @@ pub(crate) enum ColorWhen {
     Never,
 }
 
-/// Parse a `--color` value; None means usage error (exit 2 at the call site).
-/// `ansi` is an rg-compatible alias for `always`.
 pub(crate) fn parse_color_when(s: &str) -> Option<ColorWhen> {
     match s {
         "auto" => Some(ColorWhen::Auto),
@@ -29,8 +22,6 @@ pub(crate) fn parse_color_when(s: &str) -> Option<ColorWhen> {
     }
 }
 
-/// Resolve color for this process. Explicit always wins everywhere (even
-/// piped); never wins nowhere; auto follows the stdout TTY only.
 pub(crate) fn color_enabled(when: ColorWhen) -> bool {
     match when {
         ColorWhen::Always => true,
@@ -38,10 +29,6 @@ pub(crate) fn color_enabled(when: ColorWhen) -> bool {
         ColorWhen::Auto => std::io::stdout().is_terminal(),
     }
 }
-/// Wrap each non-empty matcher span in `text` with rg's match style
-/// (`\x1b[0m\x1b[1m\x1b[31m` … `\x1b[0m`). Zero-width matches are skipped so
-/// patterns like `x*` never spray codes; a line with no spans borrows back
-/// unchanged. Byte splicing is safe: regex spans are char-boundary aligned.
 pub(crate) fn colorize_spans<'a>(
     text: &'a str,
     matcher: &RegexMatcher,
@@ -68,8 +55,6 @@ pub(crate) fn colorize_spans<'a>(
         pos = e;
     }
     out.extend_from_slice(&b[pos..]);
-    // Spans are char-boundary aligned and SGR inserts are ASCII, so the
-    // splice stays valid UTF-8 by construction; loud panic if broken.
     std::borrow::Cow::Owned(String::from_utf8(out).expect("colorize splice must stay UTF-8"))
 }
 
@@ -80,9 +65,6 @@ pub(crate) fn usage() -> ! {
     std::process::exit(2);
 }
 
-/// `--help` text (stdout, exit 0). Usage errors still go through `usage()`
-/// (stderr, exit 2). Write errors are ignored: help under a closed pipe
-/// simply ends the process.
 pub(crate) fn print_help() {
     let head = concat!(
         "nkg ",
@@ -165,7 +147,6 @@ pub(crate) fn print_help() {
     let _ = w.flush();
 }
 
-/// `--version` (stdout, exit 0); same closed-pipe tolerance as help.
 pub(crate) fn print_version() {
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
@@ -195,12 +176,10 @@ mod color_tests {
     fn enabled_explicit_wins() {
         assert!(color_enabled(ColorWhen::Always));
         assert!(!color_enabled(ColorWhen::Never));
-        // Auto follows the TTY only — no assert (environment-dependent).
     }
 
     #[test]
     fn span_wrap_matches_rg_bytes() {
-        // Exact SGR sequence byte-probed on rg 15.1.0 (`--color=always`).
         let m = lit("hello");
         assert_eq!(
             &*colorize_spans("hello world", &m),
@@ -218,7 +197,6 @@ mod color_tests {
 
     #[test]
     fn zero_width_spans_skipped() {
-        // `x*` matches empty everywhere: must emit no codes at all.
         let m = lit("x*");
         let out = colorize_spans("ab", &m);
         assert_eq!(&*out, "ab");
@@ -236,8 +214,6 @@ mod color_tests {
 
     #[test]
     fn colored_row_delegates_framing() {
-        // Plain and colored rows share `path:line:` framing; only the text
-        // span differs.
         let m = lit("needle");
         let mut plain = Vec::new();
         let mut colored = Vec::new();
@@ -252,8 +228,6 @@ mod color_tests {
 
     #[test]
     fn serve_colored_mirrors_plain_shape() {
-        // Same rows, same order through the streamed text renderer; only
-        // spans wrapped.
         let raw = b"{\"path\":\"a.txt\",\"line\":1,\"text\":\"hi needle\"}\n\
                     {\"path\":\"b.txt\",\"line\":2,\"text\":\"no hit here\"}\n";
         let m = lit("needle");

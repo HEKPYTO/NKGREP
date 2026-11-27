@@ -1,5 +1,3 @@
-// nkg — ranked trigram code search.
-
 use grep_regex::RegexMatcher;
 use grep_searcher::Searcher;
 use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
@@ -36,8 +34,6 @@ struct Hit {
     score: f64,
 }
 
-/// Columnar hit: per-file arena banks match bytes verbatim; decode at emit.
-/// Wire bytes identical to the eager path.
 struct HitMeta {
     line: u64,
     start: u32,
@@ -49,8 +45,6 @@ struct FileHits {
     pid: u32,
     arena: Vec<u8>,
     metas: Vec<HitMeta>,
-    /// Line-start offsets over `arena`; empty unless context>0 (then arena
-    /// holds the full file bytes verbatim).
     line_starts: Vec<u32>,
 }
 
@@ -58,10 +52,6 @@ struct ColCollector {
     arena: Vec<u8>,
     metas: Vec<HitMeta>,
     path_bonus: f64,
-    /// Per-file cap handed to grep-searcher as `max_matches`: `Some(1)` for
-    /// `-l`/`-q` (one path per file) and `Some(n)` for `-m n`. Without it the
-    /// file was scanned to the end and the cap applied afterwards, so a `-m 1`
-    /// search of a 26 MB file cost the same as printing every match.
     match_limit: Option<u64>,
 }
 
@@ -88,8 +78,6 @@ impl Sink for ColCollector {
     }
 }
 
-/// Cold columnar verify arguments, bundled so the entry stays under
-/// clippy's argument-count limit (same contract as `CachedVerify`).
 struct VerifyInput<'a> {
     err: &'a AtomicBool,
     pid: u32,
@@ -100,21 +88,9 @@ struct VerifyInput<'a> {
     after: usize,
     invert: bool,
     follow: bool,
-    /// Per-file match cap for the searcher; see `ColCollector::match_limit`.
     match_limit: Option<u64>,
 }
 
-/// Request-scoped loud-verify latch (I/O-error exit-2 contract): verify runs
-/// on rayon workers and returns `Option`, so a per-file open/read failure
-/// records itself here instead of vanishing into a `None`. Each request owns
-/// its latch (`&AtomicBool` threaded through the verify inputs); callers fold
-/// `take_verify_io_error(err)` into `walk_error` before every emission, so an
-/// unreadable file exits 2 instead of silently matching nothing. A symlink
-/// refused under no-follow open (swapped in after the walk) still skips
-/// silently — the same outcome as a walk-filtered file.
-/// Report one unreadable corpus file from a verify worker into the
-/// request-scoped latch; the caller turns it into exit 2. Returns false so
-/// call sites keep their shape.
 fn note_verify_io_error(err: &AtomicBool, path: &str, e: &std::io::Error, follow: bool) -> bool {
     let raced_link = !follow
         && std::fs::symlink_metadata(std::path::Path::new(path))
@@ -126,13 +102,10 @@ fn note_verify_io_error(err: &AtomicBool, path: &str, e: &std::io::Error, follow
     }
     false
 }
-/// Drain a request-scoped loud-verify latch (false when no worker failed
-/// since the last drain); folded into `walk_error` before every emission.
 fn take_verify_io_error(err: &AtomicBool) -> bool {
     err.swap(false, Ordering::Relaxed)
 }
 
-/// No-context wrapper over `verify_one_raw_ctx` (before=after=0, invert=false).
 fn verify_one_raw(
     err: &AtomicBool,
     pid: u32,
@@ -156,8 +129,6 @@ fn verify_one_raw(
     })
 }
 
-/// Columnar verify: TLS Searcher + 64KB buf + verbatim-banked sink; hit set,
-/// scores, and rank order identical with or without context/invert.
 fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
     let VerifyInput {
         err,
@@ -182,28 +153,10 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
         path_bonus: file_score,
         match_limit,
     };
-    // `with` (not try_with): destroyed-TLS fallback returning empty would
-    // silently drop matches and break set equality; loud panic is correct.
-    // Any IO/search error still discards partial hits, as before.
     let ok = SEARCHER.with(|s| {
         BUF.with(|b| {
             let mut buf = b.borrow_mut();
             buf.clear();
-            // Inverted search needs `invert_match(true)`; the TLS searcher is
-            // fixed-config, so invert builds a local searcher per file (no
-            // TLS pair to keep in sync; invert is off the hot default path).
-            // The `match` reads the initial None on the default path, so no
-            // dead assignment (warnings are denied).
-            // `-l`/`-q` want the path, not the rows, so cap the searcher at one
-            // match per file. `max_matches` is grep-searcher's own mechanism
-            // for exactly this and is checked per match, so the file stops
-            // being scanned the moment it hits. The TLS searcher is
-            // fixed-config, so the capped one is built per file instead.
-            // `invert` and `match_limit` are independent: `-l -v` wants the
-            // files WITHOUT the match, which is the capped searcher on top of
-            // the inverted one. Setting them in sequence (rather than
-            // `else if`) is what keeps `-l -v` from silently degrading to a
-            // plain capped search, which returns the complement.
             let mut local: Option<Searcher> = None;
             let mut normal = s.borrow_mut();
             if invert || match_limit.is_some() {
@@ -222,17 +175,9 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
             };
             (|| -> std::io::Result<bool> {
                 use std::io::{Read, Seek, SeekFrom};
-                // No-follow open (unless -L): a symlink swapped in after
-                // the walk is refused here, never followed outside.
                 let mut f = open_verify_file(std::path::Path::new(path), follow)?;
-                // Binary skip on the head only, so a file never has to be
-                // resident to be classified: `is_binary` reads at most 8 KiB,
-                // and the index never admits binaries, so verify must skip
-                // them identically or indexed stops equalling scan.
                 let mut head = [0u8; 8192];
                 let n = f.read(&mut head)?;
-                // Per-file early exit: an empty file holds no lines and no
-                // matches; skip searcher setup. Result identical to searching.
                 if n == 0 {
                     return Ok(true);
                 }
@@ -240,18 +185,9 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
                     return Ok(true);
                 }
                 if before == 0 && after == 0 {
-                    // No context to attach, so nothing needs the bytes after
-                    // the match: stream the file instead of holding it whole.
-                    // `search_reader` is the same engine and matcher as
-                    // `search_slice`, so the banked hit set is identical and
-                    // peak memory stops scaling with the largest file in the
-                    // tree -- the difference between 6 MB and 390 MB of RSS on
-                    // a corpus of a few large files.
                     f.seek(SeekFrom::Start(0))?;
                     return Ok(searcher.search_reader(matcher, &mut f, &mut sink).is_ok());
                 }
-                // Context lines are decoded by byte range against the whole
-                // file, so this path stays buffered.
                 f.seek(SeekFrom::Start(0))?;
                 f.read_to_end(&mut buf)?;
                 Ok(searcher.search_slice(matcher, &buf, &mut sink).is_ok())
@@ -267,9 +203,6 @@ fn verify_one_raw_ctx(args: VerifyInput<'_>) -> Option<FileHits> {
             line_starts: vec![],
         };
         if before > 0 || after > 0 {
-            // The TLS buffer still holds this file's bytes (cleared only on
-            // the next call); attach copies them into the arena — no extra
-            // read, one copy, no duplicate storage.
             BUF.with(|b| attach_context(&mut fh, &b.borrow()));
         }
         Some(fh)
@@ -313,11 +246,6 @@ struct CachedVerify<'a> {
     follow: bool,
 }
 
-/// Serve-side columnar verify with context attach: same TLS Searcher +
-/// 64 KB buffer + search_slice core and verbatim-banked sink as
-/// `verify_one_raw_ctx`, but the file bytes come through the daemon fd
-/// cache (`read_verify_bytes`). Context attach is the same post-pass over
-/// the surviving hits; the hit set is identical either way.
 fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
     let CachedVerify {
         err,
@@ -342,14 +270,10 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
         path_bonus: file_score,
         match_limit: None,
     };
-    // `with` (not try_with): destroyed-TLS fallback returning empty would
-    // silently drop matches and break set equality; loud panic is correct.
-    // Any IO/search error still discards partial hits, as before.
     let ok = SEARCHER.with(|s| {
         BUF.with(|b| {
             let mut buf = b.borrow_mut();
             buf.clear();
-            // Same local-inverted-searcher contract as the cold twin.
             let mut local: Option<Searcher> = None;
             let mut normal = s.borrow_mut();
             if invert {
@@ -361,13 +285,9 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
             };
             (|| -> std::io::Result<bool> {
                 read_verify_bytes(fdc, path, &mut buf, false, follow)?;
-                // Twin of the `verify_one_raw` early exit: empty files hold
-                // no matches; skip searcher setup identically.
                 if buf.is_empty() {
                     return Ok(true);
                 }
-                // Symmetric with `cmd_index`: binary files are never indexed,
-                // so verify skips them identically (indexed==scan).
                 if is_binary(&buf) {
                     return Ok(true);
                 }
@@ -384,8 +304,6 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
             line_starts: vec![],
         };
         if before > 0 || after > 0 {
-            // Same TLS-buffer reuse as the cold twin: the buffer still holds
-            // this file's bytes; attach copies them into the arena.
             BUF.with(|b| attach_context(&mut fh, &b.borrow()));
         }
         Some(fh)
@@ -394,55 +312,16 @@ fn verify_one_raw_cached_ctx(args: CachedVerify<'_>) -> Option<FileHits> {
     }
 }
 
-/// Postings as one key-sorted run: `keys[i]` owns
-/// `ids[off[i]..off[i+1]]`. Real code has a long-tail trigram distribution —
-/// 67k postings over 2k files, against 459 over 3k for a dense synthetic
-/// corpus — so the map form paid one allocation plus a hash insert per
-/// posting, on the critical path of every cold query. Three arrays and a
-/// binary search replace that.
-///
-/// The JSON form on disk is unchanged (`{key: [ids]}`), so no index needs
-/// rebuilding and no stored file is invalidated by this representation.
-/// Postings as one key-sorted run: `keys[i]` owns the ids of run `i`. Real
-/// code has a long-tail trigram distribution — 67k postings over 2k files,
-/// against 459 over 3k for a dense synthetic corpus — so the original map paid
-/// one allocation plus a hash insert per posting on the critical path of every
-/// cold query.
-///
-/// `Raw` goes further and leaves the ids in their on-disk little-endian bytes:
-/// building only the key/offset table measured 0.26 ms against 1.96 ms to push
-/// all 2.1M ids into a `Vec`, and a query touches a handful of runs out of
-/// 67k. `Owned` remains for the JSON path, which must tokenize the document
-/// anyway, and after a subtree remap.
-///
-/// The JSON form on disk is unchanged (`{key: [ids]}`), so no stored index is
-/// invalidated by either variant.
 enum Postings {
     Owned {
         keys: Vec<u32>,
-        /// `keys.len() + 1` entries; `off[0]` is always 0.
         off: Vec<u32>,
         ids: Vec<u32>,
     },
     Raw {
-        /// Byte offset of the contiguous fixed-stride header table in `data`
-        /// (NKGREP06). Entry `i` is `data[hdr + i*16 ..][..16]`, laid out
-        /// `key | blen | last | blob_off`. Nothing per-run is
-        /// materialized: `find` binary-searches keys in place and `ids_at`
-        /// reads one entry then decodes that run's blob.
         hdr: usize,
-        /// Number of header entries (postings) in the table.
         npost: usize,
-        /// The mapped index file, so ids are never copied at load and a
-        /// query faults in only the pages it actually reads.
         data: std::sync::Arc<memmap2::Mmap>,
-        /// File count this index was built over. Layered: the load-time
-        /// `last` check range-checks every run in O(runs) — a sequential scan
-        /// of the table's `last` column, which the fixed stride makes
-        /// cache-friendly — and `decode_run` range-checks every id as it is
-        /// produced, which is the guard the subtree path relies on, since
-        /// `into_owned` flattens runs without going through `intersect_all`.
-        /// So no unchecked id reaches `is_cand` or `remap` on either path.
         nfiles: usize,
     },
 }
@@ -458,16 +337,12 @@ impl Default for Postings {
 }
 
 impl Postings {
-    /// Number of postings: one header entry each.
     fn npost(&self) -> usize {
         match self {
             Postings::Owned { keys, .. } => keys.len(),
             Postings::Raw { npost, .. } => *npost,
         }
     }
-    /// Key of entry `i`. The owned form holds a `Vec`; the raw form reads the
-    /// fixed-stride table in place, which is what lets load skip materializing
-    /// one `Vec<u32>` per column.
     fn key_at(&self, i: usize) -> u32 {
         match self {
             Postings::Owned { keys, .. } => keys[i],
@@ -477,8 +352,6 @@ impl Postings {
             }
         }
     }
-    /// One header field of entry `i`: `field` is 0 key, 1 blen, 2 last,
-    /// 3 blob_off.
     fn hdr_at(&self, i: usize, field: usize) -> u32 {
         match self {
             Postings::Owned { .. } => unreachable!("owned postings have no header table"),
@@ -492,9 +365,6 @@ impl Postings {
         match self {
             Postings::Owned { keys, .. } => keys.binary_search(&k).ok(),
             Postings::Raw { .. } => {
-                // Keys are written strictly ascending, so a plain lower-bound
-                // walk over the on-disk column is exact: O(log npost) reads of
-                // 4 bytes instead of a materialized key vector.
                 let (mut lo, mut hi) = (0usize, self.npost());
                 while lo < hi {
                     let mid = lo + (hi - lo) / 2;
@@ -508,18 +378,8 @@ impl Postings {
             }
         }
     }
-    /// Decode run `i`'s LEB128 deltas into `out`, range-checking each id as it
-    /// is produced. The bounds live here rather than only at load so that no
-    /// unchecked id can reach `is_cand` (rank) or `remap` (subtree), whatever
-    /// a stored `last` claimed.
     fn decode_run(data: &[u8], at: usize, blen: usize, nfiles: usize, out: &mut Vec<u32>) {
         out.clear();
-        // Bounded by `blen` rather than by a stored id count. Every delta is a
-        // LEB128 varint of at least one byte, so consuming exactly `blen`
-        // bytes yields exactly the ids a stored count would have named — which
-        // is why the count is not in the header at all. A hostile `blen`
-        // running past the end fails inside `get_varint` below rather than
-        // asking for a huge allocation up front.
         let end = at.saturating_add(blen);
         out.reserve(blen.min(1 << 16));
         let mut prev = 0u32;
@@ -546,7 +406,6 @@ impl Postings {
             out.push(id);
         }
     }
-    /// Ids of run `i`, decoded into `out` when they are still stored bytes.
     fn ids_at<'o>(&'o self, i: usize, out: &'o mut Vec<u32>) -> &'o [u32] {
         match self {
             Postings::Owned { off, ids, .. } => &ids[off[i] as usize..off[i + 1] as usize],
@@ -558,10 +417,6 @@ impl Postings {
             }
         }
     }
-    /// Flatten to the owned form, so a subtree remap can rewrite ids in place.
-    /// Range-checks as it decodes: this path never runs `ids_at`, and the
-    /// remap indexes `remap[id]` directly, so an unchecked corrupt id here
-    /// would panic rather than exit 2.
     fn into_owned(self) -> Postings {
         match self {
             owned @ Postings::Owned { .. } => owned,
@@ -594,24 +449,10 @@ impl Postings {
             }
         }
     }
-    /// True when every posting id addresses a real file. This is the owned
-    /// (JSON, and flattened-subtree) form's check. The binary form does not
-    /// need it here: `parse_index_bin` validates every run's stored maximum
-    /// during its single pass over the header table, so the loud exit 2 for a
-    /// corrupt index still happens at load, whatever query arrives — and it
-    /// happens once instead of twice.
     fn ids_in_range(&self, nfiles: usize) -> bool {
         match self {
             Postings::Owned { ids, .. } => ids.iter().all(|&id| (id as usize) < nfiles),
             Postings::Raw { npost, .. } => {
-                // Field 2 is `last` under NKGREP06 (`key | blen | last |
-                // blob_off`). Field 3, which the pre-bump code read, is
-                // `blob_off` now and compares a byte offset against a file
-                // count. Unreachable from the sole caller, which is
-                // `parse_index` and deserializes through `FlatBuild` into
-                // `Owned` only -- but kept correct rather than dropped, because
-                // `true` would hand a future caller no check at all and the
-                // arm's own doc claims one.
                 (0..*npost).all(|i| (self.hdr_at(i, 2) as usize) < nfiles)
             }
         }
@@ -631,9 +472,6 @@ impl Serialize for Postings {
     }
 }
 
-/// Deserialize into the flat form without materializing a `Vec` per posting:
-/// each key's id run is appended straight into one buffer as it streams, and
-/// the runs are ordered once at the end.
 impl<'de> Deserialize<'de> for Postings {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         d.deserialize_map(FlatPostingsVisitor)
@@ -642,17 +480,11 @@ impl<'de> Deserialize<'de> for Postings {
 
 #[derive(Default)]
 struct FlatBuild {
-    /// (key, start, end) into `ids`, in the order the document listed them.
     entries: Vec<(u32, u32, u32)>,
     ids: Vec<u32>,
 }
 
 impl FlatBuild {
-    /// Order the runs by key and lay them out contiguously. A duplicated key
-    /// is a corrupt document, not a merge to resolve: concatenating the runs
-    /// would hand rank an id list the file never described, and keeping only
-    /// one would silently search less than a scan. Refuse instead, which
-    /// `parse_index` turns into the usual loud exit 2.
     fn finish(mut self) -> Result<Postings, serde::de::value::Error> {
         self.entries.sort_by_key(|e| e.0);
         let mut keys: Vec<u32> = Vec::with_capacity(self.entries.len());
@@ -707,7 +539,6 @@ impl<'de, 'a> serde::de::DeserializeSeed<'de> for FlatRunSeed<'a> {
             }
             fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
                 let start = self.b.ids.len() as u32;
-                // size_hint is exact for a JSON array, so this reserves once.
                 self.b.ids.reserve(seq.size_hint().unwrap_or(0));
                 while let Some(id) = seq.next_element::<u32>()? {
                     self.b.ids.push(id);
@@ -726,44 +557,16 @@ impl<'de, 'a> serde::de::DeserializeSeed<'de> for FlatRunSeed<'a> {
 
 #[derive(Serialize, Deserialize)]
 struct Index {
-    /// Canonical absolute path of the tree the index was built from.
-    /// Required: old absolute-path indexes without it fail to parse and are
-    /// rejected loudly at load (rebuild with `nkg index`).
     root: String,
-    /// (device, inode) cookie of the build root; 0/0 where unavailable.
-    /// Catches a replaced tree behind an unchanged path.
     root_dev: u64,
     root_ino: u64,
-    /// Root-relative paths (to be joined with the query root at load).
     files: Vec<String>,
-    /// Packed trigram keys: gram_pack([a,b,c]) = (a<<16)|(b<<8)|c.
-    /// Bijective over the 3-byte domain (top byte always zero); no lossy
-    /// UTF-8 string round trip, 4 B fixed keys in the binary codec.
     postings: Postings,
 }
 
-/// Stored `files` entries must be root-relative: absolute paths (stale
-/// format) and `..` components (directory escape past the query root on
-/// join) are refused loudly (exit 2), never silently dropped. Checked at
-/// parse and again pre-join at load so a hostile index cannot make verify
-/// read outside the rooted tree.
 fn validate_stored_files(idx_path: &str, files: &[String]) {
-    // An empty stored path is malformed in either form: `nkg index` never
-    // emits one, and every output path derives from a real walk. Refusing it
-    // here keeps it off the query path entirely.
     #[cfg(unix)]
     {
-        // Byte-level equivalents of `PathBuf::from(p).is_absolute()` and
-        // `components().any(ParentDir)`, with none of their cost. This runs
-        // over every stored path on every query, so it is per-file work --
-        // measured at 2.6 ms for 18k paths, nearly all of it two allocations
-        // and a component parse that a byte scan replaces outright.
-        //
-        // Unix-only on purpose. On Windows an absolute path also has the
-        // `C:\foo`, `\foo` and `\\server\share` forms, and `a/../b` is a
-        // legal parent-dir reference written with a forward slash, so neither
-        // check holds there and reimplementing that logic would be a way to
-        // get the security guard subtly wrong.
         for p in files {
             let Some(first) = p.as_bytes().first() else {
                 eprintln!("nkg: unreadable index {idx_path} (empty stored path)");
@@ -804,9 +607,6 @@ fn validate_stored_files(idx_path: &str, files: &[String]) {
     }
 }
 
-/// Index write that refuses symlink targets: a pre-check plus `O_NOFOLLOW`
-/// open (unix) so a symlink swapped in between check and write still fails
-/// loudly (exit 2) instead of writing through to the target.
 fn write_index_file(idx_path: &str, bytes: &[u8]) {
     if let Ok(m) = std::fs::symlink_metadata(idx_path) {
         if m.file_type().is_symlink() {
@@ -814,12 +614,6 @@ fn write_index_file(idx_path: &str, bytes: &[u8]) {
             std::process::exit(2);
         }
     }
-    // Publish by rename, never by truncating the target in place. A reader
-    // may hold the old index open (the query path maps it rather than copying
-    // it), and truncating a mapped file underneath it faults with SIGBUS
-    // instead of surfacing an error. Renaming a fully written sibling also
-    // means a rebuild that dies partway leaves the previous index intact
-    // rather than a torn one.
     let tmp_path = format!("{idx_path}.tmp{}", std::process::id());
     {
         use std::io::Write;
@@ -833,10 +627,6 @@ fn write_index_file(idx_path: &str, bytes: &[u8]) {
         };
         #[cfg(not(unix))]
         let opts = {
-            // The builder methods return `&mut Self`, so chaining them off
-            // `OpenOptions::new()` binds a reference into a temporary that is
-            // dropped at the end of the statement. Bind an owned value, as the
-            // unix arm does.
             let mut o = std::fs::OpenOptions::new();
             o.write(true).create(true).truncate(true);
             o
@@ -859,27 +649,17 @@ fn write_index_file(idx_path: &str, bytes: &[u8]) {
     }
 }
 
-/// Loud index refusal shared by every index loader (exit 2): `detail` is
-/// the parenthesized cause (`"old format"`, `"truncated binary"`). One
-/// short `eprintln!` site keeps the stderr bytes identical at every call
-/// while fitting on a single line under every rustfmt version.
 fn refuse_index(idx_path: &str, detail: &str, why: &dyn std::fmt::Display) -> ! {
     eprintln!("nkg: unreadable index {idx_path} ({detail}? rebuild with `nkg index`): {why}");
     std::process::exit(2);
 }
 
-/// Loud refusal for a stale binary index magic (exit 2), split out of
-/// `parse_index_auto` for the same single-line-fits-everywhere reason.
 fn refuse_stale_index(idx_path: &str) -> ! {
-    // Derived from the constant, so a future format bump cannot leave the
-    // message naming the previous magic.
     let want = String::from_utf8_lossy(BIN_MAGIC);
     eprintln!("nkg: stale index format {idx_path} (expected {want}): rebuild with `nkg index`");
     std::process::exit(2);
 }
 
-/// Parse index JSON; old absolute-path indexes (missing `root`) and corrupt
-/// files are refused loudly instead of silently matching nothing.
 fn parse_index(idx_path: &str, data: &str) -> Index {
     match serde_json::from_str::<Index>(data) {
         Ok(idx) => {
@@ -893,40 +673,9 @@ fn parse_index(idx_path: &str, data: &str) -> Index {
         Err(e) => refuse_index(idx_path, "old format", &e),
     }
 }
-/// Binary index magic (8 B) + plain-LE linear layout (NKGREP06):
-/// magic | root_dev u64 | root_ino u64 | root_len u32 + root bytes
-/// | nfiles u32 + (len u32 + bytes)*
-/// | npostings u32
-/// | header table: npostings x POSTING_HDR bytes, each
-///     `key u32 | blen u32 | last u32 | blob_off u32`
-/// | blob section: every run's LEB128 id deltas, concatenated at `blob_off`.
-///
-/// NKGREP04 splits the posting table into a contiguous fixed-stride header
-/// array followed by one blob section. NKGREP03 interleaved each header with
-/// its variable-length blob, so a run's byte offset had to be materialized as a
-/// prefix sum at load: four `Vec<u32>` of one entry per posting. With the
-/// headers contiguous and fixed-stride, a key lookup is a binary search
-/// straight into the bytes and load allocates nothing per run. Storing
-/// `blob_off` explicitly is what removes the prefix sum -- offsets are not
-/// derivable by multiplication once blobs are concatenated.
-///
-/// Ids are delta-varint encoded: ids ascend inside a run, so a difference is
-/// almost always one byte, which keeps a real-code index to a few MB. `blen`
-/// lets the loader seek past a run without decoding it; `last` is the run's
-/// maximum (ids ascend), so the load-time range check is one comparison per
-/// run rather than decoding every delta -- and with the headers contiguous
-/// that check is a sequential scan of `last` values, not a pointer chase.
-///
-/// NKGREP01-03 are refused loudly as stale (the generic `NKGREP` prefix check
-/// covers them), same as a fingerprint mismatch. Keys are packed trigrams
-/// (gram_pack), sorted numeric on write for stable bytes. Any truncation →
-/// loud exit 2.
 const BIN_MAGIC: &[u8; 8] = b"NKGREP06";
-/// Bytes per posting header in the table NKGREP06 writes.
 const POSTING_HDR: usize = 16;
 
-/// LEB128 append. Ids ascend inside a run, so a plain unsigned delta needs no
-/// zigzag: the writer only ever emits non-negative differences.
 fn put_varint(out: &mut Vec<u8>, mut v: u32) {
     loop {
         let b = (v & 0x7f) as u8;
@@ -939,13 +688,6 @@ fn put_varint(out: &mut Vec<u8>, mut v: u32) {
     }
 }
 
-/// LEB128 read at `at`; `Some((value, next_offset))` or `None` past the end,
-/// on a continuation bit running off the slice, or on a value wider than
-/// `u32`. That last case matters: accumulating in `u32` with `checked_shl`
-/// validates the shift *amount* but not the bits it lands on, so a hostile
-/// five-byte varint at shift 28 would silently drop everything above bit 31
-/// and decode to a small, in-range id — wrong answers from a corrupt index
-/// rather than a refusal.
 fn get_varint(d: &[u8], at: usize) -> Option<(u32, usize)> {
     let mut v: u64 = 0;
     let mut shift = 0u32;
@@ -989,11 +731,6 @@ fn encode_index_bin(idx: &Index) -> Vec<u8> {
     }
     let npost = idx.postings.npost();
     put_u32(&mut out, npost as u32);
-    // Header table, then blob section. `blob_off` is absolute from the start
-    // of the file: the table's size is already fixed, so every blob's address
-    // is known before the first header is written. Writing the table first is
-    // what makes it a contiguous fixed-stride array the reader can binary
-    // search and range-check in place, with nothing allocated per run.
     let blob_base = out.len() + npost * POSTING_HDR;
     let mut scratch: Vec<u32> = Vec::new();
     let mut run: Vec<u8> = Vec::new();
@@ -1004,10 +741,6 @@ fn encode_index_bin(idx: &Index) -> Vec<u8> {
         run.clear();
         let mut prev = 0u32;
         for id in ids {
-            // Delta encoding assumes ids ascend. A hand-edited or hostile
-            // index can break that, and `id - prev` would then underflow:
-            // panic in debug, a silently huge varint in release. Refuse at
-            // write time instead of emitting an unreadable .idx.bin.
             let Some(d) = id.checked_sub(prev) else {
                 eprintln!(
                     "nkg: cannot encode index (posting ids not ascending); rebuild with `nkg index`"
@@ -1018,14 +751,6 @@ fn encode_index_bin(idx: &Index) -> Vec<u8> {
             prev = *id;
         }
         put_u32(&mut hdr, idx.postings.key_at(i));
-        // No id count is stored: `blen` names the run's byte extent and every
-        // delta is at least one varint byte, so the count is what the decoder
-        // derives by consuming that extent. NKGREP05 carried it as a fifth
-        // field, which made the header 20 bytes and the table 82% of a real
-        // index.
-        // `blen` lets the loader skip a run without decoding it, and `last`
-        // lets it range-check one value per run (ids ascend, so `last` is the
-        // run's maximum) instead of decoding every delta at load.
         put_u32(&mut hdr, run.len() as u32);
         put_u32(&mut hdr, ids.last().copied().unwrap_or(0));
         put_u32(&mut hdr, (blob_base + blobs.len()) as u32);
@@ -1083,29 +808,13 @@ fn parse_index_bin(idx_path: &str, data: std::sync::Arc<memmap2::Mmap>) -> Index
     if npost > data.len() {
         refuse("bad posting count");
     }
-    // NKGREP06: one contiguous fixed-stride header table, then the blob
-    // section. Entry `i` is `key | blen | last | blob_off`, and
-    // `blob_off` is absolute from the start of the file, so nothing here has
-    // to be materialized to make a later lookup possible -- the loader hands
-    // back the table's offset and the count, and `find` binary-searches the
-    // keys in place.
     let hdr = cur;
     let table_end = hdr.saturating_add(npost.saturating_mul(POSTING_HDR));
     if table_end > data.len() {
         refuse("truncated posting header table");
     }
-    // One sequential pass over the whole table, folding every load-time check
-    // into it: strictly increasing keys (binary search needs that), every
-    // run's stored maximum in range, and every blob offset addressing real
-    // bytes. `chunks_exact` walks the fixed stride without recomputing an
-    // index per entry, so this is a linear read over ~6 MB rather than a
-    // pointer chase -- and it still makes a corrupt index a loud exit 2 at
-    // load, whatever query arrives.
     let mut prev = 0u32;
     let mut first = true;
-    // `chunks_exact` rather than `as_chunks`: the allow below is still
-    // required, and `as_chunks` would hand the body a `&[u8; POSTING_HDR]`
-    // instead of a slice, changing every index below for no gain.
     #[allow(clippy::chunks_exact_to_as_chunks)]
     for ent in data[hdr..table_end].chunks_exact(POSTING_HDR) {
         let k = u32::from_le_bytes(ent[0..4].try_into().unwrap());
@@ -1120,12 +829,6 @@ fn parse_index_bin(idx_path: &str, data: std::sync::Arc<memmap2::Mmap>) -> Index
         if (last as usize) >= nfiles {
             refuse("posting id out of range");
         }
-        // The blob must lie inside the file. NKGREP03 walked every blob at load
-        // and refused a bad length there; with stored `blob_off` nothing walks
-        // them any more, so without this a hostile offset would only surface
-        // inside `decode_run` -- and only for postings some query happens to
-        // name. One comparison per entry keeps "any corrupt index is a loud
-        // exit 2 regardless of query" true for NKGREP06 too.
         if blob_off.saturating_add(blen) > data.len() {
             refuse("bad posting length");
         }
@@ -1147,34 +850,7 @@ fn parse_index_bin(idx_path: &str, data: std::sync::Arc<memmap2::Mmap>) -> Index
     idx
 }
 
-/// Read raw index bytes once; binary (magic) vs JSON dispatch lives here so
-/// both load helpers share it with unchanged signatures.
-///
-/// Hostile-index memory bound: an index file larger than
-/// `MAX_INDEX_BYTES` refuses the whole operation loudly (exit 2, never a
-/// silent truncation or per-file drop — either would break the
-/// indexed==scan check by searching a subset while claiming the full
-/// corpus). The read itself is length-capped so a file that grows past
-/// the pre-check between metadata and read still cannot OOM the loader;
-/// under-cap files take the identical bytes as before.
-///
-/// Deliberately NOT capped (documented refusal): per-corpus-file reads
-/// (index build and verify) and hit/arena buffers. Any silent per-file
-/// or per-hit cap would search less than the scan path and break equality
-/// EQUAL; the user's own `--max-filesize` walk filter remains the
-/// explicit, rg-compatible way to bound corpus reads.
 const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-/// Map the index rather than reading it. A one-shot query needs the file
-/// header, the file table and the posting entries its own trigrams name --
-/// roughly the first 6 MB of a 35 MB index -- and never touches the blob
-/// section holding the other 29 MB. Reading the whole file made load scale
-/// with index size; mapping lets the kernel fault in only the pages used, so
-/// load tracks the query instead of the corpus.
-///
-/// Safe against a concurrent rebuild because `write_index_file` publishes by
-/// rename: the mapping keeps the old inode alive, so a reader sees either the
-/// whole old index or the whole new one, and truncation can never reach
-/// through the mapping to fault a live query with SIGBUS.
 fn read_index_bytes(idx_path: &str) -> std::sync::Arc<memmap2::Mmap> {
     use memmap2::MmapOptions;
     let f = match std::fs::File::open(idx_path) {
@@ -1195,14 +871,10 @@ fn read_index_bytes(idx_path: &str) -> std::sync::Arc<memmap2::Mmap> {
         eprintln!("nkg: index {idx_path} exceeds 4 GiB: rebuild with `nkg index`");
         std::process::exit(2);
     }
-    // mmap rejects a zero-length mapping, and an empty file is not an index.
     if len == 0 {
         eprintln!("nkg: unreadable index {idx_path} (empty): rebuild with `nkg index`");
         std::process::exit(2);
     }
-    // SAFETY: the mapping is read-only and the file is opened read-only. The
-    // only writer is `write_index_file`, which publishes by rename, so this
-    // inode is never truncated or written while mapped.
     match unsafe { MmapOptions::new().len(len as usize).map(&f) } {
         Ok(m) => std::sync::Arc::new(m),
         Err(e) => {
@@ -1223,15 +895,6 @@ fn parse_index_auto(idx_path: &str, data: std::sync::Arc<memmap2::Mmap>) -> Inde
         Err(e) => refuse_index(idx_path, "old format", &e),
     }
 }
-/// Index header (canonical `root` + its device/inode cookie) without
-/// materializing `files` or `postings`. The serve-eligibility probe needs
-/// only these three fields, and it runs before every cold query, so parsing
-/// them off the full document paid a second ~7 ms index parse per query on a
-/// 3k-file index. Every other key is skipped with `IgnoredAny`, which scans a
-/// value without building it: no `files` strings, no `postings` map, no 459
-/// id vectors. Breaking out of the map early is not an option — serde_json
-/// rejects the unconsumed trailing comma, and skipping still validates the
-/// whole document, so corruption stays a loud refusal.
 fn index_header(idx_path: &str, data: &[u8]) -> (String, u64, u64) {
     if data.starts_with(BIN_MAGIC) {
         return parse_index_header_bin(idx_path, data);
@@ -1275,8 +938,6 @@ fn index_header(idx_path: &str, data: &[u8]) -> (String, u64, u64) {
     }
 }
 
-/// Binary header: magic | root_dev u64 | root_ino u64 | root_len u32 + bytes.
-/// The `files`/`postings` tables that follow are never touched.
 fn parse_index_header_bin(idx_path: &str, data: &[u8]) -> (String, u64, u64) {
     let mut cur = BIN_MAGIC.len();
     let mut take = |n: usize| -> &[u8] {
@@ -1297,11 +958,6 @@ fn parse_index_header_bin(idx_path: &str, data: &[u8]) -> (String, u64, u64) {
     }
 }
 
-/// Read only the header prefix: `magic | root_dev u64 | root_ino u64 |
-/// root_len u32 + root bytes`. The serve-eligibility probe needs exactly those
-/// three fields, and pulling the whole index to get them doubled load on any
-/// tree where a daemon has registered the file -- ~19 ms of a ~40 ms load on a
-/// 34 MB real-code index, spent to learn a path.
 fn read_index_header_bytes(idx_path: &str) -> Vec<u8> {
     use std::io::Read;
     let mut f = match std::fs::File::open(idx_path) {
@@ -1311,17 +967,12 @@ fn read_index_header_bytes(idx_path: &str) -> Vec<u8> {
             std::process::exit(2);
         }
     };
-    // magic(8) + root_dev(8) + root_ino(8) + root_len(4)
     const FIXED: usize = 28;
     let mut d = vec![0u8; FIXED];
     if let Err(e) = f.read_exact(&mut d) {
         eprintln!("nkg: unreadable index {idx_path}: {e}");
         std::process::exit(2);
     }
-    // Bound `root_len` against the REAL file length, not MAX_INDEX_BYTES. A
-    // corrupt index carrying root_len = 0xFFFF_FFFF passes a 4 GiB ceiling and
-    // would ask for a 4 GiB allocation to hold a path. `str_at` refused against
-    // `data.len()`, so this keeps that property on the cheaper read.
     let root_len = u32::from_le_bytes(d[24..28].try_into().unwrap()) as usize;
     let file_len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
     if root_len > file_len.saturating_sub(FIXED) {
@@ -1338,12 +989,6 @@ fn read_index_header_bytes(idx_path: &str) -> Vec<u8> {
 }
 
 fn serve_eligible_root(idx_path: &str, query_root: &std::path::Path) -> bool {
-    // No sidecar means no daemon ever registered this index, so the serve
-    // probe cannot hit and the answer is already false. Returning here skips
-    // reading and header-scanning the index on every cold query — a ~12 ms
-    // scan on a real-code JSON index — and costs nothing: the root checks
-    // below also live in `load_index_for_query`, which refuses a mismatch
-    // with the same message and exit 2 the moment we fall through to it.
     if !PathBuf::from(serve_info_path(idx_path)).exists() {
         return false;
     }
@@ -1374,10 +1019,6 @@ fn serve_eligible_root(idx_path: &str, query_root: &std::path::Path) -> bool {
     rel.as_os_str().is_empty()
 }
 
-/// Load an index for a query rooted at `query_root`: refuse (exit 2) when
-/// the query root lies outside the index root, then keep only entries under
-/// the query root and materialize them to query-root-joined paths so
-/// rank/verify see scan-identical strings.
 fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
     let data = read_index_bytes(idx_path);
     let mut idx = parse_index_auto(idx_path, data);
@@ -1405,25 +1046,7 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
         std::process::exit(2);
     }
     validate_stored_files(idx_path, &idx.files);
-    // Narrow to the queried subtree: stored paths are index-root-relative,
-    // so drop entries outside the query root and re-base the survivors onto
-    // it (`query_root.join(suffix)` echoes the argv prefix like a scan).
-    // Postings hold file ids, so remap them alongside the filter.
-    //
-    // The common case is a root query with a `.` root, and there the rebuild
-    // is the identity: `"./".join(f)` strips back to exactly `f`, so `kept`
-    // equals `idx.files` and `remap` maps every id to itself. Doing it anyway
-    // costs a `join`, a `to_string_lossy` and two `String` allocations per
-    // stored file -- ~37k allocations on an 18k-file index, measured at
-    // several milliseconds of a ~10 ms load. Skip it; the subtree branch
-    // below is the only one that needs either.
-    // Empty unless the rebuild below runs, and only the subtree branch reads
-    // it -- which is exactly the case where the rebuild runs.
     let mut remap: Vec<Option<u32>> = Vec::new();
-    // An empty stored path would take the `query_root` arm and yield "."
-    // where skipping yields "", so `validate_stored_files` refuses one at load
-    // (both index formats) rather than this loop having to check every path on
-    // every query.
     if !(rel.as_os_str().is_empty() && query_root == std::path::Path::new(".")) {
         remap.resize(idx.files.len(), None);
         let mut kept = Vec::with_capacity(idx.files.len());
@@ -1436,10 +1059,6 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
                     Err(_) => continue,
                 }
             };
-            // rg parity (audit #10): `query_root.join(rel)` echoes the argv
-            // prefix (`.` -> `./src/a.txt`); strip one leading `./` so cold
-            // indexed prints `src/a.txt` like rg and like the serve wire.
-            // SHAPE CHANGE: indexed JSON/text paths with a `.` root lose `./`.
             let joined = if suffix.is_empty() {
                 query_root.to_string_lossy().into_owned()
             } else {
@@ -1450,13 +1069,7 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
         }
         idx.files = kept;
     }
-    // An exact-root query keeps every stored path at its own id, so `remap`
-    // is the identity: the postings pass below would rewrite each of ~740k
-    // ids to itself and drop nothing. Subtree queries still filter and
-    // renumber, which is the only case that needs it.
     if !rel.as_os_str().is_empty() {
-        // Subtree queries renumber ids, so a raw run is flattened once here;
-        // the exact-root path above never pays for it.
         let Postings::Owned {
             keys: old_keys,
             off: old_off,
@@ -1475,8 +1088,6 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
                     ids.push(n);
                 }
             }
-            // A run emptied by the subtree filter keeps no key, matching the
-            // `retain(|_, ids| !ids.is_empty())` this replaces.
             if ids.len() != before {
                 keys.push(*k);
                 off.push(ids.len() as u32);
@@ -1487,9 +1098,6 @@ fn load_index_for_query(idx_path: &str, query_root: &std::path::Path) -> Index {
     idx
 }
 
-/// Load an index for `serve`: no query root exists, so the stored canonical
-/// root is the verify base. Refuse (exit 2) when the tree moved or was
-/// replaced behind the stored fingerprint.
 fn load_index_for_serve(idx_path: &str) -> Index {
     let data = read_index_bytes(idx_path);
     let mut idx = parse_index_auto(idx_path, data);
@@ -1511,24 +1119,12 @@ fn load_index_for_serve(idx_path: &str) -> Index {
     idx
 }
 
-/// Label for the single stdin search unit (`-` operand or piped stdin with
-/// no path). Chosen over rg's `<stdin>` for shell-visibility; the `-c`
-/// shape stays `label:count` and `-l` prints the bare label.
 const STDIN_LABEL: &str = "(standard input)";
 
-/// verbatim-banked ColCollector as `verify_one_raw`, but over an
-/// already-read stdin buffer instead of a file path. Empty/binary buffers
-/// hold no matches, mirroring the file path (binaries are skipped on both
-/// index and verify sides). Own TLS Searcher: no shared fn is changed.
-/// Scores fold path_bonus 0 / depth 0; the label comes from the ptab.
-/// Frozen stdin wrapper (same wrapper contract as `verify_one_raw`): the
-/// body lives in `search_stdin_raw_inv` with `invert = false`.
 fn search_stdin_raw(buf: &[u8], matcher: &RegexMatcher) -> Option<FileHits> {
     search_stdin_raw_inv(buf, matcher, false)
 }
 
-/// Stdin slice-search with MatchFlags invert: same contract as
-/// `verify_one_raw_ctx`'s invert (local inverted searcher per call).
 fn search_stdin_raw_inv(buf: &[u8], matcher: &RegexMatcher, invert: bool) -> Option<FileHits> {
     use std::cell::RefCell;
     thread_local! {
@@ -1570,9 +1166,6 @@ fn search_stdin_raw_inv(buf: &[u8], matcher: &RegexMatcher, invert: bool) -> Opt
     }
 }
 
-/// Serve-wire display path: index-root-relative form of an absolute
-/// daemon path (`<root>/<rel>` -> `<rel>`). Falls back to the absolute
-/// string when it escapes the root (should not happen; fail-open display).
 fn serve_display_path<'a>(abs: &'a str, root: &str) -> &'a str {
     let prefix = root.strip_suffix('/').unwrap_or(root);
     if let Some(rest) = abs.strip_prefix(prefix) {
@@ -1582,14 +1175,9 @@ fn serve_display_path<'a>(abs: &'a str, root: &str) -> &'a str {
             }
         }
     }
-    // Fallback: Path-prefix comparison covers symlinked/macOS /private
-    // aliasing where string prefixes diverge but components agree.
     if let Ok(rel) = std::path::Path::new(abs).strip_prefix(std::path::Path::new(root)) {
         if let Some(s) = rel.to_str() {
             if !s.is_empty() {
-                // Leak-free: the stripped `rel` borrows `abs`, but `to_str`
-                // on the stripped path borrows the intermediate; re-slice
-                // `abs` by length so the return borrows `abs` directly.
                 let off = abs.len() - s.len();
                 return &abs[off..];
             }
@@ -1597,8 +1185,6 @@ fn serve_display_path<'a>(abs: &'a str, root: &str) -> &'a str {
     }
     abs
 }
-/// Distinct matched-file count from a ranked order (`ord` + `loc`): the
-/// `F` in `N matches in F files` counts files with hits, not files walked.
 fn matched_file_count(ord: &[u32], loc: &[(u32, u32)]) -> usize {
     let mut seen: HashSet<u32> = HashSet::with_capacity(ord.len().min(1024));
     for &i in ord {
@@ -1606,12 +1192,6 @@ fn matched_file_count(ord: &[u32], loc: &[(u32, u32)]) -> usize {
     }
     seen.len()
 }
-/// `-c` / `-l` line writer: `path:count` per matching file, or matching
-/// paths only when `files_only` (`-l` wins over `-c`, matching rg:
-/// `--files-with-matches` overrides `--count`). Rows must arrive path-sorted
-/// from the caller. Zero-count files are omitted — rg prints `:0` rows, a
-/// deliberate deviation keeping indexed==scan identical (binaries, candidates)
-/// with stable order; the `path:count` shape itself is rg-compatible.
 fn write_aggregates(w: &mut impl Write, rows: &[(&str, usize)], files_only: bool) {
     let mut buf = Vec::with_capacity(rows.len() * 64);
     for (p, n) in rows {
@@ -1625,20 +1205,11 @@ fn write_aggregates(w: &mut impl Write, rows: &[(&str, usize)], files_only: bool
     stdout_write_all(w, &buf);
 }
 
-/// Loud per-file build failure (exit 2, no index written): a corpus file the
-/// build cannot read fails exactly like the scan side, never silently drops
-/// from the index (a dropped file would return fewer indexed hits with exit
-/// 0 where scan exits 2). Symlink-escape skips stay silent at the call site.
 fn refuse_build_file(p: &std::path::Path, e: &dyn std::fmt::Display) -> ! {
     eprintln!("nkg: cannot read {}: {e}", p.display());
     std::process::exit(2);
 }
 
-/// Query-side phase timing, same opt-in gate and same stderr contract as the
-/// `cmd_index` phases: unset in normal use, so stderr stays byte identical to
-/// the un-instrumented build. One `var_os` per query. `emit` is the residual
-/// from the end of `sort` to the diagnostics line (finalize + render + write),
-/// because every arm shares that tail and there are four of them to time.
 struct QueryPhases {
     on: bool,
     load: f64,
@@ -1647,15 +1218,9 @@ struct QueryPhases {
     verify: f64,
     sort: f64,
     tail: Instant,
-    /// Hits handed to the socket. `emit` is a residual that includes socket
-    /// backpressure, so the window alone cannot say whether emit is slow or
-    /// the client is slow to read; per-row cost is what separates those.
     rows: u64,
 }
 
-/// Read once per process. The daemon answers many queries on one loop, and
-/// re-reading the environment per query would put a lookup on the path the
-/// probe is trying to measure.
 static PHASE_TIMING: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("NKG_PHASE_TIMING").is_some());
 
@@ -1675,8 +1240,6 @@ impl QueryPhases {
 
     fn report(&self) {
         if self.on {
-            // `tail` starts after `sort`, so its elapsed time IS the emit
-            // window; the measured phases all closed before it.
             let emit = self.tail.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "nkg: phase: load {:.3} walk {:.3} rank {:.3} verify {:.3} sort {:.3} emit {:.3} rows {} (ms)",
@@ -1694,8 +1257,6 @@ impl QueryPhases {
 
 fn cmd_index(root: &PathBuf, idx_path: &str) {
     let t0 = Instant::now();
-    // Phase timing is opt-in: unset in normal use, so stderr stays byte
-    // identical to the un-instrumented build.
     let timing = std::env::var_os("NKG_PHASE_TIMING").is_some();
     let ms = |t: &Instant| {
         if timing {
@@ -1716,34 +1277,12 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
         eprintln!("nkg: walk error: refusing to write a partial index to {idx_path}");
         std::process::exit(2);
     }
-    // Self-exclusion: an index rebuilt inside its own corpus must not index
-    // itself (scan never sees it as a match source either — JSON has no
-    // planted text, but its bytes would still perturb the trigram table and
-    // break indexed==scan). Canonicalize both sides; a not-yet-existing
-    // output trivially matches nothing, so no absolutized fallback is needed.
     let idx_canon = std::fs::canonicalize(idx_path).ok();
-    // Wall time for the whole parallel scan. The `canon`, `read` and `extract`
-    // counters are CPU-ms summed across threads, so dividing them by the core
-    // count estimates the section rather than measuring it — and that estimate
-    // was wrong by 3x. Measured, this section runs at 11.3x on 32 cores, not
-    // 32x, because it is memory-bandwidth-bound rather than scheduler-bound:
-    // handing rayon larger chunks with `with_min_len` made it monotonically
-    // worse, 41.6 ms at chunk 1 against 232.5 ms at chunk 512, so the default
-    // splitting stands and the ceiling here is the hardware's.
     let t_scan = Instant::now();
     let entries: Vec<(String, GramSet)> = paths
         .par_iter()
         .filter_map(|p| {
             let tc = Instant::now();
-            // Race-close: canonicalize FIRST, then read through the
-            // canonical path with a no-follow open. The confinement check
-            // and the bytes then share one resolution: a symlink swapped
-            // in after the walk either resolves inside (read as-is) or
-            // outside (prefix check drops it) or races the open itself
-            // (O_NOFOLLOW refuses it) — never outside bytes stored under
-            // an inside name. Unreadable files fail loudly (exit 2, no index
-            // written) exactly like the scan side; only symlink-escape skips
-            // silent — the same outcome as a walk-filtered file.
             let canon = match std::fs::canonicalize(p) {
                 Ok(c) => c,
                 Err(e) => refuse_build_file(p, &e),
@@ -1754,9 +1293,6 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
             if timing {
                 canon_ns.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-            // Root-relative entry: canonicalize both sides so symlinked
-            // roots (e.g. /tmp on macOS) fingerprint stably. Files escaping
-            // the root via symlink are skipped, never stored absolute.
             let rel = canon
                 .strip_prefix(&root_canon)
                 .ok()?
@@ -1803,12 +1339,6 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
     let nfiles = entries.len();
     let mut files = Vec::with_capacity(nfiles);
     let mut pairs: Vec<(u32, u32)> = Vec::new();
-    // Consume `entries` rather than borrow it. The gram sets are the largest
-    // structure alive here -- one HashSet slot per incidence, the same count
-    // `pairs` ends up holding at 8 bytes each -- so borrowing kept two ~41 MB
-    // allocations live at once while `pairs` filled. Moving each set out lets
-    // it drop as soon as its file is consumed, and moves the path instead of
-    // cloning it.
     for (path, grams) in entries {
         let id = files.len() as u32;
         files.push(path);
@@ -1819,20 +1349,9 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
     let pairs_ms = ms(&t_pairs);
     let incidences = pairs.len();
     let t_sort = Instant::now();
-    // Sorting (gram, id) once yields the same per-key ascending id runs the
-    // map form produced by pushing ids in file order.
-    //
-    // Packing each pair into one u64 (gram high, id low) and sorting that
-    // instead was tried and reverted: it made the sort 30% slower, because
-    // writing a 41 MB packed array costs more memory traffic than moving two
-    // u32s inside a tuple saves. The tuple sort stands.
     pairs.par_sort_unstable();
     let sort_ms = ms(&t_sort);
     let t_asm = Instant::now();
-    // One pass writes all three run vectors. Sizing them up front matters: the
-    // previous form pushed into them and re-read `off.last_mut()` per element,
-    // so every id cost a bounds check and a backwards load. Worth about 20%
-    // of this phase.
     let n = pairs.len();
     let mut keys: Vec<u32> = Vec::with_capacity(n / 8 + 16);
     let mut off: Vec<u32> = Vec::with_capacity(n / 8 + 17);
@@ -1842,9 +1361,6 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
     for (i, &(g, id)) in pairs.iter().enumerate() {
         if i == 0 || g != prev_gram {
             if i != 0 {
-                // Close the run just finished. The first group must not push:
-                // `off` starts at 0, and each later boundary plus one closing
-                // entry makes exactly keys.len() + 1.
                 off.push(ids.len() as u32);
             }
             keys.push(g);
@@ -1901,15 +1417,6 @@ fn cmd_index(root: &PathBuf, idx_path: &str) {
     );
 }
 
-/// O3 daemon fd cache (hot-serve ONLY; the cold path never sees it): warm
-/// file fds held for the daemon lifetime, keyed by file id. Hit contract:
-/// the live path's (len, mtime) must equal the cached fd's own (len, mtime)
-/// on every use, else the entry is reopened — an edit between queries is
-/// never served stale. A replacement between the stat and the pread reads
-/// old-or-new atomically per fd, never corrupt; a pread that loses its fd
-/// to a concurrent replace retries once, then fails like any IO error.
-/// Any metadata/open failure falls back to plain open+read, so the cache
-/// never fails where the uncached path succeeds.
 #[cfg(unix)]
 struct CachedFd {
     fd: std::os::unix::io::RawFd,
@@ -1920,16 +1427,12 @@ struct CachedFd {
 #[cfg(unix)]
 impl Drop for CachedFd {
     fn drop(&mut self) {
-        // SAFETY: fd owned from `into_raw_fd` on fill, closed exactly once
-        // (replace drops the old entry; daemon exit drops the slots).
         unsafe {
             libc::close(self.fd);
         }
     }
 }
 
-/// Dense per-file slots (ids are 0..nfiles): one small mutex per file, so a
-/// warm pread hit never waits on another file's open and never hashes.
 struct FdCache {
     #[cfg(unix)]
     slots: Vec<std::sync::Mutex<Option<CachedFd>>>,
@@ -1947,19 +1450,14 @@ impl FdCache {
         }
         #[cfg(not(unix))]
         {
-            // No fd cache off unix: reads go through plain open+read.
             let _ = nfiles;
             FdCache {}
         }
     }
 }
 
-/// Best-effort NOFILE bump so the daemon can hold one fd per indexed file.
-/// Never fails the daemon: when the ceiling stays low the cache just fills
-/// what fits and fill-open errors fall back to plain open+read.
 #[cfg(unix)]
 fn bump_nofile_for_cache(want_files: usize) {
-    // SAFETY: getrlimit/setrlimit with a valid stack struct; daemon tuning.
     unsafe {
         let mut lim: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim as *mut _) != 0 {
@@ -1970,7 +1468,6 @@ fn bump_nofile_for_cache(want_files: usize) {
             return;
         }
         let mut next = lim;
-        // Raising the ceiling needs privilege; EPERM is tolerated below.
         next.rlim_max = next.rlim_max.max(want);
         next.rlim_cur = want;
         if libc::setrlimit(libc::RLIMIT_NOFILE, &next as *const _) != 0 {
@@ -1984,12 +1481,9 @@ fn bump_nofile_for_cache(want_files: usize) {
         }
     }
 }
-/// Non-unix fallback: single-fd reads need no descriptor headroom.
 #[cfg(not(unix))]
 fn bump_nofile_for_cache(_want_files: usize) {}
 
-/// pread loop into `buf` from offset 0 to EOF (offset-free: safe on a fd
-/// shared across rayon workers). Appends like `read_to_end`.
 #[cfg(unix)]
 fn pread_all(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) -> std::io::Result<()> {
     let mut off: libc::off_t = 0;
@@ -1997,8 +1491,6 @@ fn pread_all(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) -> std::io::Result
         if buf.len() == buf.capacity() {
             buf.reserve(8 * 1024);
         }
-        // SAFETY: pread into the spare capacity; `set_len` covers exactly
-        // the bytes the kernel initialized; EINTR retries, EOF ends.
         let n = unsafe {
             let dst = buf.spare_capacity_mut();
             libc::pread(fd, dst.as_mut_ptr() as *mut libc::c_void, dst.len(), off)
@@ -2015,21 +1507,12 @@ fn pread_all(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) -> std::io::Result
         }
         let n = n as usize;
         off += n as libc::off_t;
-        // SAFETY: `n` bytes initialized by pread above.
         unsafe {
             buf.set_len(buf.len() + n);
         }
     }
 }
 
-/// Open a corpus file for verify/index reads with walk-matching symlink
-/// semantics: `follow == false` (the default; the walker runs unfollowed
-/// unless `-L/--follow`) refuses symlinks atomically at open
-/// (`O_NOFOLLOW`), so a symlink swapped in between walk and open is
-/// skipped instead of followed outside the root. With `-L/--follow` the
-/// open follows links exactly like the walker does. A refused symlink
-/// surfaces as an IO error and the caller skips the file — the same
-/// outcome as a walk-filtered file, byte-identical on success paths.
 fn open_verify_file(path: &std::path::Path, follow: bool) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -2043,8 +1526,6 @@ fn open_verify_file(path: &std::path::Path, follow: bool) -> std::io::Result<std
     }
     #[cfg(not(unix))]
     {
-        // No O_NOFOLLOW off unix: best-effort no-follow check, still racy
-        // there but no worse than before; the unix path is exact.
         if !follow
             && std::fs::symlink_metadata(path)
                 .map(|m| m.file_type().is_symlink())
@@ -2064,24 +1545,6 @@ fn plain_open_read(path: &str, buf: &mut Vec<u8>, follow: bool) -> std::io::Resu
     Ok(())
 }
 
-/// Serve-side file read: warm-fd hit fstats the cached fd itself (no path
-/// walk, no open/close) and preads it; miss or edit opens fresh, validates
-/// the fd's own metadata, and caches it. `retried` bounds the EBADF re-read
-/// after a concurrent replace closed the fd under us.
-///
-/// Freshness binds the fd, not the path: the served bytes come from the
-/// cached fd, so its own fstat (len, mtime) — not a path stat taken
-/// earlier — anchors the hit decision. A swap between the decision and
-/// the pread then reads old-or-new atomically per fd, never
-/// fresh-claimed stale bytes. The fd is additionally bound to the live
-/// path by (dev, ino): a rename-swap leaves the old fd valid with
-/// matching fstat, so identity must match too or the entry refreshes
-/// from the live path (a pure-fstat check would serve pre-replace bytes
-/// indefinitely). In-place edits change the fd's own fstat and miss the
-/// same way. `follow` is false on the daemon path (the served index was
-/// built unfollowed); the miss open still honors it. Any metadata/open
-/// failure falls back to plain open+read, so the cache never fails where
-/// the uncached path succeeds.
 #[cfg(unix)]
 fn read_verify_bytes(
     fdc: Option<(&FdCache, u32)>,
@@ -2098,21 +1561,14 @@ fn read_verify_bytes(
         Some(s) => s,
         None => return plain_open_read(path, buf, follow),
     };
-    // Hit decision under one per-slot lock, no open/hash while holding
-    // it. Poison-tolerant: a panicked holder must not wedge the daemon.
-    // None (empty slot or any mismatch) falls to the fill path below.
     let hit_fd: Option<std::os::unix::io::RawFd> = 'hit: {
         let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
         let e = match guard.as_ref() {
             Some(e) => e,
             None => break 'hit None,
         };
-        // fstat the cached fd: the served bytes come from this fd, so its
-        // own metadata decides freshness — never a path stat alone.
         let fm = {
             use std::os::unix::io::FromRawFd;
-            // SAFETY: `e.fd` is a live cache-owned fd; the ManuallyDrop
-            // File borrows it for one metadata call and never closes it.
             let borrowed = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(e.fd)) };
             match borrowed.metadata() {
                 Ok(m) => m,
@@ -2121,7 +1577,6 @@ fn read_verify_bytes(
         };
         use std::os::unix::fs::MetadataExt;
         if fm.len() != e.len || fm.modified().ok() != Some(e.modified) {
-            // The held fd itself changed under us (in-place edit): refill.
             break 'hit None;
         }
         let live = match std::fs::metadata(path) {
@@ -2129,9 +1584,6 @@ fn read_verify_bytes(
             Err(_) => return plain_open_read(path, buf, follow),
         };
         if live.dev() != fm.dev() || live.ino() != fm.ino() {
-            // Rename-swap: the old fd is still valid but no longer the
-            // live path — refill from the live path, never serve the
-            // detached generation as current.
             break 'hit None;
         }
         match live.modified() {
@@ -2144,17 +1596,12 @@ fn read_verify_bytes(
         match pread_all(fd, buf) {
             Ok(()) => return Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::EBADF) && !retried => {
-                // Lost the fd to a concurrent replace: drop the dead entry
-                // and re-read once through the fresh path.
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 return read_verify_bytes(fdc, path, buf, true, follow);
             }
             Err(e) => return Err(e),
         }
     }
-    // Miss or edit: open + stat OUTSIDE the lock so one cold file never
-    // stalls other workers' warm pread hits. The open honors `follow`
-    // (no-follow by default), closing the swap-a-symlink-in window.
     let f = match open_verify_file(std::path::Path::new(path), follow) {
         Ok(f) => f,
         Err(_) => return plain_open_read(path, buf, follow),
@@ -2166,8 +1613,6 @@ fn read_verify_bytes(
         Ok(x) => x,
         Err(_) => return plain_open_read(path, buf, follow),
     };
-    // `f` drops here but the fd must survive: forget the File.
-    // SAFETY: `into_raw_fd` transfers ownership to the entry.
     let fresh = {
         use std::os::unix::io::IntoRawFd;
         f.into_raw_fd()
@@ -2175,18 +1620,14 @@ fn read_verify_bytes(
     let fd = {
         let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
-            // Recheck: another worker filled the same generation first.
             Some(e) if e.len == flen && e.modified == fmod => {
                 let fd = e.fd;
-                // SAFETY: `fresh` came from `into_raw_fd` above and is now
-                // surplus; closing exactly once here keeps one owner.
                 unsafe {
                     libc::close(fresh);
                 }
                 fd
             }
             _ => {
-                // Replace drops the old entry (closes its fd) if present.
                 *guard = Some(CachedFd {
                     fd: fresh,
                     len: flen,
@@ -2205,8 +1646,6 @@ fn read_verify_bytes(
         Err(e) => Err(e),
     }
 }
-/// Non-unix fallback: no fd cache, plain open+read — same bytes as the
-/// cold path.
 #[cfg(not(unix))]
 fn read_verify_bytes(
     _: Option<(&FdCache, u32)>,
@@ -2222,23 +1661,12 @@ fn read_verify_bytes(
 struct Query {
     pattern: String,
     top: Option<usize>,
-    /// `-i` over serve: false on old clients (serde default), so old/new
-    /// daemons interop — an old daemon just searches case-sensitively.
     #[serde(default)]
     ignore_case: bool,
-    /// `-B`/`-C` over serve: 0 on old clients (serde default), so an old
-    /// client gets plain hits from a new daemon and an old daemon (which
-    /// ignores the unknown fields) serves plain hits to a new client.
     #[serde(default)]
     before: usize,
-    /// `-A`/`-C` over serve: same interop contract as `before`.
     #[serde(default)]
     after: usize,
-    /// MatchFlags over serve (all serde-defaulted: old clients omit them and
-    /// get today's behavior from a new daemon; old daemons ignore them):
-    /// `-w` word bounds, `-v` invert, `-m` per-file cap, the pattern list
-    /// for grams/bonus (`patterns` empty = legacy single `pattern`), and
-    /// whether that list is literal (`-F`).
     #[serde(default)]
     word: bool,
     #[serde(default)]
@@ -2249,27 +1677,12 @@ struct Query {
     patterns: Vec<String>,
     #[serde(default)]
     fixed: bool,
-    /// Subtree roots over serve (both serde-defaulted: old clients omit them
-    /// and get whole-tree behavior from a new daemon; old daemons ignore
-    /// them and serve whole-tree to a new client, which then over-returns —
-    /// mixed-version skew, same as other new fields). `qroot` is the
-    /// client-canonicalized absolute query root ("" = legacy whole tree);
-    /// the daemon serves only files under it. `display_root` is the raw
-    /// root operand for cold-shape display paths ("" = legacy rel paths).
     #[serde(default)]
     qroot: String,
     #[serde(default)]
     display_root: String,
 }
 
-/// Shared rank core (intersect/union/idf scoring, path bonus, depth penalty,
-/// descending file-score order). The cold indexed path runs it; the
-/// comparator and scoring are verbatim the old bodies.
-/// Returns ordered candidate ids plus per-file scores with bonus/depth
-/// folded (the cold early-exit proof reads `scores` by file id).
-/// `qrel`/`display_root` re-base depth and bonus onto the cold-equivalent
-/// path (`display_root.join(suffix)`, one `./` stripped); `None` scores
-/// stored paths verbatim.
 fn rank_ors(
     idx: &Index,
     ors: &[Vec<u32>],
@@ -2283,16 +1696,6 @@ fn daemon_rank_path<'a>(
     qrel: Option<&std::path::Path>,
     display_root: &str,
 ) -> std::borrow::Cow<'a, str> {
-    // An empty `qrel` is a root, not the absence of one: it is what a
-    // whole-tree query sends, because the client's canonicalized root equals
-    // `idx.root` and `strip_prefix` of equal paths is `""`. Treating that
-    // empty path as "no rebasing" scored the candidate on the daemon's
-    // ABSOLUTE path, so `depth` counted however many components the machine's
-    // directory layout happens to contribute and `path_bonus` matched against
-    // that same absolute string -- the same query then reported a different
-    // `score` over serve than cold, by exactly the leaked prefix length.
-    // Only a legacy client that sent no `qroot` at all arrives as `None`, and
-    // there the stored string is all there is to score.
     let qr = match qrel {
         Some(q) => q,
         None => return std::borrow::Cow::Borrowed(abs),
@@ -2311,10 +1714,6 @@ fn daemon_rank_path<'a>(
         .into_owned();
     std::borrow::Cow::Owned(strip_dot_slash(&joined).to_owned())
 }
-/// `--stats`: print the query plan and candidate counts to stderr. The plan is
-/// the only way to tell a good trigram choice from a bad one -- a branch whose
-/// AND keeps 18k of 18k files is not being narrowed by the index, however fast
-/// the search after it runs.
 static STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn rank_ors_rooted(
@@ -2325,9 +1724,6 @@ fn rank_ors_rooted(
     display_root: &str,
 ) -> (Vec<u32>, Vec<f64>) {
     let n = idx.files.len() as f64;
-    // Decode only the postings this query actually names, into owned buffers
-    // held for the whole loop. A raw index materializes none of its ~2.1M ids
-    // at load, so this per-query decode is where those bytes become numbers.
     let mut runs: Vec<Vec<u32>> = Vec::new();
     let mut scratch: Vec<u32> = Vec::new();
     let slots: Vec<Vec<Option<usize>>> = ors
@@ -2338,16 +1734,6 @@ fn rank_ors_rooted(
                     None => None,
                     Some(i) => {
                         let run = idx.postings.ids_at(i, &mut scratch);
-                        // No range check here, and none is needed: a run that
-                        // is strictly ascending can only carry an out-of-range
-                        // id as its maximum, which the load-time `last`
-                        // check already refused; a run that is not strictly
-                        // ascending is refused by `intersect_all` below,
-                        // before any of these ids reaches `is_cand`. An
-                        // earlier per-id check here was unreachable — a
-                        // mid-run bad id desorts the run, so `intersect_all`
-                        // exits first — and was deleted rather than shipped
-                        // as an undemonstrable guard.
                         runs.push(run.to_vec());
                         Some(runs.len() - 1)
                     }
@@ -2355,12 +1741,9 @@ fn rank_ors_rooted(
                 .collect()
         })
         .collect();
-    // (postings, idf weight) per gram occurrence, in query order, for
-    // deferred exact scoring of survivors only.
     let mut occ: Vec<(&[u32], f64)> = vec![];
     let mut cand: Vec<u32> = vec![];
     let mut tmp: Vec<u32> = vec![];
-    // (trigram count, widest AND input, candidates) per OR branch, --stats only.
     let mut plan: Vec<(usize, usize, usize)> = vec![];
     for (ands, branch) in ors.iter().zip(slots.iter()) {
         let mut lists: Vec<&[u32]> = Vec::with_capacity(ands.len());
@@ -2381,8 +1764,6 @@ fn rank_ors_rooted(
         if empty || lists.is_empty() {
             continue;
         }
-        // Widest AND input bounds the result: intersecting n sorted lists can
-        // only shrink the smallest one.
         let widest = lists.iter().map(|l| l.len()).max().unwrap_or(0);
         let branch = prefilter::intersect_all(&mut lists);
         if STATS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2444,10 +1825,6 @@ fn rank_ors_rooted(
     (order, scores)
 }
 
-/// Rank order over a standalone scores vec (ST-5 columnar sort): indices
-/// only, comparator verbatim the Hit-order one (NaN fallback included), so
-/// the order — ties included — matches the stable fat-Hit sort given the
-/// same collect sequence. Sort traffic touches 8 B scores, never payloads.
 fn raw_order(scores: &[f64]) -> Vec<u32> {
     let mut ord: Vec<u32> = (0..scores.len() as u32).collect();
     ord.sort_by(|a, b| {
@@ -2458,19 +1835,6 @@ fn raw_order(scores: &[f64]) -> Vec<u32> {
     ord
 }
 
-/// Batched parallel verify in descending file-score order with provable
-/// top-k early exit (spec §6): every match scores at most its file score
-/// (match score = file score − line/1e6), so once k hits are banked, no
-/// unverified file whose file score does not exceed the kth-best match
-/// score can displace the top-k. Each batch uses the serve pattern
-/// (rayon par_iter + flat_map verify); the kth check runs between
-/// batches against the batch max (order[0] of the chunk, order is desc).
-/// Exiting before a batch whose max does not exceed kth exits before
-/// every file a per-file loop would skip — same proof, batch granularity.
-/// Final global sort + truncate stays with the caller.
-/// ST-5 columnar: banks verbatim match bytes per file (one amortized arena
-/// alloc per matched file, zero per hit) with zero Arc traffic; callers
-/// flatten metas to a side scores vec for the index-only sort.
 fn flat_scores(files: &[FileHits]) -> (Vec<f64>, Vec<(u32, u32)>) {
     let n: usize = files.iter().map(|f| f.metas.len()).sum();
     let mut scores = Vec::with_capacity(n);
@@ -2484,12 +1848,6 @@ fn flat_scores(files: &[FileHits]) -> (Vec<f64>, Vec<(u32, u32)>) {
     (scores, loc)
 }
 
-/// Decode an arena slice with the exact eager expression (`from_utf8_lossy`
-/// then a char-trim of the line terminator only): valid UTF-8 borrows the
-/// arena, only invalid-UTF8 hits allocate — the same hits as before. A CRLF
-/// file keeps its `\r`: ripgrep's line content runs to the `\n` and still
-/// carries the carriage return (probed byte-for-byte on rg 15.1.0), so
-/// trimming it here diverged from the match set on every CRLF line.
 fn banked_slice<'a>(arena: &'a [u8], start: u32, end: u32) -> std::borrow::Cow<'a, str> {
     let (s, e) = (start as usize, end as usize);
     let raw = arena.get(s..e).unwrap_or_else(|| {
@@ -2503,18 +1861,10 @@ fn banked_slice<'a>(arena: &'a [u8], start: u32, end: u32) -> std::borrow::Cow<'
     }
 }
 
-/// Decode banked match bytes (unchanged contract: same expression as before,
-/// now shared with context lines through `banked_slice`).
 fn banked_text<'a>(fh: &'a FileHits, m: &HitMeta) -> std::borrow::Cow<'a, str> {
     banked_slice(&fh.arena, m.start, m.end)
 }
 
-/// Context attach (ContextLines): rebuild `fh` over the full file bytes.
-/// The arena becomes one verbatim copy of `buf` (the match-banked bytes are
-/// dropped — no duplicate storage), `line_starts` records the byte offset
-/// of every 1-based line start (split on `\n`, mirroring the searcher), and
-/// each meta is remapped to its line's byte range, so `banked_text` decodes
-/// byte-identical text. Call only when context>0 with surviving hits.
 fn attach_context(fh: &mut FileHits, buf: &[u8]) {
     let mut starts: Vec<u32> = vec![0];
     for (i, &b) in buf.iter().enumerate() {
@@ -2544,13 +1894,6 @@ fn attach_context(fh: &mut FileHits, buf: &[u8]) {
     fh.line_starts = starts;
 }
 
-/// Context windows over sorted unique 1-based match lines: `[line-before,
-/// line+after]` clamped low at 1 (file top), merged when overlapping or
-/// adjacent (rg merges `[2,4]+[5,7]` with no separator — probed on 15.1.0).
-/// The high end stays unclamped: callers skip lines past EOF, and the merge
-/// outcome is identical with or without the clamp (a clamp can only split
-/// below a later window's start, which implies the unclamped span splits
-/// there too).
 fn compute_groups(lines: &[u64], before: usize, after: usize) -> Vec<(u64, u64)> {
     let mut groups: Vec<(u64, u64)> = vec![];
     for &l in lines {
@@ -2568,8 +1911,6 @@ fn compute_groups(lines: &[u64], before: usize, after: usize) -> Vec<(u64, u64)>
     groups
 }
 
-/// Context line text over an attached file: the `line_no`-th line decoded
-/// with the same expression as `banked_text`.
 fn ctx_line_text<'a>(fh: &'a FileHits, line_no: u64) -> std::borrow::Cow<'a, str> {
     if line_no == 0 {
         eprintln!("corrupt context line 0");
@@ -2591,12 +1932,6 @@ fn ctx_line_text<'a>(fh: &'a FileHits, line_no: u64) -> std::borrow::Cow<'a, str
     banked_slice(&fh.arena, s, e)
 }
 
-/// Rank-ordered file groups for context render: the ranked flat order `ord`
-/// folded into per-file surviving-meta lists in first-seen (rank) order,
-/// metas ascending by line within a file. Rank by hit, context attached:
-/// `--top` truncates `ord` first, so groups only ever cover survivors.
-/// Shared by the cold and serve renderers so both print the same groups in
-/// the same order from the same hit set.
 fn ctx_file_groups(
     files: &[FileHits],
     loc: &[(u32, u32)],
@@ -2623,9 +1958,6 @@ fn ctx_file_groups(
     out
 }
 
-/// Sorted unique match lines for one group file: the merge input for
-/// `compute_groups` (deduped — a line with several hits renders once, like
-/// rg — while hit *counts* still come from `ord`, multiplicity intact).
 fn ctx_group_lines(files: &[FileHits], fi: usize, mis: &[usize]) -> Vec<u64> {
     let mut v: Vec<u64> = mis.iter().map(|&mi| files[fi].metas[mi].line).collect();
     v.sort();
@@ -2633,32 +1965,10 @@ fn ctx_group_lines(files: &[FileHits], fi: usize, mis: &[usize]) -> Vec<u64> {
     v
 }
 
-/// Best score any hit in a file can reach. `ColCollector::matched` computes
-/// `file_score - line/1e6` with `line >= 1`, so this is that exact expression
-/// at line 1 — same arithmetic, so callers compare against a bound that is
-/// exact rather than a rounded `kth + 1e-6`.
-///
-/// The exit test needs this rather than `file_score` itself: a match always
-/// scores strictly below its own file, so a `file_score <= kth` form could
-/// never hold and top-k verified every candidate. A hit that ties `kth`
-/// exactly cannot displace it either — banked hits are appended in rank order
-/// and `raw_order` is a stable sort, so an unverified hit at `kth` sorts
-/// after every banked hit at `kth` and `truncate` drops it, exactly as a full
-/// verify would.
 fn best_hit_score(file_score: f64) -> f64 {
     file_score - 1.0 / 1e6
 }
 
-/// Batched parallel verify in descending file-score order with provable top-k
-/// early exit (spec §6). `order` is candidate ids in descending file score and
-/// `scores` is indexed by file id. `verify` is the per-file step, so the cold
-/// path and the serve-cached path run one copy of the proof instead of two
-/// that can drift apart. Every match scores at most
-/// `best_hit_score(file_score)`, so once k hits are banked no unverified file
-/// that cannot beat the kth-best hit can displace the top-k.
-///
-/// Full queries never early-exit (k = MAX), so the sequential batch waves
-/// would be pure barrier overhead: those verify every candidate in one wave.
 fn verify_batched<F>(
     order: &[u32],
     scores: &[f64],
@@ -2683,18 +1993,11 @@ where
     let mut done = 0usize;
     for chunk in order.chunks(BATCH) {
         if total >= k && best_hit_score(scores[chunk[0] as usize]) <= kth {
-            // Cold only: the daemon is a long-running process, and one line
-            // per top-k request is unbounded log growth there.
             if log_exit {
                 eprintln!("nkg: early exit after {done} of {} files", order.len());
             }
             break;
         }
-        // Per-file exit at file granularity (spec §6, same proof as the batch
-        // check): a file whose best achievable hit does not beat kth
-        // contributes no top-k hit. Same `best_hit_score` bound as the batch
-        // exit, applied per file, so the surviving set — ties included —
-        // matches the batch-only path.
         let armed = total >= k;
         let kth_now = kth;
         let mut batch: Vec<FileHits> = chunk
@@ -2706,9 +2009,6 @@ where
         all.append(&mut batch);
         done += chunk.len();
         if total >= k {
-            // Only the k-th largest is read, so partition at k-1 instead of
-            // sorting every banked meta: O(M) per chunk, not O(M log M). The
-            // `loc` half of `flat_scores` is never built here either.
             let n: usize = all.iter().map(|f| f.metas.len()).sum();
             let mut s: Vec<f64> = Vec::with_capacity(n);
             for f in &all {
@@ -2723,25 +2023,11 @@ where
     all
 }
 
-/// Daemon hardening bounds (localhost trust; wire token parked — see
-/// `load_serve_port`). `MAX_SERVE_LINE_BYTES` caps one wire line;
-/// `MAX_SERVE_CONNECTIONS` caps concurrent handler threads. Over-limit →
-/// drop this connection; the daemon survives.
 const MAX_SERVE_LINE_BYTES: u64 = 1 << 20;
 const MAX_SERVE_CONNECTIONS: usize = 64;
 
-/// Bytes one response batch accumulates before it goes to the socket. Every
-/// emit appends exactly one newline-terminated row, so a batch boundary
-/// always lands on a row boundary and the client's `read_line` framing is
-/// untouched. Matches the socket `BufWriter` capacity, so shipping batches
-/// makes no syscall the single buffered write did not already make.
 const SERVE_EMIT_BYTES: usize = 64 * 1024;
 
-/// One row out; the batch out once it fills. `emit` appends exactly one
-/// newline-terminated row — that is the whole framing contract, and the
-/// reason a mid-row flush cannot happen here. A failed socket write is
-/// latched, never retried: the caller stops emitting on it, exactly as the
-/// single whole-response write stopped the connection.
 fn serve_emit_line(
     writer: &mut impl Write,
     buf: &mut Vec<u8>,
@@ -2757,7 +2043,6 @@ fn serve_emit_line(
     }
 }
 fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
-    // Per-query liveness: hung clients must not pin a slot forever.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     let reader_src = match stream.try_clone() {
@@ -2769,8 +2054,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
     let mut line = String::new();
     loop {
         line.clear();
-        // Bounded line: `take` caps bytes copied into `line` so a gigabyte
-        // line allocates at most MAX+1, then this connection drops.
         let n = match (&mut reader)
             .take(MAX_SERVE_LINE_BYTES + 1)
             .read_line(&mut line)
@@ -2788,30 +2071,15 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
             break;
         }
         let t0 = Instant::now();
-        // Same opt-in gate and same stderr contract as the one-shot path.
-        // The daemon holds the index, so `load` and `walk` are structurally
-        // zero here and are reported as such rather than omitted.
         let mut ph = QueryPhases::new();
-        // Columnar serve emission: borrow-banked FileHits through the fd
-        // cache, rank once over the side scores vec, escape each unique
-        // path once, emit via emit_raw_with_path, single socket write.
-        // Byte-identical wire (one object per line plus the done line);
-        // no per-hit serde struct setup, no Arc path clones, no per-hit
-        // path escaping.
         let mut broken = false;
         let mut ctx_asked = false;
-        // Request-scoped I/O-error latch: concurrent clients must never
-        // cross-attribute (one client's drain cannot steal another's flag).
         let latch = AtomicBool::new(false);
         let mut verify_err = false;
         match serde_json::from_str::<Query>(line.trim()) {
             Err(_) => {}
             Ok(q) => {
                 ctx_asked = q.before > 0 || q.after > 0;
-                // MatchFlags serve half: legacy clients send only `pattern`
-                // (`patterns` empty); new clients send the pattern list plus
-                // flags, and the combined alternation rebuilds server-side so
-                // serve==cold on every flag mix.
                 let q_pats: Vec<String> = if q.patterns.is_empty() {
                     vec![q.pattern.clone()]
                 } else {
@@ -2826,10 +2094,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                         }
                     }
                     Ok(matcher) => {
-                        // Subtree queries (--port with a path operand): the
-                        // client sends its canonicalized absolute root plus
-                        // the raw operand for display. Relativize against the
-                        // index root; outside-index roots serve zero hits.
                         let qrel: Option<std::path::PathBuf> = if q.qroot.is_empty() {
                             None
                         } else {
@@ -2839,17 +2103,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                                 .map(|r| r.to_owned())
                         };
                         let q_outside = !q.qroot.is_empty() && qrel.is_none();
-                        // `-i` skips trigram pruning: the postings are raw bytes,
-                        // so case-sensitive grams would false-negative
-                        // (`hello` grams miss `HELLO` files). Full-file verify
-                        // keeps serve==cold on every `-i` query. `-v` skips it
-                        // too: inverted matches live outside the gram files, so
-                        // pruning would false-negative by construction.
-                        // Every file gets cold's score: path bonus minus depth.
-                        // A flat 0.0 here made serve disagree with cold on `-v`
-                        // and on gram-less queries, because cold's scan paths
-                        // score `bonus - depth` and the daemon must match them
-                        // byte for byte.
                         let all_files = || {
                             (0..idx.files.len() as u32)
                                 .map(|id| {
@@ -2906,8 +2159,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                             }
                         };
                         ph.rank = t_rank.elapsed().as_secs_f64() * 1e3;
-                        // Narrow candidates to the subtree (whole tree when
-                        // qroot is legacy-empty; zero files when outside).
                         let order: Vec<(u32, f64)> = if q_outside {
                             vec![]
                         } else if let Some(qr) = &qrel {
@@ -2929,11 +2180,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                         } else {
                             order
                         };
-                        // Serve shares the cold top-k early exit: `order` is
-                        // already descending by file score, and the warm fd
-                        // cache only changes how a file is read, not what it
-                        // may score. Splitting into ids plus an id-indexed
-                        // score table is the shape `verify_batched` takes.
                         let mut dscores: Vec<f64> = vec![0.0; idx.files.len()];
                         let ids: Vec<u32> = order
                             .iter()
@@ -2945,10 +2191,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                         let t_verify = Instant::now();
                         let mut files: Vec<FileHits> =
                             verify_batched(&ids, &dscores, q.top, false, |id| {
-                                // Frozen-wrapper fast path (agreed with
-                                // ContextLines): plain non-inverted queries run
-                                // the frozen entry (exactly _ctx(0,0,false));
-                                // context/invert go direct. Zero behavior change.
                                 if q.before == 0 && q.after == 0 && !q.invert {
                                     verify_one_raw_cached(
                                         &latch,
@@ -2975,8 +2217,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                                 }
                             });
                         ph.verify = t_verify.elapsed().as_secs_f64() * 1e3;
-                        // `-m` caps each file before rank/top, mirroring the cold
-                        // path (capped `-c` shapes come out of the wire for free).
                         let t_sort = Instant::now();
                         apply_max_count(&mut files, q.max_count);
                         verify_err |= take_verify_io_error(&latch);
@@ -2986,11 +2226,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                             ord.truncate(n);
                         }
                         ph.sort = t_sort.elapsed().as_secs_f64() * 1e3;
-                        // `tail` runs from here to the flush, so its elapsed
-                        // time IS the emit window: path escaping, rendering
-                        // and the socket write.
-                        // `ord` is exactly the hit set about to be rendered, so
-                        // this is the exact row count with no per-row work.
                         ph.rows = ord.len() as u64;
                         ph.tail = Instant::now();
                         let mut esc: Vec<Option<Vec<u8>>> = vec![None; idx.files.len()];
@@ -2998,11 +2233,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                             let (fi, _) = loc[i as usize];
                             let pid = files[fi as usize].pid as usize;
                             if esc[pid].is_none() {
-                                // Display matches cold: legacy whole-tree
-                                // queries emit index-root-relative paths;
-                                // subtree queries re-root under the raw
-                                // operand (absolute stays absolute, relative
-                                // stays relative), mirroring walk output.
                                 let rel = serve_display_path(&idx.files[pid], &idx.root);
                                 let disp: std::borrow::Cow<str> = if q.display_root.is_empty() {
                                     std::borrow::Cow::Borrowed(rel)
@@ -3032,25 +2262,13 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                             }
                         }
                         let ctx_on = q.before > 0 || q.after > 0;
-                        // Bounded batch scratch, not the whole response: rows
-                        // ship as they render, so the daemon never holds a
-                        // full-response buffer (7.6 MB on a 51k-row query).
                         let mut buf: Vec<u8> = Vec::with_capacity(SERVE_EMIT_BYTES);
                         if ctx_on {
-                            // Rank by hit, context attached: the ranked `ord` is
-                            // folded into per-file groups (first-seen = rank
-                            // order, `--top` already applied), windows expanded
-                            // and merged, then hits ride as hit JSON with carried
-                            // context lines (`"ctx":true`, file score) in span
-                            // order. Same groups the cold renderer prints.
                             let mut fscore = vec![0.0f64; idx.files.len()];
                             for (id, s) in &order {
                                 fscore[*id as usize] = *s;
                             }
                             for (fi, mis) in ctx_file_groups(&files, &loc, &ord) {
-                                // A socket that stopped reading must not be
-                                // written again: the per-write timeout has
-                                // already spent 60 s once.
                                 if broken {
                                     break;
                                 }
@@ -3060,9 +2278,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                                 let mlines = ctx_group_lines(&files, fi, &mis);
                                 let mut k = 0usize;
                                 for (lo, hi) in compute_groups(&mlines, q.before, q.after) {
-                                    // No separator travels the wire: the client
-                                    // owns `--group-separator` and recomputes the
-                                    // same groups from the hit lines.
                                     let hi = hi.min(nlines);
                                     let mut ln = lo;
                                     while ln <= hi {
@@ -3123,8 +2338,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                                 });
                             }
                         }
-                        // Tail batch: the rows that did not fill one. Still a
-                        // plain `write_all`, and `done` still goes last below.
                         if writer.write_all(&buf).is_err() {
                             broken = true;
                         }
@@ -3132,11 +2345,6 @@ fn handle_client(stream: TcpStream, idx: Arc<Index>, fdc: Arc<FdCache>) {
                 }
             }
         }
-        // Sub-millisecond precision: a served query is a few ms of work, and
-        // integer millis report every hot query as 0. Float ms keeps the
-        // field meaningful for the one mode where it is the only timing the
-        // caller gets (the daemon holds the index, so the client cannot
-        // subtract startup the way it can for a one-shot run).
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let done = if ctx_asked && verify_err {
             format!("{{\"done\":true,\"ms\":{ms:.3},\"ctx\":true,\"verify_error\":true}}")
@@ -3165,37 +2373,29 @@ fn serve_info_path(idx_path: &str) -> String {
     format!("{idx_path}.serve.json")
 }
 
-/// Linux `/proc/<pid>/stat` starttime (field 22), or None when unavailable
-/// (non-Linux, vanished pid, parse failure). Cheap pid-reuse guard.
 #[cfg(target_os = "linux")]
 fn proc_starttime(pid: u32) -> Option<u64> {
     let data = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
     let text = String::from_utf8_lossy(&data);
     let after = text.rfind(')')?;
     let fields: Vec<&str> = text[after + 1..].split_whitespace().collect();
-    // After `(comm)`: state(3)..starttime(22) → index 19.
     fields.get(19)?.parse::<u64>().ok()
 }
 #[cfg(not(target_os = "linux"))]
 fn proc_starttime(_pid: u32) -> Option<u64> {
     None
 }
-/// True when `pid` plausibly exists. Unix: `kill(pid, 0)`; EPERM means the
-/// process exists but we may not signal it. Unknown platforms: assume alive
-/// (the connect probe still fails closed to the cold path).
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
     #[cfg(unix)]
     {
-        // SAFETY: kill with sig 0 sends nothing; return/errno only.
         let r = unsafe { libc::kill(pid as i32, 0) };
         if r == 0 {
             return true;
         }
         let e = std::io::Error::last_os_error().raw_os_error();
-        // EPERM (1) = alive, no permission; ESRCH (3) = no such process.
         e == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
@@ -3208,8 +2408,6 @@ fn pid_alive(pid: u32) -> bool {
 struct ServerInfo {
     pid: u32,
     port: u16,
-    /// Daemon starttime for pid-reuse detection; 0 = unknown (old files,
-    /// non-Linux). Serde-defaulted so old sidecars still parse.
     #[serde(default)]
     starttime: u64,
 }
@@ -3225,7 +2423,6 @@ fn save_serve_info(idx_path: &str, port: u16) {
         return;
     };
     let path = serve_info_path(idx_path);
-    // No-symlink write: refuse to truncate a planted link target.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -3249,37 +2446,19 @@ fn save_serve_info(idx_path: &str, port: u16) {
     }
 }
 
-/// Serve-first probe outcome: a hit, a silent cold fallback (no sidecar ever
-/// registered or an unparseable sidecar — fresh-user stderr stays clean), or
-/// a single warned fallback (stale pid/reuse, or a live registration whose
-/// listener/reply failed). At most one line is ever printed by the caller.
 enum ServeProbe {
     Hit(ServeRows),
     MissSilent,
     MissWarn(String),
 }
 
-/// One served wire row, borrowed out of the line it was scanned from.
-/// `text` is still JSON-escaped: `push_unescaped_json` decodes it.
 struct WireRow<'a> {
     path: &'a [u8],
     line: u64,
     text: &'a [u8],
 }
 
-/// Split one served row by field position, the way `served_wire_paths`
-/// reads `path`: `emit_raw_with_path` / `emit_ctx_json` both open
-/// `{"path":"`, so a `{"path":"` inside the match TEXT sits past every field
-/// this scan stops at and cannot be reached, whatever the text contains.
-/// `path` and `text` terminate on their own `"`, and their `"` / `\` arrive
-/// escaped (`\"`, `\\`), so stepping two bytes past a backslash lands exactly
-/// on the terminator instead of stopping inside the field. `None` on a
-/// truncated, non-wire or trailing-garbage line, so an unparseable line is
-/// skipped rather than panicking.
 fn scan_wire_row(line: &[u8]) -> Option<WireRow<'_>> {
-    /// End of a JSON string body: first unescaped `"`, else None. memchr2
-    /// skips the quote/backslash-free run the way `push_escaped_json` skips
-    /// it on the emit side, which is every byte of every corpus row.
     fn end_of_str(s: &[u8]) -> Option<usize> {
         let mut i = 0;
         while i <= s.len() {
@@ -3299,7 +2478,6 @@ fn scan_wire_row(line: &[u8]) -> Option<WireRow<'_>> {
     let line_no = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
     rest = rest[digits..].strip_prefix(br#","text":""#)?;
     let end = end_of_str(rest)?;
-    // A complete row ends `,"score":N}` with nothing after the brace.
     let tail = &rest[end + 1..];
     if !(tail.ends_with(b"}") && !tail.ends_with(br#","ctx":true}"#)) {
         return None;
@@ -3311,10 +2489,6 @@ fn scan_wire_row(line: &[u8]) -> Option<WireRow<'_>> {
     })
 }
 
-/// Decode a JSON string body (no surrounding quotes) into `dst` — the
-/// inverse of `push_escaped_json`, so a row decoded here is byte-identical
-/// to the `&str` that went on the wire. An unknown or truncated escape
-/// degrades to its literal bytes instead of panicking.
 fn push_unescaped_json(dst: &mut Vec<u8>, s: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     fn hex(b: u8) -> Option<u8> {
@@ -3322,8 +2496,6 @@ fn push_unescaped_json(dst: &mut Vec<u8>, s: &[u8]) {
     }
     let mut start = 0usize;
     let mut i = 0usize;
-    // memchr skips the escape-free run, which is every byte of every corpus
-    // row; the byte loop below only runs on the rare rows that carry one.
     while let Some(rel) = memchr::memchr(b'\\', &s[i..]) {
         let k = i + rel;
         dst.extend_from_slice(&s[start..k]);
@@ -3335,10 +2507,6 @@ fn push_unescaped_json(dst: &mut Vec<u8>, s: &[u8]) {
             Some(b'b') => dst.push(0x08),
             Some(b'f') => dst.push(0x0C),
             Some(c @ (b'"' | b'\\')) => dst.push(*c),
-            // `\u00XX` is the only \u form push_escaped_json emits, so the
-            // four hex digits are one code point — always a control, hence
-            // one byte. Anything wider still decodes as UTF-8, which is what
-            // serde_json would have produced for it.
             Some(b'u') => {
                 let d = |k: usize| s.get(i + k).and_then(|&b| hex(b));
                 match (d(1), d(2), d(3), d(4)) {
@@ -3358,8 +2526,6 @@ fn push_unescaped_json(dst: &mut Vec<u8>, s: &[u8]) {
                     _ => dst.push(b'u'),
                 }
             }
-            // Unknown or truncated escape: the backslash stands, so a
-            // malformed row degrades instead of panicking.
             _ => {}
         }
         i = (i + 1).min(s.len());
@@ -3367,18 +2533,6 @@ fn push_unescaped_json(dst: &mut Vec<u8>, s: &[u8]) {
     }
     dst.extend_from_slice(&s[start..]);
 }
-/// Quiet sidecar read: `Ok(None)` = absent/corrupt (silent fallback),
-/// `Err(msg)` = stale pid/reuse (caller prints `msg` once, no second
-/// `server unreachable` line), `Ok(Some(port))` = live registration.
-///
-/// Trust model (accepted): localhost-only bind, no wire token. The query
-/// pattern travels to 127.0.0.1:port in cleartext and any local listener on
-/// the recorded port can answer; that disclosure is documented localhost
-/// trust, not a boundary. A shared-secret wire token was considered and
-/// parked (sidecar-secret rotation/forwarding complexity outweighs the gain
-/// while any local user can already bind loopback). The pid-liveness +
-/// starttime check here closes only the stale-file / port-reuse hijack: a
-/// dead daemon's sidecar never diverts a query.
 fn load_serve_port_quiet(idx_path: &str) -> Result<Option<u16>, String> {
     let path = serve_info_path(idx_path);
     let data = match std::fs::read_to_string(&path) {
@@ -3411,7 +2565,6 @@ fn load_serve_port_quiet(idx_path: &str) -> Result<Option<u16>, String> {
 
 fn cmd_serve(idx_path: &str, port: u16) {
     let idx = Arc::new(load_index_for_serve(idx_path));
-    // O3: daemon-global warm-fd cache + fd headroom for one fd per file.
     bump_nofile_for_cache(idx.files.len());
     let fdc = Arc::new(FdCache::new(idx.files.len()));
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
@@ -3443,10 +2596,6 @@ fn cmd_serve(idx_path: &str, port: u16) {
         });
     }
 }
-/// MatchFlags half of a serve query (MatchFlags owns; ContextLines owns the
-/// before/after half). `pattern` (kept positional) is the combined
-/// alternation the matcher compiles; the spec carries the branches for
-/// server-side grams/bonus plus the flags.
 struct MatchSpec<'a> {
     patterns: &'a [String],
     fixed: bool,
@@ -3456,57 +2605,33 @@ struct MatchSpec<'a> {
     qroot: &'a str,
     display_root: &'a str,
 }
-/// Where a classified hit row goes once the wire row has been read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ServeMode {
-    /// `-q` / `-c` / `-l`: nothing per row. Counts print after the `done`
-    /// line, which is where the totals come from.
     Aggregate,
-    /// Default JSON: the wire line verbatim.
     Json,
-    /// `--format text`: `path:line:text`, rendered as each row arrives.
     Text,
-    /// `-A`/`-B`/`-C`: the whole response, regrouped after the stream ends.
     Context,
 }
 
-/// Rendered bytes held before a batch reaches stdout.
 const SERVE_FLUSH_BYTES: usize = 256 * 1024;
 
-/// Per-row scratch for the streamed text render: the decoded path and text,
-/// reused across rows so rendering a hit allocates nothing.
 #[derive(Default)]
 struct WireScratch {
     path: Vec<u8>,
     text: Vec<u8>,
 }
 
-/// One served response, consumed as it streams off the socket. Rows are
-/// classified, counted and rendered where they arrive, so neither the
-/// response nor its render is ever materialised whole. The `done` line's
-/// flags are still read last, after every row — that ordering is unchanged.
 struct ServeRows {
-    /// In `Context` mode, the raw wire, regrouped by the caller. In the
-    /// streaming modes this is drained to stdout and ends up empty.
     buf: Vec<u8>,
-    /// Distinct hit paths (wire-escaped) and their hit counts: both the
-    /// `-c` / `-l` rows and the `F` in the `N matches in F files` line.
     files: HashMap<Vec<u8>, usize>,
     matches: usize,
-    /// The daemon sent its `done` line, so the response ran to completion.
     done: bool,
-    /// The daemon echoed `"ctx":true` rows, so it understood the context
-    /// fields; an old daemon answered with plain hits.
     ctx_echo: bool,
     verify_err: bool,
-    /// Rows already written to stdout. Past the first one a cold re-run
-    /// would duplicate them, which is why a mid-response failure is fatal.
     emitted: bool,
 }
 
 impl ServeRows {
-    /// Sorted `path:count` rows for `-c` / `-l`, decoded from the wire's
-    /// escaped paths (cold-path parity: one row per hit file, sorted).
     fn aggregates(&self) -> Vec<(String, usize)> {
         let mut rows: Vec<(String, usize)> = self
             .files
@@ -3521,26 +2646,17 @@ impl ServeRows {
         rows
     }
 
-    /// Distinct hit files: the `F` in the `N matches in F files` diagnostics.
     fn matched(&self) -> usize {
         self.files.len()
     }
 }
 
-/// Everything a serve fetch needs about the query it is serving: the request
-/// fields, how each row is retained, the client-side highlight matcher, and
-/// the flags the response tail renders with. Bundled so the fetch entries
-/// stay under clippy's argument-count limit (same idiom as `MatchSpec`).
 struct ServeQuery<'a> {
     pattern: &'a str,
     top: Option<usize>,
     ignore_case: bool,
     mspec: &'a MatchSpec<'a>,
-    /// How a classified row is retained; see `ServeMode`.
     mode: ServeMode,
-    /// Client-side highlight matcher for `--format text`; plain fallback when
-    /// the matcher will not build (unreachable in practice — a bad regex
-    /// exits 2 before render — so a good render never fails for a miss).
     matcher: Option<RegexMatcher>,
     group_sep: &'a str,
     ctx_before: usize,
@@ -3555,7 +2671,6 @@ impl ServeQuery<'_> {
         self.ctx_before > 0 || self.ctx_after > 0
     }
 
-    /// The wire request for this query, or None when it will not serialize.
     fn request(&self) -> Option<String> {
         serde_json::to_string(&Query {
             pattern: self.pattern.to_string(),
@@ -3575,7 +2690,6 @@ impl ServeQuery<'_> {
     }
 }
 
-/// How a served row is consumed, from the flags alone.
 fn serve_mode(
     quiet: bool,
     count_mode: bool,
@@ -3583,8 +2697,6 @@ fn serve_mode(
     ctx_on: bool,
     format_text: bool,
 ) -> ServeMode {
-    // `-q` is an aggregate shape too: it prints nothing, and the `done` line
-    // still has to supply the totals the diagnostics use.
     if ctx_on {
         ServeMode::Context
     } else if quiet || count_mode || files_only {
@@ -3596,9 +2708,6 @@ fn serve_mode(
     }
 }
 
-/// Render a collected wire response as `--format text` rows. Only the
-/// `--port` old-daemon degradation reaches this: context was asked for, the
-/// daemon did not honour it, and its plain hit rows sit in `rows.buf`.
 fn render_buffered_text(raw: &[u8], matcher: Option<&RegexMatcher>) -> Vec<u8> {
     let mut out = vec![];
     let mut scratch = WireScratch::default();
@@ -3610,20 +2719,10 @@ fn render_buffered_text(raw: &[u8], matcher: Option<&RegexMatcher>) -> Vec<u8> {
     out
 }
 
-/// Served-response tail, shared by `--use-index` and `--port`: print the
-/// `-c`/`-l` aggregates or the regrouped context render (JSON and text rows
-/// are already on stdout — `read_serve_response` streamed them), then the
-/// `N matches in F files` diagnostic, then the exit contract.
 fn finish_serve_response(rows: &ServeRows, r: &ServeQuery<'_>, t0: Instant) {
     let matcher = r.matcher.as_ref();
     let matched = rows.matched();
     if r.count_mode || r.files_only {
-        // `-c` / `-l` over serve: aggregate the served rows client-side (--top
-        // already applied server-side; `-l` wins over `-c`, `-q` still
-        // suppresses stdout). `matched` counts distinct hit files (cold
-        // parity); diagnostics keep the cold `matches in files` + `index
-        // load` shape so stderr needs one grammar (`via serve` rides inside
-        // the parens, load is 0 with no cold read).
         if !r.quiet {
             let agg = rows.aggregates();
             let refs: Vec<(&str, usize)> = agg.iter().map(|(p, n)| (p.as_str(), *n)).collect();
@@ -3633,11 +2732,6 @@ fn finish_serve_response(rows: &ServeRows, r: &ServeQuery<'_>, t0: Instant) {
             stdout_flush(&mut writer);
         }
     } else if r.ctx_on() && !r.quiet {
-        // Context owns the output: regrouped rg-shaped rows from the carried
-        // hit+ctx wire (rank groups kept). `ctx_echo` false means an old
-        // daemon ignored the context fields and answered with plain hits,
-        // which render as text rows instead (serve-first fails over to cold
-        // there; an explicit --port has no cold tree).
         let stdout = std::io::stdout();
         let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
         let text = if rows.ctx_echo {
@@ -3660,19 +2754,13 @@ fn finish_serve_response(rows: &ServeRows, r: &ServeQuery<'_>, t0: Instant) {
         std::process::exit(1);
     }
 }
-/// Why a serve read stopped before the `done` line.
 #[derive(Debug)]
 struct ServeFail {
     msg: String,
-    /// The daemon rejected the pattern rather than dying.
     bad_regex: bool,
-    /// Rows already reached stdout, so the caller must not re-run cold.
     emitted: bool,
 }
 
-/// Append `path:line:text` for one served wire row. Framing is
-/// `emit_text_row`'s, so the streamed render and the cold render cannot
-/// diverge; only the field split differs (by position, not by parse).
 fn push_wire_text_row(
     out: &mut Vec<u8>,
     wire: &[u8],
@@ -3686,9 +2774,6 @@ fn push_wire_text_row(
     push_unescaped_json(&mut scratch.path, row.path);
     scratch.text.clear();
     push_unescaped_json(&mut scratch.text, row.text);
-    // Wire text was escaped from a `&str`, so the decoded bytes are valid
-    // UTF-8; the lossy arm is the degradation the cold renderer already
-    // accepts (`banked_slice`), not a new failure mode.
     let path = String::from_utf8_lossy(&scratch.path);
     let text = String::from_utf8_lossy(&scratch.text);
     match matcher {
@@ -3697,14 +2782,6 @@ fn push_wire_text_row(
     }
 }
 
-/// Read one served response off `stream`, rendering rows as they arrive.
-///
-/// `Err` means the daemon stopped early. It is only safe to fall back to a
-/// cold re-run when `emitted` is false: past the first row the partial
-/// output is already on stdout and the re-run would duplicate it, which is a
-/// worse failure than exit 2. Every failure that can happen before the first
-/// row (connect, request write, an `{"error":...}` reply) still falls back
-/// exactly as it did when the whole response was collected first.
 fn read_serve_response(
     stream: &mut impl Read,
     mode: ServeMode,
@@ -3760,11 +2837,6 @@ fn read_serve_response(
             continue;
         }
         let wire = &line.as_bytes()[..read - 1];
-        // `"ctx":true` keys off FIELD POSITION, never presence: the marker is
-        // the last field of a carried context row, so the same sequence
-        // sitting inside a match's own `text` cannot reach it. A parsed test
-        // would be equally correct but is the generic-Value walk this loop
-        // exists to stop doing; a substring test would be neither.
         if wire.ends_with(br#","ctx":true}"#) {
             if mode == ServeMode::Context {
                 rows.buf.extend_from_slice(line.as_bytes());
@@ -3780,8 +2852,6 @@ fn read_serve_response(
             ServeMode::Text => push_wire_text_row(&mut rows.buf, wire, matcher, &mut scratch),
             ServeMode::Aggregate => {}
         }
-        // The streaming modes write each batch out as it fills, so the
-        // client never holds the response — or its render — whole.
         if mode != ServeMode::Context && rows.buf.len() >= SERVE_FLUSH_BYTES {
             stdout_write_all(out, &rows.buf);
             rows.buf.clear();
@@ -3797,9 +2867,6 @@ fn read_serve_response(
     Ok(rows)
 }
 
-/// Hot `--port` fetch: read the served response, rendering it as it arrives.
-/// An explicit `--port` has no cold tree to fall back to, so every failure
-/// here is terminal — including one that arrives after rows are printed.
 fn client_query(port: u16, q: &ServeQuery<'_>) -> ServeRows {
     let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
         Ok(s) => s,
@@ -3834,17 +2901,6 @@ fn client_query(port: u16, q: &ServeQuery<'_>) -> ServeRows {
     }
 }
 
-/// Serve-first probe for `--use-index`: connect to the daemon registered in
-/// `<index>.serve.json`, if any. No sidecar (or an unparseable one) is a
-/// silent cold fallback; a stale registration warns once via `load_serve_port_quiet`;
-/// any failure after a live registration (no listener, bad reply, old daemon
-/// without context echo) warns once as unreachable. At most one line total.
-/// Context behaves like `client_query`: carried `"ctx":true` lines collect
-/// verbatim but never count, and a missing context echo from an old daemon
-/// fails over to the cold path — which is safe, because no context or
-/// aggregate row is on stdout until the response has ended. A default-JSON or
-/// text query has already printed its rows by then, so an incomplete
-/// response there exits 2 instead of re-running cold over partial output.
 fn try_serve_query(idx_path: &str, q: &ServeQuery<'_>) -> ServeProbe {
     const UNREACHABLE: &str = "nkg: server unreachable, falling back to local index";
     let port = match load_serve_port_quiet(idx_path) {
@@ -3887,10 +2943,6 @@ fn try_serve_query(idx_path: &str, q: &ServeQuery<'_>) -> ServeProbe {
         Err(_) => return ServeProbe::MissWarn(UNREACHABLE.to_string()),
     };
     if !rows.done || (q.mode == ServeMode::Context && !rows.ctx_echo) {
-        // Either the daemon stopped before its `done` line, or (context only)
-        // an old daemon ignored the context fields and served plain hits. Fall
-        // over to the cold path, which attaches context locally — but only if
-        // nothing has been printed, which `emitted` proves.
         return if rows.emitted {
             eprintln!("nkg: server closed the connection mid-response");
             std::process::exit(2);
@@ -3900,25 +2952,11 @@ fn try_serve_query(idx_path: &str, q: &ServeQuery<'_>) -> ServeProbe {
     }
     ServeProbe::Hit(rows)
 }
-/// Cold-emission JSON string escaper (Escaper region): byte-identical to
-/// serde_json for `&str` input. Only `"`, `\` and bytes < 0x20 escape;
-/// `\n`/`\r`/`\t`/0x08/0x0C use short forms, other controls `\u00XX`
-/// (lowercase hex, matching serde_json); UTF-8 multibyte passes through.
-/// memchr2 skips the common quote/backslash-free run; the gap holds only
-/// rare controls, scanned inline. Floats are NOT touched here: callers format
-/// `score` via serde_json so ryu output stays byte-exact.
 fn push_escaped_json(out: &mut Vec<u8>, s: &str) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let b = s.as_bytes();
     let mut start = 0usize;
     let mut i = 0usize;
-    // First index in `b[pos..end)` holding a byte < 0x20, or `end` when the
-    // gap is control-free. SWAR fast path (ST-8 text-half): each 8-byte word
-    // is tested exactly via the zero-byte trick on `w & 0xE0..` (a byte is
-    // < 0x20 iff its top three bits are clear), so the common control-free
-    // gap skips the per-byte branch loop below; a flagged word falls through
-    // to the exact per-byte scan, which must find the control (the word test
-    // is exact, never a false positive). Tail bytes scan inline.
     #[inline]
     fn first_control(b: &[u8], pos: usize, end: usize) -> usize {
         const E0: u64 = 0xE0E0_E0E0_E0E0_E0E0;
@@ -3948,10 +2986,6 @@ fn push_escaped_json(out: &mut Vec<u8>, s: &str) {
             Some(r) => i + r,
             None => b.len(),
         };
-        // Control-free gaps (the corpus-common case: 0 of 51410 heavy texts
-        // hold a byte < 0x20) skip the per-byte loop; the escape loop below
-        // then resumes from the first real control with `start` untouched,
-        // which emits byte-identical output.
         let mut j = first_control(b, i, end);
         while j < end {
             let c = b[j];
@@ -3985,7 +3019,6 @@ fn push_escaped_json(out: &mut Vec<u8>, s: &str) {
     }
     out.extend_from_slice(&b[start..]);
 }
-/// Manual u64 digits, byte-identical to Display, no fmt machinery per hit.
 fn push_line_no(buf: &mut Vec<u8>, line: u64) {
     let mut tmp = [0u8; 20];
     let mut v = line;
@@ -4002,7 +3035,6 @@ fn push_line_no(buf: &mut Vec<u8>, line: u64) {
     }
     buf.extend_from_slice(&tmp[20 - len..]);
 }
-/// Resolve the display path for a file id: index table when indexed, else scan table.
 fn path_of<'a>(
     idx_opt: &'a Option<Index>,
     ptab: &'a [String],
@@ -4015,30 +3047,12 @@ fn path_of<'a>(
     }
 }
 
-// Emission shape shared by all three renderers (context, text, JSON). The
-// cost of emitting is matched bytes, not rows: 240 rows of 560 KB out-weigh
-// 51k rows of 40 B by three orders of magnitude. A row-count gate therefore
-// serialised the byte-heavy half of the space, and a row-count chunk handed
-// that half to a single worker (240 rows fit in one 4096-row chunk). Below
-// EMIT_PAR_MIN_BYTES of estimated output the rayon barrier plus the per-chunk
-// allocations cost more than the rendering they split, so one serial buffer
-// wins; above it the rows go through `par_chunks` and are written back in
-// `ord` order. EMIT_CHUNK_MAX_ROWS keeps the many-short-rows shape on the
-// 4096-row chunk it has always used.
 const EMIT_PAR_MIN_BYTES: usize = 64 * 1024;
 const EMIT_CHUNK_BYTES: usize = 1024 * 1024;
 const EMIT_CHUNK_MAX_ROWS: usize = 4096;
-/// Per-row framing estimate: path, line number, separators. JSON also
-/// escapes the text and prints the score, hence its larger constant. These
-/// are the pre-existing `* 128` / `* 160` reserves, now one term of a byte
-/// total rather than the whole estimate.
 const FRAME_TEXT: usize = 128;
 const FRAME_JSON: usize = 160;
 
-/// Display state every row renderer needs: the banked hits, the flat row
-/// index, and how a file id resolves to its display path. Bundled so the
-/// renderers stay under clippy's argument-count limit (same contract as
-/// `VerifyInput`).
 struct EmitSource<'a> {
     hits: &'a [FileHits],
     loc: &'a [(u32, u32)],
@@ -4055,11 +3069,6 @@ impl EmitSource<'_> {
     }
 }
 
-/// Estimated output bytes for `rows`: the banked match text they decode to
-/// plus the per-row framing cost. `HitMeta::start..end` is exactly the banked
-/// span, so this is the emitted text volume and not the file's whole arena —
-/// `--top` over a large banked file emits a fraction of it. O(rows), no
-/// allocation.
 fn est_output_bytes(rows: &[u32], hits: &[FileHits], loc: &[(u32, u32)], frame: usize) -> usize {
     let text: usize = rows
         .iter()
@@ -4072,10 +3081,6 @@ fn est_output_bytes(rows: &[u32], hits: &[FileHits], loc: &[(u32, u32)], frame: 
     text + rows.len() * frame
 }
 
-/// Rows per parallel chunk for `rows` rows of `est_bytes` estimated output,
-/// or `None` to render one serial buffer. The chunk is sized by bytes, so a
-/// row that is a large fraction of EMIT_CHUNK_BYTES stands alone and reaches
-/// its own worker, while short rows fall back to the row-capped chunking.
 fn emit_plan(rows: usize, est_bytes: usize) -> Option<usize> {
     if rows == 0 || est_bytes < EMIT_PAR_MIN_BYTES {
         return None;
@@ -4084,10 +3089,6 @@ fn emit_plan(rows: usize, est_bytes: usize) -> Option<usize> {
     Some((EMIT_CHUNK_BYTES / avg).clamp(1, EMIT_CHUNK_MAX_ROWS))
 }
 
-/// Upper bound on the bytes one context group renders. Every window a group
-/// prints lies inside `[first hit - before, last hit + after]`, and on this
-/// path the arena holds whole files, so the line-start table gives that span
-/// in O(1) — no window pass, no per-row allocation.
 fn ctx_group_bytes(
     fh: &FileHits,
     mis: &[usize],
@@ -4117,9 +3118,6 @@ fn ctx_group_bytes(
     e.saturating_sub(s) + (hi - lo + 1) as usize * frame
 }
 
-/// One chunk of ranked text rows into its own buffer, reserved from the same
-/// byte estimate the gate uses. `--color always` is a branch inside this
-/// body, so it inherits the gate, the chunking and the reservation.
 fn render_text_chunk(src: &EmitSource<'_>, chunk: &[u32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(est_output_bytes(chunk, src.hits, src.loc, FRAME_TEXT));
     for &i in chunk {
@@ -4137,8 +3135,6 @@ fn render_text_chunk(src: &EmitSource<'_>, chunk: &[u32]) -> Vec<u8> {
     buf
 }
 
-/// One chunk of ranked JSON rows into its own buffer. Sequential and
-/// chunked-parallel emission share this body, so both stay byte-identical.
 fn render_json_chunk(src: &EmitSource<'_>, esc: &[Option<Vec<u8>>], chunk: &[u32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(est_output_bytes(chunk, src.hits, src.loc, FRAME_JSON));
     for &i in chunk {
@@ -4156,10 +3152,6 @@ fn render_json_chunk(src: &EmitSource<'_>, esc: &[Option<Vec<u8>>], chunk: &[u32
     buf
 }
 
-/// One chunk of context file groups into its own buffer. The chunk unit is
-/// the file group — a group's rows share the hit cursor and print in line
-/// order — so groups partition the output and `collect()` keeps them in rank
-/// order.
 fn render_ctx_chunk(
     src: &EmitSource<'_>,
     chunk: &[(usize, Vec<usize>)],
@@ -4212,9 +3204,6 @@ fn render_ctx_chunk(
     buf
 }
 
-/// Manual cold-emission line from columnar fields: byte-identical to the
-/// derived Serialize impl (same field order/separators, same path escaper,
-/// same serde/ryu score path); only the source of the fields differs.
 fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, score: f64) {
     buf.extend_from_slice(b"{\"path\":\"");
     buf.extend_from_slice(path_esc);
@@ -4226,10 +3215,6 @@ fn emit_raw_with_path(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str,
     serde_json::to_writer(&mut *buf, &score).unwrap();
     buf.extend_from_slice(b"}\n");
 }
-/// Grep-compatible text line (`--format text`): `path:line:text` in rank
-/// order — the same hits in the same order as JSON, only rendered without
-/// score. Line numbers are always on; text is the same banked decode as
-/// JSON, unescaped. ColorOut's hook point: wrap the text push below.
 fn emit_text_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
     buf.extend_from_slice(path.as_bytes());
     buf.push(b':');
@@ -4239,10 +3224,6 @@ fn emit_text_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
     buf.push(b'\n');
 }
 
-/// Context row (`-A`/`-B`/`-C`): `path:line-text` — the `-` marker mirrors
-/// rg's context-line shape (probed on 15.1.0: `:` match vs `-` context, `--`
-/// between disjoint in-file groups). Framing duplicates `emit_text_row`
-/// (the file's itoa convention); only the marker differs.
 fn emit_ctx_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
     buf.extend_from_slice(path.as_bytes());
     buf.push(b':');
@@ -4252,12 +3233,6 @@ fn emit_ctx_row(buf: &mut Vec<u8>, path: &str, line: u64, text: &str) {
     buf.push(b'\n');
 }
 
-/// Serve-wire context line: same fields as `emit_raw_with_path` plus a
-/// trailing `,"ctx":true` marker, so clients can tell carried context from
-/// hits without reparsing ambiguity (a match *text* may itself contain the
-/// substring `"ctx":true`). `score` carries the file score (context inherits
-/// its file's rank weight; clients drop it at render). Only ever emitted
-/// when the query asked for context, so the default wire is untouched.
 fn emit_ctx_json(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, file_score: f64) {
     buf.extend_from_slice(b"{\"path\":\"");
     buf.extend_from_slice(path_esc);
@@ -4270,15 +3245,6 @@ fn emit_ctx_json(buf: &mut Vec<u8>, path_esc: &[u8], line: u64, text: &str, file
     buf.extend_from_slice(b",\"ctx\":true}\n");
 }
 
-/// Serve-wire context render (ContextLines): the daemon returns hits plus
-/// carried `"ctx":true` lines in rank-file group order. Regroup the hit
-/// lines (first-seen file order, lines ascending — the wire already arrives
-/// so), expand/merge windows with `compute_groups`, and print rg-shaped
-/// rows (`path:line:text` hits, `path:line-text` context, `sep` between
-/// disjoint in-file groups, none across files). Same groups the cold
-/// renderer prints from the same hit set; unparseable lines are skipped,
-/// mirroring `served_path_counts`. A line that is both hit and context
-/// renders as a hit.
 fn render_served_context(
     raw: &[u8],
     before: usize,
@@ -4286,7 +3252,6 @@ fn render_served_context(
     sep: &str,
     matcher: Option<&RegexMatcher>,
 ) -> Vec<u8> {
-    // path -> (line -> (text, is_hit)), first-seen file order.
     type ServedFileLines = (String, std::collections::BTreeMap<u64, (String, bool)>);
     let mut files: Vec<ServedFileLines> = vec![];
     for line in raw.split(|&b| b == b'\n') {
@@ -4329,9 +3294,6 @@ fn render_served_context(
                 out.push(b'\n');
             }
             first_group = false;
-            // No EOF clamp available (nlines isn't on the wire): lines past
-            // EOF simply have no entry and are skipped — output-identical to
-            // clamping, by the same merge argument as `compute_groups`.
             let mut ln = lo;
             while ln <= hi {
                 if let Some((text, hit)) = lines.get(&ln) {
@@ -4355,8 +3317,6 @@ fn render_served_context(
     out
 }
 
-/// Colored text row: same `path:line:text` framing as `emit_text_row` with
-/// match spans highlighted. Delegates framing so the two never diverge.
 fn emit_text_row_colored(
     buf: &mut Vec<u8>,
     path: &str,
@@ -4368,10 +3328,6 @@ fn emit_text_row_colored(
     emit_text_row(buf, path, line, &colored);
 }
 
-// Real emission fns (`emit_raw_with_path` + `push_escaped_json`) are exercised
-// directly by the escape check below; no test-only wrappers.
-
-/// Stdout BrokenPipe contract: `| head` exits 0; any other IO error exits 2.
 fn stdout_err(e: std::io::Error) -> ! {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
         std::process::exit(0);
@@ -4380,24 +3336,17 @@ fn stdout_err(e: std::io::Error) -> ! {
     std::process::exit(2);
 }
 
-/// Stdout write that never panics; success-path bytes are unchanged.
 fn stdout_write_all(w: &mut impl Write, data: &[u8]) {
     if let Err(e) = w.write_all(data) {
         stdout_err(e);
     }
 }
 
-/// Stdout flush with the same BrokenPipe contract as `stdout_write_all`.
 fn stdout_flush(w: &mut impl Write) {
     if let Err(e) = w.flush() {
         stdout_err(e);
     }
 }
-/// `-q` exit: stdout stays empty (the flag's whole contract), stderr keeps
-/// the diagnostics line: exit 2 on any walk error, else 0 on the first
-/// match / 1 on none. The
-/// short-circuit is the caller's `find_any`: rayon stops scheduling verify
-/// work once any worker banks a hit, so quiet latency is time-to-first-hit.
 fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant, walk_error: bool) -> ! {
     eprintln!(
         "nkg: {} in {files} files, {} ms (index load {load_ms} ms)",
@@ -4415,8 +3364,6 @@ fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant, walk_error:
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    // --help/--version win before any subcommand; `--` ends the flag scan
-    // so `nkg -- --help` still searches the literal.
     {
         let mut dashdash = false;
         for a in &raw {
@@ -4480,9 +3427,6 @@ fn main() {
             }
             j += 1;
         }
-        // `--port` is required (usage exit 2). The old random-bind
-        // (port 0) is gone: no caller relies on it; only this site
-        // called `cmd_serve`.
         if !have_port {
             usage();
         }
@@ -4504,15 +3448,9 @@ fn main() {
     let mut walk_max_depth: Option<usize> = None;
     let mut walk_max_filesize: Option<u64> = None;
     let mut walk_globs: Vec<String> = vec![];
-    // Context flags (ContextLines): three Options so an explicit -A/-B beats
-    // -C regardless of order (probed on rg 15.1.0: `-C1 -A3` and `-A3 -C1`
-    // both yield after=3). Resolved to before/after after the loop.
     let mut ctx_a: Option<usize> = None;
     let mut ctx_b: Option<usize> = None;
     let mut ctx_c: Option<usize> = None;
-    // MatchFlags (-m/-e/-f/-F/-v/-w): patterns accumulate from `-e` repeats
-    // and `-f` files; any of them makes every positional a path.
-    // `-x`/`-P`/`-E`/`-G` are parked (loud exit 2, never positional).
     let mut max_count: Option<usize> = None;
     let mut patterns_e: Vec<String> = vec![];
     let mut pattern_files: Vec<String> = vec![];
@@ -4520,9 +3458,6 @@ fn main() {
     let mut fixed_strings = false;
     let mut invert_match = false;
     let mut word_regexp = false;
-    // Group separator between disjoint in-file context groups (nkg
-    // extension — rg 15.1.0 has no such flag but prints `--`); empty means
-    // no separator lines.
     let mut group_sep = String::from("--");
     let mut pos: Vec<String> = vec![];
     let mut end_opts = false;
@@ -4585,10 +3520,6 @@ fn main() {
                 }
             }
         } else if raw[i] == "--color" {
-            // Bare --color forces on (GNU `[=WHEN]` convention; rg requires a
-            // value, so bare is the one deliberate divergence). A following
-            // valid WHEN is consumed as the value (`--color always`); anything
-            // else stays positional (the pattern).
             if i + 1 < raw.len() && parse_color_when(&raw[i + 1]).is_some() {
                 i += 1;
                 color_when = parse_color_when(&raw[i]).unwrap();
@@ -4625,8 +3556,6 @@ fn main() {
                 }
             }
         } else if raw[i] == "-m" || raw[i] == "--max-count" {
-            // Per-file match cap (rg: matching lines per file; -c prints the
-            // capped counts). 0 is legal (matches nothing, exit 1).
             i += 1;
             if i >= raw.len() {
                 usage();
@@ -4647,7 +3576,6 @@ fn main() {
                 }
             }
         } else if raw[i].starts_with("-m") && !raw[i].starts_with("--") && raw[i].len() > 2 {
-            // Attached short (`-m2`).
             match raw[i][2..].parse::<usize>() {
                 Ok(n) => max_count = Some(n),
                 Err(_) => {
@@ -4656,8 +3584,6 @@ fn main() {
                 }
             }
         } else if raw[i] == "-e" || raw[i] == "--regexp" {
-            // Repeatable search pattern (OR); values take the next arg
-            // verbatim. Any -e/-f makes every positional a path.
             i += 1;
             if i >= raw.len() {
                 usage();
@@ -4668,7 +3594,6 @@ fn main() {
             explicit_patterns = true;
             patterns_e.push(raw[i]["--regexp=".len()..].to_string());
         } else if raw[i] == "-f" || raw[i] == "--file" {
-            // Repeatable pattern file (one pattern per line, `-` = stdin).
             i += 1;
             if i >= raw.len() {
                 usage();
@@ -4694,13 +3619,9 @@ fn main() {
             || raw[i] == "--encoding"
             || raw[i] == "-G"
         {
-            // Parked matcher flags: loud exit 2, never a positional pattern.
-            // (`--no-pcre2`/`--no-encoding` below are silent no-ops: the
-            // default engine already satisfies them.)
             eprintln!("nkg: {} is not supported", raw[i]);
             usage();
         } else if raw[i] == "--no-pcre2" || raw[i] == "--no-encoding" {
-            // No-op: requests the default engine/byte behavior we already do.
         } else if raw[i] == "-i" || raw[i] == "--ignore-case" {
             ignore_case = true;
         } else if raw[i] == "-q" || raw[i] == "--quiet" || raw[i] == "--silent" {
@@ -4728,7 +3649,6 @@ fn main() {
         } else if raw[i].starts_with("--glob=") {
             walk_globs.push(raw[i]["--glob=".len()..].to_string());
         } else if raw[i].starts_with("-g") && !raw[i].starts_with("--") && raw[i].len() > 2 {
-            // Attached short (`-g*.rs`), mirroring clap's short-value join.
             walk_globs.push(raw[i][2..].to_string());
         } else if raw[i] == "-d" || raw[i] == "--max-depth" {
             i += 1;
@@ -4751,7 +3671,6 @@ fn main() {
                 }
             }
         } else if raw[i].starts_with("-d") && !raw[i].starts_with("--") && raw[i].len() > 2 {
-            // Attached short (`-d2`).
             match raw[i][2..].parse::<usize>() {
                 Ok(d) => walk_max_depth = Some(d),
                 Err(_) => {
@@ -4842,9 +3761,6 @@ fn main() {
         } else if raw[i].starts_with("--group-separator=") {
             group_sep = raw[i]["--group-separator=".len()..].to_string();
         } else if raw[i].starts_with("-A") && !raw[i].starts_with("--") && raw[i].len() > 2 {
-            // Attached short (`-A2`), mirroring the `-d2`/`-g` convention.
-            // A non-numeric tail (e.g. a `-Apple` pattern) is a usage error,
-            // matching rg (`-A` consumes the next arg as its number).
             match raw[i][2..].parse::<usize>() {
                 Ok(n) => ctx_a = Some(n),
                 Err(_) => {
@@ -4853,7 +3769,6 @@ fn main() {
                 }
             }
         } else if raw[i].starts_with("-B") && !raw[i].starts_with("--") && raw[i].len() > 2 {
-            // Attached short (`-B2`).
             match raw[i][2..].parse::<usize>() {
                 Ok(n) => ctx_b = Some(n),
                 Err(_) => {
@@ -4862,7 +3777,6 @@ fn main() {
                 }
             }
         } else if raw[i].starts_with("-C") && !raw[i].starts_with("--") && raw[i].len() > 2 {
-            // Attached short (`-C1`).
             match raw[i][2..].parse::<usize>() {
                 Ok(n) => ctx_c = Some(n),
                 Err(_) => {
@@ -4877,12 +3791,6 @@ fn main() {
                 .chars()
                 .all(|c| matches!(c, 'i' | 'q' | 'c' | 'l' | 'F' | 'v' | 'w'))
         {
-            // Combined no-arg shorts (-cl, -iq, -iv, -vw, ...): claimed only
-            // when EVERY char is a known no-arg short. Anything with other
-            // letters falls through to positional — the shared short-cluster
-            // protocol (FlagsCLS/FlagsAQ consented to this unified arm;
-            // behavior for -c/-l/-cl/-lc/-cc and -i/-q/-iq/-qi is unchanged).
-            // Bare `-` (stdin) never reaches here via the len>1 guard.
             for c in raw[i][1..].chars() {
                 match c {
                     'i' => ignore_case = true,
@@ -4892,8 +3800,6 @@ fn main() {
                     'F' => fixed_strings = true,
                     'v' => invert_match = true,
                     'w' => word_regexp = true,
-                    // Unreachable by the guard above; empty keeps the match
-                    // exhaustive without a behavior claim.
                     _ => {}
                 }
             }
@@ -4902,9 +3808,6 @@ fn main() {
         }
         i += 1;
     }
-    // MatchFlags patterns: with any -e/-f every positional is a path (rg
-    // shape; more than one path stays a usage error — single-root index).
-    // Without -e/-f the first positional is the pattern, as before.
     if explicit_patterns {
         if pos.len() > 1 {
             usage();
@@ -4912,9 +3815,6 @@ fn main() {
     } else if pos.is_empty() || pos.len() > 2 {
         usage();
     }
-    // `-f` files load here (after usage checks, before dispatch): each line
-    // a pattern, interior empties kept (match-all, probed on rg 15.1.0),
-    // `-` reads piped stdin once. A missing file exits 2 with `nkg: msg`.
     let mut patterns: Vec<String> = patterns_e;
     if !pattern_files.is_empty() {
         let mut stdin_pats: Option<Vec<u8>> = None;
@@ -4943,24 +3843,12 @@ fn main() {
         }
     }
     if explicit_patterns && patterns.is_empty() {
-        // `-f` with zero patterns (e.g. an empty file): rg matches nothing.
-        // A never-matching regex keeps the whole pipeline (and exit 1)
-        // uniform: `\b\B` is contradictory at one position (verified empty
-        // against rg 15.1.0 semantics), compiles without look-around, and
-        // holds no trigrams (full scan, like any gram-less pattern). Fixed
-        // is cleared since this is a regex by construction.
         patterns.push("\\b\\B".to_string());
         fixed_strings = false;
     }
     if !explicit_patterns {
         patterns.push(pos[0].clone());
     }
-    // Stdin search unit (FlagsCLS): an explicit `-` operand, or piped stdin
-    // with no path operand, searches stdin as one unit labeled
-    // `(standard input)` instead of walking the tree. A terminal with no
-    // path defaults to root `.` (rg parity); piped stdin with no path keeps
-    // the stdin unit. With -e/-f there is no pattern positional, so the
-    // path shifts to pos[0] (or none when piped/terminal-default).
     let stdin_is_term = std::io::stdin().is_terminal();
     let stdin_explicit = if explicit_patterns {
         pos.first().map(|s| s.as_str()) == Some("-")
@@ -4972,8 +3860,6 @@ fn main() {
     } else {
         pos.len() == 1 && !stdin_is_term
     };
-    // Terminal bare (no path, stdin is a tty): search `.` like rg. Piped
-    // stdin with no path stays the stdin unit via `stdin_piped` above.
     let terminal_root = stdin_is_term
         && (if explicit_patterns {
             pos.is_empty()
@@ -4984,10 +3870,6 @@ fn main() {
         eprintln!("nkg: stdin search cannot use --port");
         usage();
     }
-    // `--use-index` names an index to search, `--port` names a daemon that
-    // already holds one. Taking `--port` and dropping `--use-index` in
-    // silence makes a stale path look indexed, which is how a benchmark
-    // ends up measuring something other than what it names.
     if port.is_some() && use_index.is_some() {
         eprintln!("nkg: --use-index cannot be combined with --port");
         usage();
@@ -5018,8 +3900,6 @@ fn main() {
     } else {
         PathBuf::from(pos.get(1).map(|s| s.as_str()).unwrap_or("."))
     };
-    // Traversal filters thread into every cold walk below; the index build
-    // keeps defaults (full corpus) so gate A holds by construction.
     let walk_opts = WalkOptions {
         hidden: walk_hidden,
         no_ignore: walk_no_ignore,
@@ -5028,20 +3908,10 @@ fn main() {
         max_filesize: walk_max_filesize,
         globs: walk_globs,
     };
-    // Color resolves once: text render only (JSON/-c/-l/-q never consult it).
-    // Short-circuit keeps the default path off the is_terminal syscall.
     let color_on = format_text && color_enabled(color_when);
-    // Context resolves once: an explicit -A/-B beats -C per side (rg 15.1.0
-    // probe); `ctx_on` gates every context path below — when false the JSON,
-    // text, and wire paths are byte-identical to before.
     let ctx_after = ctx_a.or(ctx_c).unwrap_or(0);
     let ctx_before = ctx_b.or(ctx_c).unwrap_or(0);
     let ctx_on = ctx_after > 0 || ctx_before > 0;
-    // MatchFlags spec: the serve wire and the cold path share it (patterns
-    // for grams/bonus, flags for matcher/verify/cap).
-    // Subtree roots for serve: canonicalized absolute (daemon cwd may
-    // differ) plus the raw operand for cold-shape display. Unresolvable
-    // roots send a sentinel matching nothing (exit 1, not whole-tree).
     let root_raw = root.to_string_lossy().into_owned();
     let qroot_canon = std::fs::canonicalize(&root)
         .map(|c| c.to_string_lossy().into_owned())
@@ -5058,9 +3928,6 @@ fn main() {
 
     let t0 = Instant::now();
     let mut ph = QueryPhases::new();
-    // Root check runs before the serve-first probe so both paths agree on
-    // exit status; subtree queries skip serve (the daemon covers the whole
-    // index root) and go cold, where candidates are narrowed to the subtree.
     let walk_default = !walk_opts.hidden
         && !walk_opts.no_ignore
         && !walk_opts.follow
@@ -5076,18 +3943,12 @@ fn main() {
     } else {
         false
     };
-    // Serve query state, resolved once for both serve entry points: the
-    // request fields, how a classified row is retained, the client-side
-    // highlight matcher, and the flags the response tail renders with.
-    // `-q` is an aggregate shape — it prints nothing, and the `done` line
-    // still supplies the diagnostics' totals.
     let sq = ServeQuery {
         pattern: &pattern,
         top,
         ignore_case,
         mspec: &mspec,
         mode: serve_mode(quiet, count_mode, files_only, ctx_on, format_text),
-        // Color resolves once per query for the text render only.
         matcher: color_on
             .then(|| build_matcher_opts(&pattern, ignore_case, word_regexp, fixed_single).ok())
             .flatten(),
@@ -5117,9 +3978,6 @@ fn main() {
     if let Some(p) = port.filter(|_| walk_default) {
         let rows = client_query(p, &sq);
         if ctx_on && !rows.ctx_echo {
-            // Old daemon ignored the context fields: matches render without
-            // carried context (the serve-first path fails over to cold
-            // instead — no cold tree exists for an explicit --port).
             eprintln!("nkg: server ignored context flags (old daemon?)");
         }
         finish_serve_response(&rows, &sq, t0);
@@ -5133,34 +3991,20 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // ST-5 columnar cold path: borrow-banked FileHits (pid = file id when
-    // indexed, ptab index on scan) + flattened side scores vec + pid-indexed
-    // escaped paths. Serve emits the same banked path; the check pins both
-    // byte-identical.
-    // `-l`/`-q` need one path per file and discard the rows, so the searcher
-    // can stop at each file's first match. `-m n` is NOT safe here: it caps
-    // matches before ranking, and a file's score comes from how many matches it
-    // banked, so capping early changes which files rank highest. `-m` stays the
-    // post-pass in `apply_max_count`.
     let match_limit = files_only.then_some(1u64);
     let mut hits: Vec<FileHits> = vec![];
 
     let mut walk_error = false;
-    // Request-scoped I/O-error latch for this query (see handle_client).
     let verify_latch = AtomicBool::new(false);
     let mut ptab: Vec<String> = vec![];
     let mut hits_indexed = false;
     let files: usize;
     let mut load_ms = 0u128;
     let idx_opt: Option<Index> = if stdin_mode {
-        // Stdin bypasses the index entirely: the piped bytes are not indexed
-        // content. --use-index is ignored, not an error.
         None
     } else if let Some(idx_path) = &use_index {
         let t_load = Instant::now();
         let idx = load_index_for_query(idx_path, &root);
-        // One clock read for both consumers. `as_millis` stays exact here --
-        // deriving it from a float would truncate differently on some inputs.
         let load = t_load.elapsed();
         load_ms = load.as_millis();
         ph.load = load.as_secs_f64() * 1e3;
@@ -5169,9 +4013,6 @@ fn main() {
         None
     };
     if stdin_mode {
-        // No walk, no index: stdin bytes are the only search unit, labeled
-        // `(standard input)`. The shared sort/emit tail below applies
-        // unchanged (--top truncates, -c/-l aggregate, JSON stays default).
         files = 1;
         ptab = vec![STDIN_LABEL.to_string()];
         let mut input = Vec::new();
@@ -5182,24 +4023,17 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        // Frozen-wrapper default (same contract as the daemon): plain stdin
-        // queries run the frozen entry; invert goes direct. Zero behavior
-        // change — the wrapper is exactly _inv(false).
         let stdin_hit = if invert_match {
             search_stdin_raw_inv(&input, &matcher, true)
         } else {
             search_stdin_raw(&input, &matcher)
         };
         if quiet {
-            // Existence only, mirroring the file branches: no stdout, 0/1 exit.
             quiet_exit(stdin_hit.is_some(), files, load_ms, t0, false);
         }
         hits = stdin_hit.map(|h| vec![h]).unwrap_or_default();
-        // `-m` caps the unit before rank/top/count/emit, like files below.
         apply_max_count(&mut hits, max_count);
         if ctx_on {
-            // The stdin buffer outlives verify (FlagsCLS coupling): attach
-            // line tables over it so stdin renders context like files.
             for fh in hits.iter_mut() {
                 attach_context(fh, &input);
             }
@@ -5207,18 +4041,6 @@ fn main() {
     } else if let Some(idx) = &idx_opt {
         let mut scores = vec![0.0f64; idx.files.len()];
         let mut order: Vec<u32> = vec![];
-        // `-i` forces the scan fallback: trigram postings are raw bytes, so
-        // case-sensitive grams would false-negative on case variants
-        // (`hello` grams miss `HELLO` files). Scanning makes indexed==scan
-        // hold by construction; the matcher itself folds case. `-v` forces
-        // it too: inverted matches live outside the gram files.
-        // `--hidden`/`--no-ignore`/`-L` force it as well: the index is built
-        // with walk defaults (hidden skipped, ignores respected, links
-        // unfollowed), so those files are absent from postings — no candidate
-        // filter could recover them. The fallback walks with live walk_opts,
-        // so indexed==scan holds by construction there too. Shrink-only
-        // filters (-d/-g/--max-filesize) stay on the fast path: candidates
-        // are intersected pre-verify below.
         let mut fallback =
             ignore_case || invert_match || walk_hidden || walk_no_ignore || walk_follow;
         match if fallback {
@@ -5228,9 +4050,6 @@ fn main() {
         } {
             None => fallback = true,
             Some(ors) => {
-                // Shared rank core: intersect/union/idf, any-pattern path
-                // bonus (single-pattern = contains(pattern), as before),
-                // depth penalty, descending order + per-file scores.
                 let t_rank = Instant::now();
                 let (o, s) = rank_ors(idx, &ors, &|p| {
                     patterns.iter().any(|pat| p.contains(pat.as_str()))
@@ -5252,8 +4071,6 @@ fn main() {
                 .map(|p| strip_dot_slash(&p.to_string_lossy()).to_owned())
                 .collect();
             if quiet {
-                // Existence only: `find_any` stops the parallel wave at the
-                // first banked hit instead of verifying every file.
                 let found = (0u32..ptab.len() as u32)
                     .into_par_iter()
                     .find_any(|pid| {
@@ -5284,13 +4101,7 @@ fn main() {
             hits = (0u32..ptab.len() as u32)
                 .into_par_iter()
                 .filter_map(|pid| {
-                    // Same per-file score as the scan branch below (path bonus
-                    // minus depth): the fallback is a scan, so its rows must
-                    // be byte-identical to one, not just set-equal.
                     let ps = &ptab[pid as usize];
-                    // `Path::new` rather than `PathBuf::from`: the owned
-                    // buffer was allocated per candidate purely to count
-                    // components, which borrows do just as well.
                     let depth = std::path::Path::new(ps).components().count() as f64;
                     let bonus = if patterns.iter().any(|pat| ps.contains(pat.as_str())) {
                         100.0
@@ -5313,14 +4124,6 @@ fn main() {
                 .collect();
             ph.verify += t_ver.elapsed().as_secs_f64() * 1e3;
         } else {
-            // Shrink-only traversal filters apply to candidates pre-verify,
-            // not to the index itself (the build keeps full-corpus defaults
-            // so gate A holds). The rank candidates are intersected with a
-            // live `walk_files` set — the same walker the scan branches use,
-            // so depth/size/glob semantics match by construction. Defaults
-            // skip the walk entirely: zero behavior or output change on the
-            // hot path. (Expand filters never reach here: --hidden,
-            // --no-ignore, and -L take the scan fallback above.)
             if walk_opts.max_depth.is_some()
                 || walk_opts.max_filesize.is_some()
                 || !walk_opts.globs.is_empty()
@@ -5337,8 +4140,6 @@ fn main() {
             }
             files = order.len();
             if quiet {
-                // Existence only over the pruned candidate set: same
-                // `find_any` short-circuit as the scan branches.
                 let found = order
                     .par_iter()
                     .find_any(|id| {
@@ -5362,8 +4163,6 @@ fn main() {
                     walk_error | take_verify_io_error(&verify_latch),
                 );
             }
-            // Rank-ordered parallel verify, kth early exit between batches
-            // (spec §6: match score ≤ file score, exit moves only with proof).
             let t_ver = Instant::now();
             hits = verify_batched(&order, &scores, top, true, |id| {
                 verify_one_raw_ctx(VerifyInput {
@@ -5393,8 +4192,6 @@ fn main() {
             .map(|p| strip_dot_slash(&p.to_string_lossy()).to_owned())
             .collect();
         if quiet {
-            // Existence only: `find_any` stops the parallel wave at the
-            // first banked hit instead of verifying every file.
             let found = (0u32..ptab.len() as u32)
                 .into_par_iter()
                 .find_any(|pid| {
@@ -5425,8 +4222,6 @@ fn main() {
         hits = (0u32..ptab.len() as u32)
             .into_par_iter()
             .filter_map(|pid| {
-                // Same verify core as the indexed path: depth folds into
-                // file_score, so scores match the old inline Collector.
                 let ps = &ptab[pid as usize];
                 let depth = std::path::Path::new(ps).components().count() as f64;
                 let bonus = if patterns.iter().any(|pat| ps.contains(pat.as_str())) {
@@ -5450,14 +4245,8 @@ fn main() {
             .collect();
         ph.verify += t_ver.elapsed().as_secs_f64() * 1e3;
     }
-    // `-m`: per-file cap before rank/top/count/emit. Truncation precedes
-    // context derivation (agreed with ContextLines): context renders from
-    // surviving metas. No `-m` = no-op.
     let t_sort = Instant::now();
     apply_max_count(&mut hits, max_count);
-    // Columnar sort: flattened side scores vec drives index order; comparator
-    // verbatim the fat-Hit one, so rank (ties included) is unchanged.
-    // `loc` maps each flat position to (file, meta) for banked decode.
     let (hit_scores, loc) = flat_scores(&hits);
     let mut ord = raw_order(&hit_scores);
     if let Some(n) = top {
@@ -5467,11 +4256,7 @@ fn main() {
     ph.tail = Instant::now();
     ph.rows = ord.len() as u64;
     let matches = ord.len();
-    // Audit #8: `F` counts distinct hit files, not files walked/candidates.
-    // SHAPE CHANGE: `-c` single-file hits and `-m1` now report `in 1 files`
-    // instead of `in N files` (walked count).
     let matched = matched_file_count(&ord, &loc);
-    // Display state for the three renderers below (context, text, JSON).
     let src = EmitSource {
         hits: &hits,
         loc: &loc,
@@ -5482,10 +4267,6 @@ fn main() {
         matcher: &matcher,
     };
     if count_mode || files_only {
-        // `-c` / `-l` cold emit: per-file surviving-hit (post---top) counts,
-        // path-sorted for a stable contract (rg emits walk-parallel order).
-        // `-l` wins over `-c`; `-q` never reaches here (quiet_exit above).
-        // Zero-count files are omitted (see write_aggregates).
         let mut counts: HashMap<usize, usize> = HashMap::new();
         for &i in &ord {
             let (fi, _) = loc[i as usize];
@@ -5515,14 +4296,6 @@ fn main() {
         return;
     }
     if ctx_on {
-        // Context render: rank by hit, context attached. The ranked `ord`
-        // (post---top, so context never consumes rank budget) folds into
-        // per-file groups in first-seen rank order; lines ascend within a
-        // file; windows expand by before/after, merge on overlap/adjacency;
-        // `--` (or `--group-separator`) parts disjoint in-file groups, never
-        // across files — the rg 15.1.0 shape probe. A line with several hits
-        // renders once; `matches` (hits, multiplicity intact) drives the
-        // diagnostics and the 0/1 exit, like `-c`.
         let groups = ctx_file_groups(&hits, &loc, &ord);
         let est: usize = groups
             .iter()
@@ -5558,15 +4331,6 @@ fn main() {
         return;
     }
     if format_text {
-        // Text emit: same ranked `ord` as JSON (rank order preserved — same
-        // hits, same order, different rendering), no score, line numbers
-        // always on. Skips the JSON path-escape table; -c/-l/-q returned
-        // above. ContextLines' context>0 renderer takes over when context
-        // flags are set (plain text here is the no-context trigger).
-        // Same chunked-parallel shape as the JSON emitter: text mode renders
-        // strictly less per row than JSON (no escape table, no score) yet was
-        // emitting single-threaded, so on a heavy query it cost more than the
-        // JSON path it should have been cheaper than.
         let est = est_output_bytes(&ord, &hits, &loc, FRAME_TEXT);
         let parts: Vec<Vec<u8>> = match emit_plan(ord.len(), est) {
             None => vec![render_text_chunk(&src, &ord)],
@@ -5595,15 +4359,6 @@ fn main() {
         }
         return;
     }
-    // Ordered parallel emission (cold emission only): manual memchr escaper
-    // into chunk buffers per-thread, join in order, single sequential write.
-    // Serial fallback under threshold keeps selective/small queries off the
-    // rayon ramp. serde_json remains the differential check in tests.
-    // Each unique path is escaped once per query (heavy-full emits 51k hits
-    // from ~3k files) into a pid-indexed table: no per-hit HashMap, no Arc.
-    // Indexed pids address the index file table, scan pids the ptab.
-    // Hit text decodes from the file arena at emit (`banked_text`): valid
-    // UTF-8 borrows, so the common path allocates nothing per hit.
     let table_len = match &idx_opt {
         Some(idx) if hits_indexed => idx.files.len(),
         _ => ptab.len(),
@@ -5619,8 +4374,6 @@ fn main() {
             esc[pid] = Some(v);
         }
     }
-    // Emit one line per ordered hit; sequential and chunked-parallel share
-    // this body so both stay byte-identical.
     let stdout = std::io::stdout();
     let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
     let est = est_output_bytes(&ord, &hits, &loc, FRAME_JSON);
@@ -5655,28 +4408,19 @@ mod context_tests {
 
     #[test]
     fn groups_merge_overlap_and_adjacency() {
-        // Overlap: [1,3]+[3,5] -> one group. Adjacency ([2,4]+[5,7]) merges
-        // with no separator — probed on rg 15.1.0.
         assert_eq!(compute_groups(&[2, 4], 1, 1), vec![(1, 5)]);
         assert_eq!(compute_groups(&[3, 7], 1, 1), vec![(2, 4), (6, 8)]);
     }
     #[test]
     fn groups_clamp_top_and_split() {
-        // Line 1 with before=2 clamps at 1; far-apart windows stay split.
         assert_eq!(compute_groups(&[1], 2, 1), vec![(1, 2)]);
         assert_eq!(compute_groups(&[1, 8], 1, 1), vec![(1, 2), (7, 9)]);
-        // Empty input, empty output; zero context is the line itself.
         assert!(compute_groups(&[], 2, 2).is_empty());
         assert_eq!(compute_groups(&[5], 0, 0), vec![(5, 5)]);
     }
 
     #[test]
     fn attach_remap_is_byte_identical() {
-        // attach_context must not change decoded hit text: metas remapped
-        // into the full-file arena decode exactly what the match-banked
-        // arena decoded (CRLF + missing-trailing-newline included). A CRLF
-        // line keeps its `\r` on both sides — probed byte-for-byte on rg
-        // 15.1.0, which renders `1-first\r` for this exact file.
         let dir = std::env::temp_dir().join(format!("nkg_ctx_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.txt");
@@ -5707,7 +4451,6 @@ mod context_tests {
         for (m, b) in attached.metas.iter().zip(before.iter()) {
             assert_eq!(&banked_text(&attached, m).into_owned(), b);
         }
-        // Context lines decode through the same table.
         assert_eq!(ctx_line_text(&attached, 1), "first\r");
         assert_eq!(ctx_line_text(&attached, 3), "middle");
         assert_eq!(ctx_line_text(&attached, 4), "needle two");
@@ -5716,8 +4459,6 @@ mod context_tests {
 
     #[test]
     fn served_context_renders_rg_shape() {
-        // Hits + carried ctx lines regroup into rg-shaped rows with `--`
-        // only between disjoint in-file groups, never across files.
         let raw = b"{\"path\":\"b.txt\",\"line\":2,\"text\":\"hit B\",\"score\":1.0}\n\
                     {\"path\":\"b.txt\",\"line\":1,\"text\":\"ctx B\",\"score\":1.0,\"ctx\":true}\n\
                     {\"path\":\"a.txt\",\"line\":1,\"text\":\"hit A1\",\"score\":0.0}\n\
@@ -5727,7 +4468,6 @@ mod context_tests {
             &out,
             b"b.txt:1-ctx B\nb.txt:2:hit B\na.txt:1:hit A1\n--\na.txt:9:hit A2\n"
         );
-        // Empty separator prints no separator lines.
         let out = render_served_context(raw, 1, 1, "", None);
         assert_eq!(
             &out,
@@ -5741,8 +4481,6 @@ mod git_skip_tests {
     use super::*;
 
     fn plant(root: &std::path::Path) {
-        // Fake `.git` tree with pack files, a hidden file, and a normal
-        // file: mirrors the live `rg --hidden` / `--no-ignore` probes.
         std::fs::create_dir_all(root.join(".git/objects/pack")).unwrap();
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(root.join(".git/objects/pack/t.pack"), "packbytes\n").unwrap();
@@ -5776,8 +4514,6 @@ mod git_skip_tests {
 
     #[test]
     fn git_four_contexts_match_rg() {
-        // Probed rg 15.1.0 on this repo: default/hidden/no-ignore all skip
-        // `.git`; only --hidden+--no-ignore descends it.
         let dir = std::env::temp_dir().join(format!("nkg_gitskip_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5785,21 +4521,17 @@ mod git_skip_tests {
         let root = dir.clone();
         let has_git =
             |s: &std::collections::HashSet<String>| s.iter().any(|p| p.starts_with(".git"));
-        // Default: gate A + byte-identical gate — exactly the visible file.
         let d = names(&root, &opts(false, false));
         assert_eq!(
             d,
             std::collections::HashSet::from(["normal.txt".to_string()])
         );
-        // --hidden alone: hidden files appear, `.git` still skipped.
         let h = names(&root, &opts(true, false));
         assert!(h.contains("normal.txt"), "{h:?}");
         assert!(h.contains(".hidden.txt"), "{h:?}");
         assert!(!has_git(&h), "--hidden must not descend .git: {h:?}");
-        // --no-ignore alone: hidden filter still skips `.git`.
         let n = names(&root, &opts(false, true));
         assert!(!has_git(&n), "--no-ignore alone keeps hidden skip: {n:?}");
-        // --hidden+--no-ignore: `.git` contents (incl. pack) searched.
         let b = names(&root, &opts(true, true));
         assert!(b.contains(".git/HEAD"), "{b:?}");
         assert!(
@@ -5813,7 +4545,6 @@ mod git_skip_tests {
 
     #[test]
     fn git_explicit_operand_still_searches() {
-        // Probed rg: `rg --hidden pat .git` searches the explicit dir.
         let dir = std::env::temp_dir().join(format!("nkg_gitroot_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
@@ -5842,10 +4573,6 @@ mod varint_tests {
 
     #[test]
     fn varint_rejects_wider_than_u32() {
-        // Five continuation bytes. Accumulating in u32 yields exactly
-        // 0xFFFFFFFF, which is not `> u32::MAX`, so it would slip through as
-        // Some — proving the early return exists, though that value alone would
-        // still be refused downstream by the `id < nfiles` bound.
         let b = [0xffu8, 0xff, 0xff, 0xff, 0x7f, 0];
         assert!(
             get_varint(&b, 0).is_none(),
@@ -5855,11 +4582,6 @@ mod varint_tests {
 
     #[test]
     fn varint_would_not_silently_decode_to_an_in_range_id() {
-        // The actual hazard, not just a missed early return: `0x10 << 28`
-        // lands on bit 32, so a u32 accumulator drops it and this decodes to
-        // id 1 — in range for any real tree, i.e. a corrupt index quietly
-        // yielding a wrong match instead of a refusal. The true value is
-        // 4294967297, which the u64 accumulator rejects.
         let b = [0x81u8, 0x80, 0x80, 0x80, 0x10, 0];
         assert_eq!(
             get_varint(&b, 0),
@@ -5884,10 +4606,6 @@ mod varint_tests {
 mod serve_wire_tests {
     use super::*;
 
-    /// A served response as the daemon writes it: hits in rank order, the
-    /// `done` line last. `text` on the hit row carries an escaped
-    /// `"ctx":true` inside it — the exact shape a substring test would
-    /// misclassify as context.
     const RESPONSE: &[u8] = b"{\"path\":\"a.txt\",\"line\":1,\"text\":\"saw \\\"ctx\\\":true here\",\"score\":0.5}\n\
                               {\"path\":\"b.txt\",\"line\":2,\"text\":\"carried ctx\",\"score\":0.5,\"ctx\":true}\n\
                               {\"path\":\"a.txt\",\"line\":3,\"text\":\"second hit\",\"score\":0.5}\n\
@@ -5903,10 +4621,6 @@ mod serve_wire_tests {
 
     #[test]
     fn ctx_marker_in_match_text_counts_as_a_hit() {
-        // `"ctx":true` is the LAST field of a carried context row, so the
-        // same sequence inside a match's own text cannot classify as
-        // context. Two hits (a.txt twice), one carried context row, and the
-        // marker-bearing text is rendered as text, not dropped.
         let (rows, out) = read(ServeMode::Text);
         assert_eq!(rows.matches, 2, "ctx marker inside text must not eat a hit");
         assert_eq!(rows.matched(), 1, "only a.txt is a hit file");
@@ -5920,8 +4634,6 @@ mod serve_wire_tests {
 
     #[test]
     fn context_mode_collects_hits_and_carried_rows() {
-        // Context regroups the whole response, so it is the one mode that
-        // keeps the wire: nothing reaches stdout until the stream ends.
         let (rows, out) = read(ServeMode::Context);
         assert_eq!(rows.matches, 2);
         assert!(out.is_empty(), "context rows never reach stdout early");
@@ -5936,8 +4648,6 @@ mod serve_wire_tests {
 
     #[test]
     fn json_mode_passes_the_wire_through_verbatim() {
-        // Default JSON: hit rows reach stdout byte-for-byte, in wire order,
-        // and the carried context row never does.
         let (rows, out) = read(ServeMode::Json);
         assert_eq!(rows.matches, 2);
         assert!(rows.emitted);
@@ -5950,16 +4660,12 @@ mod serve_wire_tests {
 
     #[test]
     fn scan_survives_adversarial_match_text() {
-        // A path with escaped quote/backslash, and text carrying a quote, a
-        // backslash and a literal `{"path":"` — all past fields the scan
-        // stops at, so none of it can be reached.
         let wire =
             br#"{"path":"a\"b\\c.txt","line":7,"text":"q\"r\\s {\"path\":\"z\"}","score":1.0}"#;
         let row = scan_wire_row(wire).expect("complete row");
         assert_eq!(row.path, br#"a\"b\\c.txt"#);
         assert_eq!(row.line, 7);
         assert_eq!(row.text, br#"q\"r\\s {\"path\":\"z\"}"#);
-        // Truncated, foreign or trailing-garbage rows degrade to None.
         assert!(scan_wire_row(br#"{"path":"a.txt","line":1,"text":"trunc"#).is_none());
         assert!(scan_wire_row(b"not a wire row").is_none());
         assert!(scan_wire_row(br#"{"path":"a.txt","line":x,"text":"y","score":1}"#).is_none());
@@ -5995,15 +4701,11 @@ mod serve_wire_tests {
         let mut cursor = &wire[..];
         let mut out = vec![];
         let rows = read_serve_response(&mut cursor, ServeMode::Text, None, &mut out).expect("done");
-        // Unparseable rows still count as rows (the wire contract is one
-        // object per line) but render nothing and add no file count.
         assert_eq!(rows.matches, 3);
         assert_eq!(rows.matched(), 1);
         assert_eq!(String::from_utf8(out).unwrap(), "a.txt:4:ok\n");
     }
 
-    /// Records every `write_all` as its own batch, so a test can see exactly
-    /// where the daemon's batch boundaries fell on the wire.
     #[derive(Default)]
     struct BatchLog(Vec<Vec<u8>>);
 
@@ -6019,12 +4721,6 @@ mod serve_wire_tests {
 
     #[test]
     fn emit_batches_break_only_between_rows() {
-        // The streamed response carries one invariant: a batch may leave the
-        // socket only BETWEEN rows, because the client frames on newlines and
-        // `emit_raw_with_path` appends exactly one newline-terminated row.
-        // Drives far more rows than one 64 KiB batch holds, checks every batch
-        // ends on a row boundary, and checks the shipped bytes equal the
-        // single-buffer render byte for byte.
         const ROWS: u64 = 20_000;
         let mut want: Vec<u8> = vec![];
         for line in 0..ROWS {
@@ -6059,9 +4755,6 @@ mod serve_wire_tests {
 
     #[test]
     fn emit_batch_failure_latches_broken() {
-        // A refused write is latched once and never retried: the emit loops
-        // stop on it, so a stalled reader cannot spend the write timeout once
-        // per remaining batch.
         struct Dead;
         impl Write for Dead {
             fn write(&mut self, _b: &[u8]) -> std::io::Result<usize> {
@@ -6094,9 +4787,6 @@ mod serve_wire_tests {
 mod emit_tests {
     use super::*;
 
-    /// Ranked banked hits: `files` files of `rows` hit lines, every line
-    /// `row_bytes` long. Row text carries a quote and a backslash so the
-    /// JSON escaper is on the path.
     struct Fix {
         hits: Vec<FileHits>,
         loc: Vec<(u32, u32)>,
@@ -6118,7 +4808,6 @@ mod emit_tests {
                 matcher: &self.matcher,
             }
         }
-        /// Per-pid JSON path table, as the JSON arm builds it.
         fn esc(&self) -> Vec<Option<Vec<u8>>> {
             let mut esc: Vec<Option<Vec<u8>>> = vec![None; self.ptab.len()];
             for fh in self.hits.iter() {
@@ -6178,16 +4867,6 @@ mod emit_tests {
 
     #[test]
     fn few_huge_rows_take_the_parallel_path() {
-        // Few rows, enormous bytes: a row-count gate reads a small row count
-        // and renders megabytes of text through one serial buffer, and a
-        // 4096-row chunk hands all of it to a single worker.
-        //
-        // The fixture has to be big enough to fill the pool, because the
-        // property under test is that the chunk size spreads across EVERY
-        // worker. At a fixed 240 rows the assertion only held on machines
-        // with few cores: 240 rows in ~18-row chunks is 14 chunks, so it
-        // passed at 8 threads and failed at 32. Scale rows with the thread
-        // count instead, with headroom over the ~18 rows a chunk holds.
         let threads = rayon::current_num_threads();
         let rows = (threads * 24).max(240);
         let f = fix(rows.div_ceil(60), 60, 56 * 1024);
@@ -6204,25 +4883,8 @@ mod emit_tests {
 
     #[test]
     fn a_chunk_reserves_the_bytes_it_renders() {
-        // The failure this guards is UNDER-reservation: a 128 B/row reserve
-        // against 56 KB rows under-reserves 440x, and the chunk then grows by
-        // doubling through ~12 serial realloc+memcpy copies.
-        //
-        // Slack is proportional to chunk row count, not a fixed quantity, so
-        // assert the ratio rather than a byte count. FRAME_TEXT=128 is
-        // deliberately generous against a real ~38 B of path+line framing,
-        // which makes over-reserve scale with rows: measured 26 KB on 240 rows
-        // and 378 KB on 3,600. An absolute limit therefore encodes the size of
-        // whatever fixture it was written against and says nothing about how
-        // accurate the estimator is; it happened to hold here only because
-        // EMIT_CHUNK_MAX_ROWS caps a chunk at 4,096 rows, which bounds slack at
-        // 4096 x 90 B = 360 KB. If that cap were ever raised the old limit
-        // would silently become wrong rather than failing.
         const MAX_OVER_RESERVE: f64 = 2.0;
 
-        // Few, huge rows: the estimate is near-exact, so the reserve and the
-        // final capacity should agree exactly. If the reserve were too small
-        // the buffer would double and capacity would overshoot it.
         let f = fix(4, 60, 56 * 1024);
         let est = est_output_bytes(&f.ord, &f.hits, &f.loc, FRAME_TEXT);
         let out = render_text_chunk(&f.src(), &f.ord);
@@ -6240,9 +4902,6 @@ mod emit_tests {
             out.len()
         );
 
-        // Many short rows: framing dominates, so this is the shape where a
-        // per-row constant actually accumulates, and the one the absolute
-        // form of this assertion would have failed on.
         let many = fix(60, 60, 512);
         assert!(
             many.ord.len() >= 3_000,
@@ -6267,22 +4926,15 @@ mod emit_tests {
 
     #[test]
     fn plan_reads_bytes_not_rows() {
-        // 240 rows of 560 KB: one row per chunk, so the rows reach every
-        // worker instead of one 4096-row chunk.
         let plan = emit_plan(240, 240 * 560 * 1024).expect("134 MB of output renders in parallel");
         assert!(240usize.div_ceil(plan) >= rayon::current_num_threads());
-        // 51k short rows keep the row-capped chunking they have always had.
         assert_eq!(emit_plan(51_410, 51_410 * 160), Some(4096));
-        // A few tens of kilobytes still renders into one serial buffer.
         assert_eq!(emit_plan(4000, 4096), None);
         assert_eq!(emit_plan(0, 0), None);
     }
 
     #[test]
     fn top_truncation_sizes_from_the_rows_that_print() {
-        // `--top 5` over a file with 1.9 MB banked prints 5 rows: ~41 KB,
-        // which stays serial. Sizing from the file arena instead would
-        // report 1.9 MB and open the gate for a five-row answer.
         let f = fix(1, 240, 8 * 1024);
         let top: Vec<u32> = f.ord.iter().copied().take(5).collect();
         let est = est_output_bytes(&top, &f.hits, &f.loc, FRAME_TEXT);
@@ -6296,9 +4948,6 @@ mod emit_tests {
 
     #[test]
     fn chunking_never_changes_a_byte() {
-        // Many short rows, and row counts either side of the old 4000-row
-        // threshold, render identically through one serial buffer and
-        // through any chunking.
         for (files, rows, row_bytes) in
             [(3usize, 1667usize, 40usize), (3, 1333, 100), (4, 1000, 100)]
         {
@@ -6363,9 +5012,6 @@ mod emit_tests {
 
     #[test]
     fn ctx_chunking_never_changes_a_byte() {
-        // Two files, two hit lines each, `-C1`: disjoint in-file groups
-        // part on `--`, and grouping the files into any number of chunks
-        // must not move a byte.
         let dir = std::env::temp_dir().join(format!("nkg_emit_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let body = "l1\nneedle a\nl3\nl4\nl5\nneedle b\nl7\n";
