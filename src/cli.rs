@@ -2,7 +2,9 @@ use grep_regex::RegexMatcher;
 use std::io::{IsTerminal, Write};
 
 #[cfg(test)]
-use crate::{build_matcher, emit_text_row, emit_text_row_colored, render_buffered_text};
+use crate::matcher::build_matcher;
+#[cfg(test)]
+use crate::{emit_text_row, emit_text_row_colored, render_buffered_text};
 
 /// --color target state (ColorOut): auto (default), always, never, plus ansi
 /// as an rg-compatible alias for always. auto colorizes only when stdout is
