@@ -2,9 +2,9 @@ use grep_regex::RegexMatcher;
 use std::io::{IsTerminal, Write};
 
 #[cfg(test)]
-use crate::matcher::build_matcher;
+use crate::emit::{emit_text_row, emit_text_row_colored, render_buffered_text};
 #[cfg(test)]
-use crate::{emit_text_row, emit_text_row_colored, render_buffered_text};
+use crate::matcher::build_matcher;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ColorWhen {
