@@ -1,7 +1,9 @@
-use crate::FileHits;
+use crate::verify::FileHits;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use std::collections::HashSet;
 
+#[cfg(test)]
+use crate::verify::*;
 #[cfg(test)]
 use crate::*;
 

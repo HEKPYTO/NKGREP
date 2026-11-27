@@ -1,13 +1,14 @@
 # src
 
-Six files. `main.rs` holds the entry point and argument parsing;
+Seven files. `main.rs` holds the entry point and argument parsing;
 `cli.rs` holds usage, help, version, and color; `walk.rs` holds
 `walk_files`, file sizes, root cookie, and dot-slash normalization;
 `prefilter.rs` is the trigram set logic shared by rank paths;
 `index_format.rs` holds the index data model, binary and JSON codec,
 header, and validation;
 `matcher.rs` holds matcher construction, trigram query grams, literal
-runs, `-f` splitting, and `-m` capping.
+runs, `-f` splitting, and `-m` capping;
+`verify.rs` holds per-file search, stdin search, and the fd cache.
 
 ## Pipeline
 
