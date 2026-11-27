@@ -18,9 +18,7 @@ __pycache__/
 # Index and corpus artifacts anywhere
 *.idx.json
 *.idx.bin
-nkgrep.idx.json
-.nkgrep.json
-.nkg.json
+.nkg*
 corpus*/
 .tgrep/
 *CORPUS_TGREP*
@@ -28,10 +26,9 @@ corpus*/
 
 # Serve configs
 *.serve.json
-serve.json
 
 # Private experiment log (stays on disk, never committed)
-decision.tsv
+*.tsv
 
 # macOS
 .DS_Store

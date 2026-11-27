@@ -336,7 +336,7 @@ pub(crate) fn push_wire_text_row(
     scratch: &mut WireScratch,
 ) {
     let Some(row) = scan_wire_row(wire) else {
-        return; // unparseable line: skipped, exactly as before
+        return;
     };
     scratch.path.clear();
     push_unescaped_json(&mut scratch.path, row.path);
@@ -1172,7 +1172,7 @@ fn main() {
                             &matcher,
                             scores[**id as usize],
                             walk_follow,
-                            Some(1), // -q needs existence only
+                            Some(1),
                         )
                         .is_some()
                     })

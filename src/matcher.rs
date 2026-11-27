@@ -180,7 +180,7 @@ fn split_branches(pattern: &str) -> Vec<String> {
                     cls.push(it.next().unwrap());
                 }
                 if it.peek() == Some(&']') {
-                    cls.push(it.next().unwrap()); // `[]...]` — first ] literal
+                    cls.push(it.next().unwrap());
                 }
                 {
                     let iter = it.by_ref();
@@ -188,7 +188,7 @@ fn split_branches(pattern: &str) -> Vec<String> {
                         cls.push(c2);
                         if c2 == '\\' {
                             if let Some(e) = iter.next() {
-                                cls.push(e); // escaped char inside class
+                                cls.push(e);
                             }
                             continue;
                         }
@@ -216,7 +216,7 @@ fn literal_runs(branch: &str) -> Vec<Vec<u8>> {
                 if !cur.is_empty() {
                     runs.push(std::mem::take(&mut cur));
                 }
-                let _ = it.next(); // escaped char is never a literal
+                let _ = it.next();
             }
             '[' => {
                 if !cur.is_empty() {
@@ -544,7 +544,7 @@ mod literal_tests {
     fn no_literal_falls_back() {
         assert!(query_grams("a|b").is_none());
         assert!(query_grams(".*").is_none());
-        assert!(query_grams("a\\|b").is_none()); // single branch, runs < 3
+        assert!(query_grams("a\\|b").is_none());
     }
     #[test]
     fn group_and_repeat_falls_back() {

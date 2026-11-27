@@ -536,7 +536,7 @@ pub(crate) fn scan_wire_row(line: &[u8]) -> Option<WireRow<'_>> {
             if s[k] == b'"' {
                 return Some(k);
             }
-            i = k + 2; // step over the escaped byte
+            i = k + 2;
         }
         None
     }
@@ -1252,7 +1252,7 @@ mod serve_wire_tests {
                 emit_raw_with_path(b, b"a/b.txt", line + 1, "payload text", 1.5)
             });
             if broken {
-                break; // what the emit loops do
+                break;
             }
         }
         assert!(broken, "a refused write must latch broken");

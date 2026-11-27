@@ -9,6 +9,14 @@ highest-scoring matches. It combines a trigram index with best-first
 verification: on plain literal queries it returns exactly the match set
 of ripgrep, ordered by relevance score.
 
+## Features
+
+- Ranked top-k results; on plain literals, the match set equals ripgrep's exactly.
+- Trigram index in binary (`.bin`) or JSON format.
+- Top-k early exit never displaces a true top-k hit.
+- `nkg serve` holds the index in memory; `--use-index` falls back to a cold load when no daemon answers.
+- JSON Lines or text output, color, and before/after context flags.
+
 ## Prerequisites
 
 Rust 1.98 or newer (`rust-toolchain.toml` pins it) and `cargo`. Install `rg` only if you run the bench parity harnesses.
@@ -51,14 +59,6 @@ Each hit comes back as one JSON object per line:
 ```json
 {"path":"a.txt","line":1,"text":"hello world","score":-4.000001}
 ```
-
-## Features
-
-- Ranked top-k results; on plain literals, the match set equals ripgrep's exactly.
-- Trigram index in binary (`.bin`) or JSON format.
-- Top-k early exit never displaces a true top-k hit.
-- `nkg serve` holds the index in memory; `--use-index` falls back to a cold load when no daemon answers.
-- JSON Lines or text output, color, and before/after context flags.
 
 ## Performance
 
