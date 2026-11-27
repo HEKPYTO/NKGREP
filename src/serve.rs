@@ -1,7 +1,7 @@
 use crate::emit::{emit_ctx_json, emit_raw_with_path, render_buffered_text, render_served_context};
 use crate::index_format::{
     index_header, parse_index_auto, read_index_bytes, read_index_header_bytes,
-    validate_stored_files, Index,
+    validate_stored_files, Index, BIN_MAGIC,
 };
 use crate::matcher::{
     apply_max_count, build_matcher_opts, combine_patterns, query_grams, query_grams_multi,
@@ -29,8 +29,17 @@ pub(crate) fn serve_eligible_root(idx_path: &str, query_root: &std::path::Path) 
     if !PathBuf::from(serve_info_path(idx_path)).exists() {
         return false;
     }
-    let data = read_index_header_bytes(idx_path);
-    let (root, root_dev, root_ino) = index_header(idx_path, &data);
+    let mut magic = [0u8; BIN_MAGIC.len()];
+    let binary = std::fs::File::open(idx_path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && magic == *BIN_MAGIC;
+    let (root, root_dev, root_ino) = if binary {
+        index_header(idx_path, &read_index_header_bytes(idx_path))
+    } else {
+        let data = read_index_bytes(idx_path);
+        index_header(idx_path, &data)
+    };
     let q_canon = canon_root(query_root);
     let idx_canon = canon_root(&PathBuf::from(&root));
     let rel = match q_canon.strip_prefix(&idx_canon) {
@@ -1261,5 +1270,19 @@ mod serve_wire_tests {
             "the batch is cleared after shipping, so a dead socket cannot \
              spend the write timeout once per remaining batch"
         );
+    }
+    #[test]
+    fn serve_root_check_accepts_json_index_root() {
+        let dir = std::env::temp_dir().join(format!("nkg_serve_json_root_{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+        let idx_path = dir.join("j.idx.json");
+        let idx = idx_path.to_str().unwrap();
+        crate::cmd_index(&dir, idx);
+        std::fs::write(format!("{idx}.serve.json"), "{}").unwrap();
+        assert!(serve_eligible_root(idx, &dir));
+        assert!(!serve_eligible_root(idx, &sub));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
