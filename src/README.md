@@ -1,7 +1,9 @@
 # src
 
-Two files. `main.rs` is the whole binary (~8k lines); `prefilter.rs`
-is the trigram set logic shared by rank paths.
+Four files. `main.rs` holds the entry point and argument parsing;
+`cli.rs` holds usage, help, version, and color; `walk.rs` holds
+`walk_files`, file sizes, root cookie, and dot-slash normalization;
+`prefilter.rs` is the trigram set logic shared by rank paths.
 
 ## Pipeline
 

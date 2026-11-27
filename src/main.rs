@@ -3,8 +3,6 @@
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::Searcher;
 use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
-use ignore::overrides::OverrideBuilder;
-use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -14,7 +12,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+mod cli;
 mod prefilter;
+mod walk;
+use cli::{
+    color_enabled, colorize_spans, parse_color_when, print_help, print_version, usage, ColorWhen,
+};
+use walk::{
+    canon_root, is_binary, parse_filesize, refuse_bad_filesize, root_cookie, strip_dot_slash,
+    walk_files, WalkOptions,
+};
 #[derive(Serialize, Deserialize, Clone)]
 #[cfg(test)]
 struct Hit {
@@ -728,37 +735,6 @@ struct Index {
     /// Bijective over the 3-byte domain (top byte always zero); no lossy
     /// UTF-8 string round trip, 4 B fixed keys in the binary codec.
     postings: Postings,
-}
-
-/// Canonical absolute fingerprint of a build/query root; exit 2 when the
-/// root does not resolve.
-fn canon_root(root: &std::path::Path) -> PathBuf {
-    match std::fs::canonicalize(root) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("nkg: bad root {}: {e}", root.display());
-            std::process::exit(2);
-        }
-    }
-}
-
-/// Stable (device, inode) cookie for a canonical root; (0, 0) where the
-/// platform offers no file identity (non-unix) or metadata is unreadable.
-/// Unlike mtime this never changes when files are added inside the tree.
-fn root_cookie(canon: &std::path::Path) -> (u64, u64) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(canon) {
-            Ok(m) => (m.dev(), m.ino()),
-            Err(_) => (0, 0),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = canon;
-        (0, 0)
-    }
 }
 
 /// Stored `files` entries must be root-relative: absolute paths (stale
@@ -1530,160 +1506,6 @@ fn load_index_for_serve(idx_path: &str) -> Index {
     idx
 }
 
-/// Traversal filters (rg-compatible shapes): `--hidden`, `--no-ignore`,
-/// `-L/--follow`, `-g/--glob`, `-d/--max-depth`, `--max-filesize`.
-/// Default holds historical behavior: hidden skipped, ignore files
-/// respected, links unfollowed, unbounded depth/size, no globs.
-#[derive(Default)]
-struct WalkOptions {
-    hidden: bool,
-    no_ignore: bool,
-    follow: bool,
-    max_depth: Option<usize>,
-    max_filesize: Option<u64>,
-    globs: Vec<String>,
-}
-
-/// Loud refusal for an unparsable `--max-filesize` value (exit 2 via
-/// `usage`): keeps the long `eprintln!` at a shallow indent so it fits on
-/// one line under every rustfmt version; stderr bytes are unchanged.
-fn refuse_bad_filesize(arg: &str) -> ! {
-    eprintln!("nkg: bad --max-filesize {arg:?}: expected bytes with optional K/M/G suffix");
-    usage();
-}
-
-/// `--max-filesize` human size: plain bytes or a K/M/G suffix (powers of
-/// 1024, either case — probed live against rg 15.1.0: `1K` keeps a 1010 B
-/// file). None on garbage; the caller exits 2 like rg's `invalid size`.
-fn parse_filesize(s: &str) -> Option<u64> {
-    if s.is_empty() {
-        return None;
-    }
-    let (num, mult) = match s.chars().last().unwrap() {
-        'K' | 'k' => (&s[..s.len() - 1], 1024u64),
-        'M' | 'm' => (&s[..s.len() - 1], 1024 * 1024),
-        'G' | 'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        c if c.is_ascii_digit() => (s, 1),
-        _ => return None,
-    };
-    num.parse::<u64>().ok()?.checked_mul(mult)
-}
-
-fn walk_files(root: &PathBuf, opts: &WalkOptions) -> (Vec<PathBuf>, bool) {
-    // Paths come back sorted. Two callers depend on this: the index mints file ids
-    // from the returned order, and a stable score sort breaks ties BY ID, so
-    // readdir order leaked into output. It is also filesystem-specific -- APFS
-    // returns directory entries in insertion order and ext4 in hash order -- so the
-    // same corpus ranked equal-scored files differently per filesystem. Sorting
-    // here rather than at one call site keeps the index and scan walks in the same
-    // order, which is what the indexed==scan oracle compares.
-
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(!opts.hidden)
-        .git_ignore(!opts.no_ignore)
-        .ignore(!opts.no_ignore)
-        .git_global(!opts.no_ignore)
-        .git_exclude(!opts.no_ignore)
-        .parents(true)
-        .require_git(false)
-        .follow_links(opts.follow);
-    if let Some(d) = opts.max_depth {
-        builder.max_depth(Some(d));
-    }
-    // -g/--glob runs in `filter_entry`, NOT `builder.overrides`: probed rg
-    // 15.1.0 keeps gitignore above -g whitelists (a gitignored file matching
-    // `-g '*.txt'` is still skipped), while builder-level overrides would
-    // whitelist it past gitignore ("overrides have the highest precedence").
-    // The walker's own ignore machinery runs first, so gitignore still wins
-    // and the Override only further restricts. Same matcher, same input
-    // (leading `./` stripped exactly as dir.rs feeds it): bare globs
-    // whitelist, `!` globs exclude, neg-only keeps everything else, dirs
-    // never prune traversal on a non-match.
-    let mut glob_matcher: Option<ignore::overrides::Override> = None;
-    if !opts.globs.is_empty() {
-        let mut ob = OverrideBuilder::new(root);
-        for g in &opts.globs {
-            if let Err(e) = ob.add(g) {
-                eprintln!("nkg: bad --glob {g:?}: {e}");
-                std::process::exit(2);
-            }
-        }
-        match ob.build() {
-            Ok(ov) => glob_matcher = Some(ov),
-            Err(e) => {
-                eprintln!("nkg: bad --glob: {e}");
-                std::process::exit(2);
-            }
-        }
-    }
-    // rg parity (probed 15.1.0): `.git/` never descends unless --no-ignore:
-    // --hidden alone still skips it; --hidden+--no-ignore searches it. No
-    // git ops involved: pure path-component prune in filter_entry. Pruning
-    // the `.git` dir entry itself kills descent, so pack files cost nothing.
-    let skip_git = !opts.no_ignore;
-    if glob_matcher.is_some() || opts.max_filesize.is_some() || skip_git {
-        let root_path = root.clone();
-        let max_opt = opts.max_filesize;
-        builder.filter_entry(move |e| {
-            // Explicit file operands bypass traversal filters (probed rg:
-            // -g, -d, hidden, and --max-filesize all still search them).
-            if e.path() == root_path {
-                return true;
-            }
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if skip_git {
-                // Relative to the walk root so an explicit `.git` operand
-                // still searches (probed: `rg --hidden pat .git` does). A
-                // plain file named `.git` (worktree pointer) is a hidden
-                // file, not a tree: searched under --hidden, never pruned.
-                if let Ok(rel) = e.path().strip_prefix(&root_path) {
-                    let mut comps = rel.components().peekable();
-                    while let Some(c) = comps.next() {
-                        let last = comps.peek().is_none();
-                        if c.as_os_str() == ".git" && (!last || is_dir) {
-                            return false;
-                        }
-                    }
-                }
-            }
-            if let Some(max) = max_opt {
-                // Files only: dir metadata lengths are filesystem noise —
-                // filtering them would prune whole subtrees (probed: rg
-                // keeps subdir files under --max-filesize 100).
-                if !is_dir && e.metadata().map(|m| m.len() > max).unwrap_or(false) {
-                    return false;
-                }
-            }
-            match &glob_matcher {
-                Some(ov) => {
-                    let p = e.path();
-                    let rel = p.strip_prefix("./").unwrap_or(p);
-                    !ov.matched(rel, is_dir).is_ignore()
-                }
-                None => true,
-            }
-        });
-    }
-    let mut paths: Vec<PathBuf> = vec![];
-    let mut had_error = false;
-    for entry in builder.build() {
-        match entry {
-            Ok(e) => {
-                if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    paths.push(e.path().to_path_buf());
-                }
-            }
-            Err(e) => {
-                eprintln!("nkg: walk error: {e}");
-                had_error = true;
-            }
-        }
-    }
-    paths.sort();
-    (paths, had_error)
-}
-
 /// Label for the single stdin search unit (`-` operand or piped stdin with
 /// no path). Chosen over rg's `<stdin>` for shell-visibility; the `-c`
 /// shape stays `label:count` and `-l` prints the bare label.
@@ -1743,12 +1565,6 @@ fn search_stdin_raw_inv(buf: &[u8], matcher: &RegexMatcher, invert: bool) -> Opt
     }
 }
 
-/// Display-path normalization (rg parity, probed 15.1.0): strip a single
-/// leading `./` so `nkg pat .` prints `src/a.txt`, not `./src/a.txt`.
-/// Absolute paths and bare relatives pass through untouched.
-fn strip_dot_slash(s: &str) -> &str {
-    s.strip_prefix("./").unwrap_or(s)
-}
 /// Serve-wire display path: index-root-relative form of an absolute
 /// daemon path (`<root>/<rel>` -> `<rel>`). Falls back to the absolute
 /// string when it escapes the root (should not happen; fail-open display).
@@ -1802,17 +1618,6 @@ fn write_aggregates(w: &mut impl Write, rows: &[(&str, usize)], files_only: bool
         buf.push(b'\n');
     }
     stdout_write_all(w, &buf);
-}
-
-/// Identical binary-file skip on both index and verify sides (soundness):
-/// a file is binary when its first 8192 bytes contain a NUL. `cmd_index`
-/// and every verify path share this predicate so indexed==scan on binaries.
-/// `memchr` rather than a byte loop: the scalar `iter().any` scanned the
-/// same 8 KiB head of every file one byte at a time and measured 5.2 ms over
-/// a 2k-file tree against 0.2 ms here — most of what separated the scan path
-/// from ripgrep once the open/read cost was subtracted.
-fn is_binary(bytes: &[u8]) -> bool {
-    memchr::memchr(0, &bytes[..bytes.len().min(8192)]).is_some()
 }
 
 /// Multiply-xorshift finalizer for the build's gram set. A gram key is a
@@ -5139,71 +4944,6 @@ fn render_served_context(
     out
 }
 
-/// --color target state (ColorOut): auto (default), always, never, plus ansi
-/// as an rg-compatible alias for always. auto colorizes only when stdout is
-/// a TTY. Color applies to `--format text` match spans only; JSON stays
-/// machine-clean. GREP_COLORS is parked (not honored): match style is fixed
-/// bold-red, byte-probed on rg 15.1.0.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ColorWhen {
-    Auto,
-    Always,
-    Never,
-}
-
-/// Parse a `--color` value; None means usage error (exit 2 at the call site).
-/// `ansi` is an rg-compatible alias for `always`.
-fn parse_color_when(s: &str) -> Option<ColorWhen> {
-    match s {
-        "auto" => Some(ColorWhen::Auto),
-        "always" | "ansi" => Some(ColorWhen::Always),
-        "never" => Some(ColorWhen::Never),
-        _ => None,
-    }
-}
-
-/// Resolve color for this process. Explicit always wins everywhere (even
-/// piped); never wins nowhere; auto follows the stdout TTY only.
-fn color_enabled(when: ColorWhen) -> bool {
-    match when {
-        ColorWhen::Always => true,
-        ColorWhen::Never => false,
-        ColorWhen::Auto => std::io::stdout().is_terminal(),
-    }
-}
-
-/// Wrap each non-empty matcher span in `text` with rg's match style
-/// (`\x1b[0m\x1b[1m\x1b[31m` … `\x1b[0m`). Zero-width matches are skipped so
-/// patterns like `x*` never spray codes; a line with no spans borrows back
-/// unchanged. Byte splicing is safe: regex spans are char-boundary aligned.
-fn colorize_spans<'a>(text: &'a str, matcher: &RegexMatcher) -> std::borrow::Cow<'a, str> {
-    use grep_matcher::Matcher;
-    let b = text.as_bytes();
-    let mut spans: Vec<(usize, usize)> = vec![];
-    let _ = matcher.find_iter(b, |m| {
-        if m.start() < m.end() {
-            spans.push((m.start(), m.end()));
-        }
-        true
-    });
-    if spans.is_empty() {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = Vec::with_capacity(b.len() + spans.len() * 16);
-    let mut pos = 0usize;
-    for (s, e) in spans {
-        out.extend_from_slice(&b[pos..s]);
-        out.extend_from_slice(b"\x1b[0m\x1b[1m\x1b[31m");
-        out.extend_from_slice(&b[s..e]);
-        out.extend_from_slice(b"\x1b[0m");
-        pos = e;
-    }
-    out.extend_from_slice(&b[pos..]);
-    // Spans are char-boundary aligned and SGR inserts are ASCII, so the
-    // splice stays valid UTF-8 by construction; loud panic if broken.
-    std::borrow::Cow::Owned(String::from_utf8(out).expect("colorize splice must stay UTF-8"))
-}
-
 /// Colored text row: same `path:line:text` framing as `emit_text_row` with
 /// match spans highlighted. Delegates framing so the two never diverge.
 fn emit_text_row_colored(
@@ -5220,12 +4960,6 @@ fn emit_text_row_colored(
 // Real emission fns (`emit_raw_with_path` + `push_escaped_json`) are exercised
 // directly by the escape check below; no test-only wrappers.
 
-const USAGE: &str = "usage: nkg index <path> [--index FILE]\n       nkg serve --index FILE --port PORT\n       nkg [-i] [-v] [-w] [-F] [-m N] [-e PAT] [-f FILE] [-q] [-c] [-l] [-./--hidden] [--no-ignore] [-L/--follow] [-g/--glob GLOB] [-d/--max-depth N] [--max-filesize N] [-A N] [-B N] [-C N] [--group-separator SEP] [--top N] [--format json|text] [--color[=WHEN]] [--stats] [--use-index FILE | --port PORT] [--] <pattern> [path]\n";
-
-fn usage() -> ! {
-    eprint!("{USAGE}");
-    std::process::exit(2);
-}
 /// Stdout BrokenPipe contract: `| head` exits 0; any other IO error exits 2.
 fn stdout_err(e: std::io::Error) -> ! {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
@@ -5266,98 +5000,6 @@ fn quiet_exit(found: bool, files: usize, load_ms: u128, t0: Instant, walk_error:
     } else {
         1
     });
-}
-
-/// `--help` text (stdout, exit 0). Usage errors still go through `usage()`
-/// (stderr, exit 2). Write errors are ignored: help under a closed pipe
-/// simply ends the process.
-fn print_help() {
-    let head = concat!(
-        "nkg ",
-        env!("CARGO_PKG_VERSION"),
-        " — ranked trigram code search\n",
-    );
-    let opts = concat!(
-        "options:\n",
-        "  -i, --ignore-case  case-insensitive match\n",
-        "  -q, --quiet        suppress stdout, stop at first match\n",
-        "  --silent           alias for --quiet\n",
-        "  -                  read (standard input) instead of [path]\n",
-        "                     (no [path]: search . when stdin is a terminal,\n",
-        "                      else search stdin as one unit)\n",
-        "  -c, --count        path:count per matching file, path-sorted\n",
-        "  -l, --files-with-matches\n",
-        "  --stats           print the query plan and candidate counts to\n",
-        "                     stderr (indexed searches only)\n",
-        "  -m, --max-count N  cap matching lines per file at N (0 matches\n",
-        "                     nothing; -c prints capped counts; applies\n",
-        "                     per-file before --top; -m2 attached also works)\n",
-        "  -e, --regexp PAT   search pattern, OR (repeatable; an inline flag\n",
-        "                     like (?i) stays scoped to its pattern; any -e/-f\n",
-        "                     makes every positional a path)\n",
-        "  -f, --file FILE    patterns from FILE, one per line (repeatable;\n",
-        "                     empty line matches every line; - reads stdin;\n",
-        "                     missing file exits 2)\n",
-        "  -F, --fixed-strings\n",
-        "                     treat all patterns literally\n",
-        "  -v, --invert-match select non-matching lines (forces full scan\n",
-        "                     under --use-index)\n",
-        "  -w, --word-regexp  word-boundary match (Unicode word chars)\n",
-        "                     (short no-arg flags combine: any cluster of only\n",
-        "                     i q c l F v w letters sums its letters)\n",
-        "  --no-pcre2, --no-encoding  no-ops: the default engine already satisfies them\n",
-        "  --format json|text output rendering (default json; text emits\n",
-        "                     path:line:text in rank order — same hits, same\n",
-        "                     order as json, no score; ignored under -c/-l/-q)\n",
-        "  --color[=WHEN]     highlight match spans in --format text (default auto:\n",
-        "                     colorize only when stdout is a tty; always/never force\n",
-        "                     or suppress; ansi aliases always; json stays clean;\n",
-        "                     GREP_COLORS not honored; --color WHEN consumes WHEN\n",
-        "                     when valid, else WHEN is searched as the pattern)\n",
-        "  -., --hidden       search hidden files and directories\n",
-        "  --no-hidden        cancel --hidden (hidden files skipped by default)\n",
-        "  --no-ignore        skip .gitignore/.ignore/.rgignore/exclude files\n",
-        "  -L, --follow       follow symbolic links\n",
-        "  --no-follow        cancel --follow (symlinks unfollowed by default)\n",
-        "  -g, --glob GLOB    include/exclude paths, gitignore-style (repeatable;\n",
-        "                     leading ! excludes, neg-only keeps the rest;\n",
-        "                     -gGLOB attached also works)\n",
-        "  -d, --max-depth N  limit directory traversal depth (-d2 attached also works)\n",
-        "  --max-filesize N   skip files larger than N bytes (K/M/G suffixes)\n",
-        "  -A, --after-context N\n",
-        "                     print N lines after each match (`-A2` also works)\n",
-        "  -B, --before-context N\n",
-        "                     print N lines before each match (`-B2` also works)\n",
-        "  -C, --context N    print N lines around each match (`-C1` also works;\n",
-        "                     an explicit -A/-B beats -C on its side)\n",
-        "  --group-separator SEP\n",
-        "                     separator between disjoint context groups in one\n",
-        "                     file (default `--`; empty prints none)\n",
-        "  --top N            print only the top N ranked matches\n",
-        "  --use-index FILE   load this index file for the query, consulting the\n",
-        "                     daemon registered for it first and falling back to a\n",
-        "                     local index load when the server is unreachable\n",
-        "  --port PORT        query the daemon on PORT instead of searching locally\n",
-        "  --                 end the flag scan, so a pattern beginning with -\n",
-        "                     is searched literally\n",
-        "  --index FILE       for index and serve, use FILE as the index file\n",
-        "                     (default: .nkg.bin)\n",
-        "  -h, --help         print help to stdout and exit 0\n",
-        "  -V, --version      print the version to stdout and exit 0\n",
-    );
-    let stdout = std::io::stdout();
-    let mut w = stdout.lock();
-    let _ = w.write_all(head.as_bytes());
-    let _ = w.write_all(USAGE.as_bytes());
-    let _ = w.write_all(opts.as_bytes());
-    let _ = w.flush();
-}
-
-/// `--version` (stdout, exit 0); same closed-pipe tolerance as help.
-fn print_version() {
-    let stdout = std::io::stdout();
-    let mut w = stdout.lock();
-    let _ = writeln!(w, "nkg {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn main() {
@@ -7108,101 +6750,6 @@ mod escape_tests {
             }
         }
         assert!(n > 1000, "corpus fuzz saw too few lines: {n}");
-    }
-}
-
-#[cfg(test)]
-mod color_tests {
-    use super::*;
-
-    fn lit(pat: &str) -> RegexMatcher {
-        build_matcher(pat, false).unwrap()
-    }
-
-    #[test]
-    fn parse_when_values() {
-        assert_eq!(parse_color_when("auto"), Some(ColorWhen::Auto));
-        assert_eq!(parse_color_when("always"), Some(ColorWhen::Always));
-        assert_eq!(parse_color_when("never"), Some(ColorWhen::Never));
-        assert_eq!(parse_color_when("ansi"), Some(ColorWhen::Always));
-        assert_eq!(parse_color_when("bogus"), None);
-        assert_eq!(parse_color_when(""), None);
-        assert_eq!(parse_color_when("Always"), None);
-    }
-
-    #[test]
-    fn enabled_explicit_wins() {
-        assert!(color_enabled(ColorWhen::Always));
-        assert!(!color_enabled(ColorWhen::Never));
-        // Auto follows the TTY only — no assert (environment-dependent).
-    }
-
-    #[test]
-    fn span_wrap_matches_rg_bytes() {
-        // Exact SGR sequence byte-probed on rg 15.1.0 (`--color=always`).
-        let m = lit("hello");
-        assert_eq!(
-            &*colorize_spans("hello world", &m),
-            "\x1b[0m\x1b[1m\x1b[31mhello\x1b[0m world"
-        );
-    }
-
-    #[test]
-    fn no_match_borrows_back_verbatim() {
-        let m = lit("zzz");
-        let out = colorize_spans("hello world", &m);
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(&*out, "hello world");
-    }
-
-    #[test]
-    fn zero_width_spans_skipped() {
-        // `x*` matches empty everywhere: must emit no codes at all.
-        let m = lit("x*");
-        let out = colorize_spans("ab", &m);
-        assert_eq!(&*out, "ab");
-        assert!(!out.bytes().any(|b| b == 0x1b));
-    }
-
-    #[test]
-    fn multi_span_all_wrapped() {
-        let m = lit("o");
-        assert_eq!(
-            &*colorize_spans("foo boo", &m),
-            "f\x1b[0m\x1b[1m\x1b[31mo\x1b[0m\x1b[0m\x1b[1m\x1b[31mo\x1b[0m b\x1b[0m\x1b[1m\x1b[31mo\x1b[0m\x1b[0m\x1b[1m\x1b[31mo\x1b[0m"
-        );
-    }
-
-    #[test]
-    fn colored_row_delegates_framing() {
-        // Plain and colored rows share `path:line:` framing; only the text
-        // span differs.
-        let m = lit("needle");
-        let mut plain = Vec::new();
-        let mut colored = Vec::new();
-        emit_text_row(&mut plain, "a.txt", 7, "a needle here");
-        emit_text_row_colored(&mut colored, "a.txt", 7, "a needle here", &m);
-        assert_eq!(&plain, b"a.txt:7:a needle here\n");
-        assert_eq!(
-            &colored,
-            b"a.txt:7:a \x1b[0m\x1b[1m\x1b[31mneedle\x1b[0m here\n"
-        );
-    }
-
-    #[test]
-    fn serve_colored_mirrors_plain_shape() {
-        // Same rows, same order through the streamed text renderer; only
-        // spans wrapped.
-        let raw = b"{\"path\":\"a.txt\",\"line\":1,\"text\":\"hi needle\"}\n\
-                    {\"path\":\"b.txt\",\"line\":2,\"text\":\"no hit here\"}\n";
-        let m = lit("needle");
-        let plain = render_buffered_text(raw, None);
-        let colored = render_buffered_text(raw, Some(&m));
-        assert_eq!(&plain, b"a.txt:1:hi needle\nb.txt:2:no hit here\n");
-        assert_eq!(
-            &colored,
-            b"a.txt:1:hi \x1b[0m\x1b[1m\x1b[31mneedle\x1b[0m\nb.txt:2:no hit here\n"
-        );
     }
 }
 
