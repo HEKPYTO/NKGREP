@@ -3,6 +3,8 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use std::collections::HashSet;
 
 #[cfg(test)]
+use crate::rank::{banked_text, flat_scores, raw_order, verify_batched};
+#[cfg(test)]
 use crate::verify::*;
 #[cfg(test)]
 use crate::*;
