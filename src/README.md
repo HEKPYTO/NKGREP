@@ -1,6 +1,6 @@
 # src
 
-Nine files. `main.rs` holds the entry point and argument parsing;
+Ten files. `main.rs` holds the entry point and argument parsing;
 `cli.rs` holds usage, help, version, and color; `walk.rs` holds
 `walk_files`, file sizes, root cookie, and dot-slash normalization;
 `prefilter.rs` is the trigram set logic shared by rank paths;
@@ -12,7 +12,9 @@ header, and validation;
 runs, `-f` splitting, and `-m` capping;
 `verify.rs` holds per-file search, stdin search, and the fd cache;
 `emit.rs` holds output framing, chunk planning, text/JSON/context
-rendering, and color delegation.
+rendering, and color delegation;
+`serve.rs` holds the daemon, wire protocol, serve probe, and
+serve response rendering.
 
 ## Pipeline
 

@@ -1,8 +1,9 @@
 use crate::cli::colorize_spans;
 use crate::index_format::Index;
+use crate::push_wire_text_row;
 use crate::rank::{banked_text, compute_groups, ctx_group_lines, ctx_line_text};
+use crate::serve::{path_of, push_escaped_json, push_line_no, WireScratch};
 use crate::verify::FileHits;
-use crate::{path_of, push_escaped_json, push_line_no, push_wire_text_row, WireScratch};
 use grep_regex::RegexMatcher;
 
 #[cfg(test)]

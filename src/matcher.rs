@@ -3,11 +3,17 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use std::collections::HashSet;
 
 #[cfg(test)]
+use crate::emit::emit_raw_with_path;
+#[cfg(test)]
 use crate::rank::{banked_text, flat_scores, raw_order, verify_batched};
+#[cfg(test)]
+use crate::serve::push_escaped_json;
 #[cfg(test)]
 use crate::verify::*;
 #[cfg(test)]
 use crate::*;
+#[cfg(test)]
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(crate) struct GramHasher(u64);

@@ -1,8 +1,9 @@
 use crate::index_format::Index;
 use crate::prefilter;
+use crate::serve::serve_display_path;
 use crate::verify::{FileHits, HitMeta};
 use crate::walk::strip_dot_slash;
-use crate::{serve_display_path, stdout_write_all, PHASE_TIMING};
+use crate::{stdout_write_all, PHASE_TIMING};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
