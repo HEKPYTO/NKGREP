@@ -2,10 +2,6 @@
 /target/
 
 # PRIVATE device-only surface — never commit
-HANDOFF.md
-AGENTS.md
-ISSUE.md
-ISSUES.md
 docs/
 plans/
 outputs/
@@ -47,3 +43,7 @@ decision.tsv
 *.key
 *.p12
 secrets/
+*.md
+!README.md
+!**/README.md
+!LICENSE

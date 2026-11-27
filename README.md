@@ -1,5 +1,9 @@
 # nkgrep
 
+[![CI](https://img.shields.io/github/actions/workflow/status/HEKPYTO/NKGREP/ci.yml?branch=main)](https://github.com/HEKPYTO/NKGREP/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/nkgrep)](https://crates.io/crates/nkgrep)
+[![license](https://img.shields.io/crates/l/nkgrep)](https://crates.io/crates/nkgrep)
+
 nkgrep is a ranked code search tool. Given a pattern, it returns the k
 highest-scoring matches. It combines a trigram index with best-first
 verification: on plain literal queries it returns exactly the match set

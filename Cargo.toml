@@ -15,7 +15,6 @@ exclude = [
      "plans/",
      "outputs/",
      "output/",
-     "CHANGELOG.md",
      "AGENTS.md",
      ".worktrees/",
      "*.idx.json",

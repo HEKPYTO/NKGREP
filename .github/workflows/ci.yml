@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: fmt
@@ -54,3 +57,13 @@ jobs:
         with:
           toolchain: "1.98"
       - run: cargo build --release
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Only per-directory READMEs are tracked markdown
+        run: |
+          bad=$(git ls-files '*.md' | while read -r f; do case "$f" in README.md|*/README.md|LICENSE) ;; *) echo "$f" ;; esac; done)
+          test -z "$bad" || { echo "$bad"; exit 1; }
