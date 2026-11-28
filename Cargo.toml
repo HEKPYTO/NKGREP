@@ -11,15 +11,6 @@ keywords = ["search", "grep", "code-search", "index", "ranking"]
 categories = ["command-line-utilities", "text-processing"]
 exclude = [
      "bench/",
-     "docs/",
-     "plans/",
-     "outputs/",
-     "output/",
-     "AGENTS.md",
-     ".worktrees/",
-     "*.idx.json",
-     "*.idx.bin",
-     "corpus*/",
      ".github/",
      ".gitignore",
      ".pre-commit-config.yaml",
