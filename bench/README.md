@@ -63,7 +63,6 @@ competitive.
 | `race.py` | Full parity-gated race vs indexed and scan competitors (11 interleaved rounds) |
 | `make_chart.py` | Draws `benchmark.png` from one `race.py` run, transcribed by hand |
 | `benchmark.png` | Standalone bench chart; the root README uses a numbers table instead |
-| `VERSIONS.md` | Exact tool builds and paths the numbers were taken on |
 
 Everything else under `bench/` is generated or per-run and is not in the
 repository: `gen_corpus.py` writes `corpus/`, `corpus-git/` and

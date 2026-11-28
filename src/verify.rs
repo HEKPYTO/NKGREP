@@ -51,10 +51,7 @@ impl Sink for ColCollector {
             end,
             score,
         });
-        if self.match_limit.is_some() {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(self.match_limit.is_none())
     }
 }
 

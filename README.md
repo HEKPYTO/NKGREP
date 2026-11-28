@@ -19,7 +19,7 @@ of ripgrep, ordered by relevance score.
 
 ## Prerequisites
 
-Rust 1.98 or newer (`rust-toolchain.toml` pins it) and `cargo`. Install `rg` only if you run the bench parity harnesses.
+Rust 1.100 or newer (`rust-toolchain.toml` pins it) and `cargo`. Install `rg` only if you run the bench parity harnesses.
 
 ## Quickstart
 
@@ -81,7 +81,7 @@ Full numbers and method: [bench/README.md](bench/README.md).
 
 ## Development
 
-Pinned toolchain: Rust 1.98 (`rust-toolchain.toml`). `cargo test` runs 85 tests: 53 unit + 32 oracle.
+Pinned toolchain: Rust 1.100 (`rust-toolchain.toml`). `cargo test` runs 86 tests: 54 unit + 32 oracle.
 
 ```sh
 cargo fmt --check
